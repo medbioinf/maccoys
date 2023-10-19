@@ -13,6 +13,7 @@ use maccoys::web::server::start as start_web_server;
 enum Commands {
     Web {
         database_url: String,
+        database: String,
         interface: String,
         port: u16,
     },
@@ -52,6 +53,7 @@ async fn main() -> Result<()> {
     match args.command {
         Commands::Web {
             database_url,
+            database,
             interface,
             port,
         } => {
@@ -61,7 +63,7 @@ async fn main() -> Result<()> {
                     .split(",")
                     .map(|x| x.to_string())
                     .collect::<Vec<String>>();
-                start_web_server(database_hosts, interface, port).await?;
+                start_web_server(database_hosts, database, interface, port).await?;
             } else {
                 error!("Unsupported database protocol: {}", database_url);
             }

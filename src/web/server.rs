@@ -18,20 +18,20 @@ use crate::web::decoy_controller::insert_decoys;
 ///
 /// # Arguments
 /// * `database_nodes` - List of database nodes
+/// * `database` - Database/keyspace name
 /// * `interface` - Interface to listen on
 /// * `port` - Port to listen on
 ///
-pub async fn start(database_nodes: Vec<String>, interface: String, port: u16) -> Result<()> {
+pub async fn start(
+    database_nodes: Vec<String>,
+    database: String,
+    interface: String,
+    port: u16,
+) -> Result<()> {
     // Create a database client
     // Session maintains it own connection pool internally: https://github.com/scylladb/scylla-rust-driver/issues/724
     // A single client with a session should be sufficient for the entire application
-    let db_client = Client::new(
-        &database_nodes
-            .iter()
-            .map(|node| node.as_str())
-            .collect::<Vec<&str>>(),
-    )
-    .await?;
+    let db_client = Client::new(&database_nodes, database.as_str()).await?;
     let db_client = Arc::new(db_client);
 
     // Load configuration

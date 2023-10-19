@@ -9,7 +9,6 @@ use axum::response::{IntoResponse, Response};
 use macpepdb::chemistry::amino_acid::calc_sequence_mass;
 use macpepdb::database::scylla::client::{Client, GenericClient};
 use macpepdb::database::scylla::peptide_table::{PeptideTable, UPDATE_SET_PLACEHOLDER};
-use macpepdb::database::scylla::SCYLLA_KEYSPACE_NAME;
 use macpepdb::database::table::Table;
 use macpepdb::entities::{configuration::Configuration, peptide::Peptide as Decoy};
 use macpepdb::tools::peptide_partitioner::get_mass_partition;
@@ -88,7 +87,7 @@ pub async fn insert_decoys(
 
     let statement = format!(
         "UPDATE {}.{} SET {}, is_metadata_updated = false WHERE partition = ? and mass = ? and sequence = ?",
-        SCYLLA_KEYSPACE_NAME,
+        db_client.get_database(),
         PeptideTable::table_name(),
         UPDATE_SET_PLACEHOLDER.as_str()
     );
