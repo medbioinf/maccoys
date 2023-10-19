@@ -7,6 +7,7 @@ use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // internal imports
+use maccoys::database::database_build::DatabaseBuild;
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -16,6 +17,17 @@ enum Commands {
         database: String,
         interface: String,
         port: u16,
+    },
+    /// Build a MaCPepDB database for decoy caching.
+    ///
+    DatabaseBuild {
+        /// Comma separated list of ScyllaDB nodes
+        database_url: String,
+        /// Database/keyspace name
+        database: String,
+        /// Path or http(s)-URL to a MaCPepDB configuration JSON file. If a URL is given, the file will be downloaded and parsed.
+        /// If you have no working MaCPepDB do download one, you can use the default from the MaCcoyS repo.
+        configuration_resource: String,
     },
 }
 
@@ -67,6 +79,20 @@ async fn main() -> Result<()> {
             } else {
                 error!("Unsupported database protocol: {}", database_url);
             }
+        }
+        Commands::DatabaseBuild {
+            database_url,
+            database,
+            configuration_resource,
+        } => {
+            let plain_database_url = database_url[9..].to_string();
+            let database_hosts = plain_database_url
+                .split(",")
+                .map(|x| x.to_string())
+                .collect::<Vec<String>>();
+            let build = DatabaseBuild::new(database_hosts, database);
+            build.build(&configuration_resource).await?;
+            info!("Database build finished");
         }
     };
 
