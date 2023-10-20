@@ -11,20 +11,17 @@ use reqwest;
 use serde_json;
 
 pub struct DatabaseBuild {
-    database_nodes: Vec<String>,
-    database: String,
+    database_url: String,
 }
 
 impl DatabaseBuild {
     /// Creates a new DatabaseBuild instance.
     ///
     /// # Arguments
-    /// * `database_nodes` - List of database nodes
-    /// * `database` - Database/keyspace name
-    pub fn new(database_nodes: Vec<String>, database: String) -> Self {
+    /// * `database_url` - Database URL of the format scylla://host1,host2,host3/keyspace
+    pub fn new(database_url: &str) -> Self {
         Self {
-            database_nodes,
-            database,
+            database_url: database_url.to_string(),
         }
     }
 
@@ -34,7 +31,7 @@ impl DatabaseBuild {
     /// * `configuration_resource` - Path or http(s)-URL to a MaCPepDB configuration JSON file. If a URL is given, the file will be downloaded and parsed.
     ///
     pub async fn build(&self, configuration_resource: &str) -> Result<()> {
-        let mut client = Client::new(&self.database_nodes, &self.database).await?;
+        let mut client = Client::new(&self.database_url).await?;
 
         // Run migrations
         run_migrations(&client).await;

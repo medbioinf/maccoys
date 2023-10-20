@@ -14,17 +14,14 @@ use maccoys::web::server::start as start_web_server;
 enum Commands {
     Web {
         database_url: String,
-        database: String,
         interface: String,
         port: u16,
     },
     /// Build a MaCPepDB database for decoy caching.
     ///
     DatabaseBuild {
-        /// Comma separated list of ScyllaDB nodes
+        /// Database URL of the format scylla://host1,host2,host3/keyspace
         database_url: String,
-        /// Database/keyspace name
-        database: String,
         /// Path or http(s)-URL to a MaCPepDB configuration JSON file. If a URL is given, the file will be downloaded and parsed.
         /// If you have no working MaCPepDB do download one, you can use the default from the MaCcoyS repo.
         configuration_resource: String,
@@ -65,32 +62,20 @@ async fn main() -> Result<()> {
     match args.command {
         Commands::Web {
             database_url,
-            database,
             interface,
             port,
         } => {
             if database_url.starts_with("scylla://") {
-                let plain_database_url = database_url[9..].to_string();
-                let database_hosts = plain_database_url
-                    .split(",")
-                    .map(|x| x.to_string())
-                    .collect::<Vec<String>>();
-                start_web_server(database_hosts, database, interface, port).await?;
+                start_web_server(&database_url, interface, port).await?;
             } else {
                 error!("Unsupported database protocol: {}", database_url);
             }
         }
         Commands::DatabaseBuild {
             database_url,
-            database,
             configuration_resource,
         } => {
-            let plain_database_url = database_url[9..].to_string();
-            let database_hosts = plain_database_url
-                .split(",")
-                .map(|x| x.to_string())
-                .collect::<Vec<String>>();
-            let build = DatabaseBuild::new(database_hosts, database);
+            let build = DatabaseBuild::new(&database_url);
             build.build(&configuration_resource).await?;
             info!("Database build finished");
         }
