@@ -41,17 +41,20 @@ pub enum TargetLookupType {
 }
 
 impl TargetLookupType {
-    pub fn from_url(url: &str) -> Result<Self> {
-        if url.is_empty() {
-            Ok(TargetLookupType::None)
-        } else if url.starts_with("http") {
-            Ok(TargetLookupType::Web)
-        } else if url.starts_with("bloom+http") {
-            Ok(TargetLookupType::WebBloomFilter)
-        } else if url.starts_with("postgresql") {
-            Ok(TargetLookupType::Database)
-        } else {
-            bail!("Unknown target lookup type for url: {}", url)
+    pub fn from_url(url: &Option<String>) -> Result<Self> {
+        match url {
+            Some(url) => {
+                if url.starts_with("http") {
+                    Ok(TargetLookupType::Web)
+                } else if url.starts_with("bloom+http") {
+                    Ok(TargetLookupType::WebBloomFilter)
+                } else if url.starts_with("postgresql") {
+                    Ok(TargetLookupType::Database)
+                } else {
+                    bail!("Unknown target lookup type for url: {}", url)
+                }
+            }
+            None => Ok(TargetLookupType::None),
         }
     }
 }
@@ -64,7 +67,7 @@ impl TargetLookupType {
 pub struct DecoyGenerator {
     target_lookup_type: TargetLookupType,
     target_lookup_url: String,
-    initial_target_lookup_url: String,
+    initial_target_lookup_url: Option<String>,
     cleavage_terminus: Terminus,
     allowed_cleavage_amino_acids: Vec<char>,
     missed_cleavage_regex: Regex,
@@ -81,7 +84,7 @@ pub struct DecoyGenerator {
 
 impl DecoyGenerator {
     pub async fn new(
-        target_lookup_url: String,
+        target_lookup_url: Option<String>,
         cleavage_terminus: Terminus,
         allowed_cleavage_amino_acids: Vec<char>,
         missed_cleavage_regex: Regex,
@@ -96,15 +99,15 @@ impl DecoyGenerator {
         // Add the web service related path
         let plain_target_lookup_url = match target_lookup_type {
             TargetLookupType::Web => {
-                format!("{}/api/peptides", target_lookup_url)
+                format!("{}/api/peptides", target_lookup_url.as_ref().unwrap())
             }
             TargetLookupType::WebBloomFilter => {
                 format!(
                     "{}/lookup/everywhere",
-                    &target_lookup_url[6..] // remove the `bloom+` from the protocol
+                    &target_lookup_url.as_ref().unwrap()[6..] // remove the `bloom+` from the protocol
                 )
             }
-            _ => target_lookup_url.clone(),
+            _ => target_lookup_url.as_ref().unwrap().to_string(),
         };
 
         let http_client = match target_lookup_type {
@@ -116,7 +119,7 @@ impl DecoyGenerator {
         let (db_client, db_configuration): (Option<DbClient>, Option<DbConfiguration>) =
             match target_lookup_type {
                 TargetLookupType::Database => {
-                    let client = DbClient::new(&target_lookup_url).await?;
+                    let client = DbClient::new(target_lookup_url.as_ref().unwrap()).await?;
                     let configuration = ConfigurationTable::select(&client).await?;
                     (Some(client), Some(configuration))
                 }
