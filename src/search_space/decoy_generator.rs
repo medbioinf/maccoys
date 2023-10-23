@@ -1,4 +1,5 @@
 // std imports
+use std::str::FromStr;
 use std::time::Instant;
 
 // 3rd party imports
@@ -26,35 +27,37 @@ use scylla::frame::response::result::CqlValue;
 // internal imports
 use crate::search_space::decoy_part::DecoyPart;
 
-/// Type of target lookup to use
-/// None: Do not lookup the target
-/// Web: Use a MaCPepDB web service to lookup the target
-/// Database: Use direct database access to MaCPepDB database
-/// WebBloomFilter: Use a MaCPepDB BloomFilter webservice
+/// Target loopup url
+/// For http urls, a placeholder for the sequence added to the url `:sequence:`
 ///
 #[derive(Clone)]
-pub enum TargetLookupType {
+pub enum TargetLookupUrl {
     None,
-    Web,
-    Database,
-    WebBloomFilter,
+    Web(String),
+    Database(String),
+    WebBloomFilter(String),
 }
 
-impl TargetLookupType {
-    pub fn from_url(url: &Option<String>) -> Result<Self> {
-        match url {
-            Some(url) => {
-                if url.starts_with("http") {
-                    Ok(TargetLookupType::Web)
-                } else if url.starts_with("bloom+http") {
-                    Ok(TargetLookupType::WebBloomFilter)
-                } else if url.starts_with("postgresql") {
-                    Ok(TargetLookupType::Database)
-                } else {
-                    bail!("Unknown target lookup type for url: {}", url)
-                }
-            }
-            None => Ok(TargetLookupType::None),
+impl FromStr for TargetLookupUrl {
+    type Err = anyhow::Error;
+
+    fn from_str(url: &str) -> Result<Self> {
+        if url.is_empty() {
+            Ok(TargetLookupUrl::None)
+        } else if url.starts_with("http") {
+            Ok(TargetLookupUrl::Web(format!(
+                "{}/api/peptides/:sequence:/exists",
+                url
+            )))
+        } else if url.starts_with("bloom+http") {
+            Ok(TargetLookupUrl::WebBloomFilter(format!(
+                "{}/lookup/everywhere/:sequence:",
+                &url[6..]
+            )))
+        } else if url.starts_with("scylla") {
+            Ok(TargetLookupUrl::Database(url.to_string()))
+        } else {
+            bail!("Unknown target lookup type for url: {}", url)
         }
     }
 }
@@ -65,8 +68,7 @@ impl TargetLookupType {
 /// the range.
 ///
 pub struct DecoyGenerator {
-    target_lookup_type: TargetLookupType,
-    target_lookup_url: String,
+    target_lookup_url: TargetLookupUrl,
     initial_target_lookup_url: Option<String>,
     cleavage_terminus: Terminus,
     allowed_cleavage_amino_acids: Vec<char>,
@@ -94,32 +96,23 @@ impl DecoyGenerator {
         static_c_terminus_modification: i64,
     ) -> Result<Self> {
         let mass_distance_matrix = Self::build_mass_distance_matrix(&decoy_parts);
-        let target_lookup_type = TargetLookupType::from_url(&target_lookup_url)?;
-
-        // Add the web service related path
-        let plain_target_lookup_url = match target_lookup_type {
-            TargetLookupType::Web => {
-                format!("{}/api/peptides", target_lookup_url.as_ref().unwrap())
-            }
-            TargetLookupType::WebBloomFilter => {
-                format!(
-                    "{}/lookup/everywhere",
-                    &target_lookup_url.as_ref().unwrap()[6..] // remove the `bloom+` from the protocol
-                )
-            }
-            _ => target_lookup_url.as_ref().unwrap().to_string(),
+        let initial_target_lookup_url = target_lookup_url.clone();
+        let target_lookup_url = match target_lookup_url {
+            Some(url) => TargetLookupUrl::from_str(url.as_str())?,
+            None => TargetLookupUrl::None,
         };
 
-        let http_client = match target_lookup_type {
-            TargetLookupType::Web | TargetLookupType::WebBloomFilter => {
+        let http_client = match target_lookup_url {
+            TargetLookupUrl::Web(_) | TargetLookupUrl::WebBloomFilter(_) => {
                 Some(reqwest::Client::new())
             }
             _ => None,
         };
+
         let (db_client, db_configuration): (Option<DbClient>, Option<DbConfiguration>) =
-            match target_lookup_type {
-                TargetLookupType::Database => {
-                    let client = DbClient::new(target_lookup_url.as_ref().unwrap()).await?;
+            match &target_lookup_url {
+                TargetLookupUrl::Database(url) => {
+                    let client = DbClient::new(url.as_str()).await?;
                     let configuration = ConfigurationTable::select(&client).await?;
                     (Some(client), Some(configuration))
                 }
@@ -153,7 +146,7 @@ impl DecoyGenerator {
         }
 
         Ok(Self {
-            target_lookup_type,
+            target_lookup_url,
             cleavage_terminus,
             allowed_cleavage_amino_acids,
             missed_cleavage_regex,
@@ -166,8 +159,7 @@ impl DecoyGenerator {
             http_client,
             db_client,
             db_configuration,
-            target_lookup_url: plain_target_lookup_url,
-            initial_target_lookup_url: target_lookup_url,
+            initial_target_lookup_url,
         })
     }
 
@@ -364,9 +356,9 @@ impl DecoyGenerator {
     }
 
     async fn is_not_a_target(&self, sequence: &str) -> Result<bool> {
-        match self.target_lookup_type {
-            TargetLookupType::None => Ok(true),
-            TargetLookupType::Database => {
+        match &self.target_lookup_url {
+            TargetLookupUrl::None => Ok(true),
+            TargetLookupUrl::Database(_) => {
                 let sequence = sequence.to_uppercase();
                 let mass = calc_sequence_mass(sequence.as_str())?;
                 let partition = get_mass_partition(
@@ -388,23 +380,32 @@ impl DecoyGenerator {
                 .await?;
                 Ok(peptide_opt.is_none())
             }
-            TargetLookupType::Web | TargetLookupType::WebBloomFilter => {
-                let url = format!("{}/{}", self.target_lookup_url, sequence);
-                let response = match &self.http_client {
-                    Some(client) => client.get(&url).send().await?,
-                    None => bail!(
-                        "No http client available, but TargetLookupType is Web or WebBloomFilter"
-                    ),
-                };
+            TargetLookupUrl::Web(url) | TargetLookupUrl::WebBloomFilter(url) => {
+                let url = url.replace(":sequence:", sequence);
+                // let response = match &self.http_client {
+                //     Some(client) => client.get(&url).send().await?,
+                //     None => bail!(
+                //         "No http client available, but TargetLookupType is Web or WebBloomFilter"
+                //     ),
+                // };
 
-                match response.status().as_u16() {
+                match self
+                    .http_client
+                    .as_ref()
+                    .unwrap()
+                    .get(&url)
+                    .send()
+                    .await?
+                    .status()
+                    .as_u16()
+                {
                     200 => {
                         // If sequence was target, just generate a new one
                         Ok(false)
                     }
                     404 => Ok(true),
-                    _ => {
-                        bail!("Unexpected response status: {}", response.status());
+                    unknown => {
+                        bail!("Unexpected response status: {}", unknown);
                     }
                 }
             }
