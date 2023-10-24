@@ -53,13 +53,16 @@ enum Commands {
         /// URL for fetching targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
         target_url: String,
         /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        #[arg(short)]
         decoy_url: Option<String>,
         /// Optional URL for checking generated decoy against targets.
         /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
         /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
         /// If not given, decoys will not be checked against the target database and considered as "correct".
+        #[arg(short)]
         target_lookup_url: Option<String>,
         /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        #[arg(short = 'c')]
         decoy_cache_url: Option<String>,
     },
 }
