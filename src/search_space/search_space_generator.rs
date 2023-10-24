@@ -31,6 +31,7 @@ use tokio::io::AsyncWriteExt;
 // internal imports
 use super::decoy_generator::DecoyGenerator;
 use super::decoy_part::DecoyPart;
+use crate::search_space::decoy_cache::DecoyCache;
 use crate::search_space::target_lookup::TargetLookup;
 use crate::{
     constants::{
@@ -288,6 +289,11 @@ impl SearchSpaceGenerator {
             None => None,
         };
 
+        let decoy_cache: Option<DecoyCache> = match self.decoy_cache_url {
+            Some(ref url) => Some(DecoyCache::new(url).await?),
+            None => None,
+        };
+
         let mut decoy_ctr = decoy_ctr;
 
         let statically_modified_amino_acids = ptms
@@ -389,6 +395,9 @@ impl SearchSpaceGenerator {
                 if target_lookup.is_target(&sequence).await? {
                     continue;
                 }
+            }
+            if let Some(ref decoy_cache) = decoy_cache {
+                decoy_cache.cache(vec![(sequence.clone(), 0)]).await?;
             }
             fasta_file
                 .write(
