@@ -1,66 +1,19 @@
 // std imports
-use std::str::FromStr;
 use std::time::Instant;
 
 // 3rd party imports
-use anyhow::{bail, Result};
+use anyhow::Result;
 use async_stream::try_stream;
 use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::ModificationType;
 use dihardts_omicstools::proteomics::post_translational_modifications::Position as ModificationPosition;
 use fancy_regex::Regex;
 use futures::Stream;
-use macpepdb::chemistry::amino_acid::calc_sequence_mass;
 use macpepdb::chemistry::molecule::WATER;
-use macpepdb::database::configuration_table::ConfigurationTable as ConfigurationTableTrait;
-use macpepdb::database::scylla::client::Client as DbClient;
-use macpepdb::database::scylla::client::GenericClient;
-use macpepdb::database::scylla::configuration_table::ConfigurationTable;
-use macpepdb::database::scylla::peptide_table::PeptideTable;
-use macpepdb::database::selectable_table::SelectableTable;
-use macpepdb::entities::configuration::Configuration as DbConfiguration;
-use macpepdb::tools::peptide_partitioner::get_mass_partition;
 use rand::{thread_rng, Rng};
-use reqwest;
-use scylla::frame::response::result::CqlValue;
 
 // internal imports
 use crate::search_space::decoy_part::DecoyPart;
-
-/// Target loopup url
-/// For http urls, a placeholder for the sequence added to the url `:sequence:`
-///
-#[derive(Clone)]
-pub enum TargetLookupUrl {
-    None,
-    Web(String),
-    Database(String),
-    WebBloomFilter(String),
-}
-
-impl FromStr for TargetLookupUrl {
-    type Err = anyhow::Error;
-
-    fn from_str(url: &str) -> Result<Self> {
-        if url.is_empty() {
-            Ok(TargetLookupUrl::None)
-        } else if url.starts_with("http") {
-            Ok(TargetLookupUrl::Web(format!(
-                "{}/api/peptides/:sequence:/exists",
-                url
-            )))
-        } else if url.starts_with("bloom+http") {
-            Ok(TargetLookupUrl::WebBloomFilter(format!(
-                "{}/lookup/everywhere/:sequence:",
-                &url[6..]
-            )))
-        } else if url.starts_with("scylla") {
-            Ok(TargetLookupUrl::Database(url.to_string()))
-        } else {
-            bail!("Unknown target lookup type for url: {}", url)
-        }
-    }
-}
 
 /// Generate a decoy within the given mass range and parameters
 /// by generating a random sequence of amino acids until the mass is larger
@@ -68,8 +21,6 @@ impl FromStr for TargetLookupUrl {
 /// the range.
 ///
 pub struct DecoyGenerator {
-    target_lookup_url: TargetLookupUrl,
-    initial_target_lookup_url: Option<String>,
     cleavage_terminus: Terminus,
     allowed_cleavage_amino_acids: Vec<char>,
     missed_cleavage_regex: Regex,
@@ -79,14 +30,10 @@ pub struct DecoyGenerator {
     static_n_terminus_modification: i64,
     static_c_terminus_modification: i64,
     mass_distance_matrix: Vec<Vec<i64>>,
-    http_client: Option<reqwest::Client>,
-    db_client: Option<DbClient>,
-    db_configuration: Option<DbConfiguration>,
 }
 
 impl DecoyGenerator {
     pub async fn new(
-        target_lookup_url: Option<String>,
         cleavage_terminus: Terminus,
         allowed_cleavage_amino_acids: Vec<char>,
         missed_cleavage_regex: Regex,
@@ -96,28 +43,6 @@ impl DecoyGenerator {
         static_c_terminus_modification: i64,
     ) -> Result<Self> {
         let mass_distance_matrix = Self::build_mass_distance_matrix(&decoy_parts);
-        let initial_target_lookup_url = target_lookup_url.clone();
-        let target_lookup_url = match target_lookup_url {
-            Some(url) => TargetLookupUrl::from_str(url.as_str())?,
-            None => TargetLookupUrl::None,
-        };
-
-        let http_client = match target_lookup_url {
-            TargetLookupUrl::Web(_) | TargetLookupUrl::WebBloomFilter(_) => {
-                Some(reqwest::Client::new())
-            }
-            _ => None,
-        };
-
-        let (db_client, db_configuration): (Option<DbClient>, Option<DbConfiguration>) =
-            match &target_lookup_url {
-                TargetLookupUrl::Database(url) => {
-                    let client = DbClient::new(url.as_str()).await?;
-                    let configuration = ConfigurationTable::select(&client).await?;
-                    (Some(client), Some(configuration))
-                }
-                _ => (None, None),
-            };
 
         // Collect decoy parts for each allowed cleavage amino acid
         // without modification or with modification fitting the cleavage site
@@ -146,7 +71,6 @@ impl DecoyGenerator {
         }
 
         Ok(Self {
-            target_lookup_url,
             cleavage_terminus,
             allowed_cleavage_amino_acids,
             missed_cleavage_regex,
@@ -156,10 +80,6 @@ impl DecoyGenerator {
             static_n_terminus_modification,
             static_c_terminus_modification,
             mass_distance_matrix,
-            http_client,
-            db_client,
-            db_configuration,
-            initial_target_lookup_url,
         })
     }
 
@@ -209,7 +129,7 @@ impl DecoyGenerator {
         // Cast once so it can be used multiple times
         let max_number_of_missed_cleavages_u = max_number_of_missed_cleavages as usize;
         let mut rng = thread_rng();
-        'decoy_loop: while start.elapsed().as_secs_f64() < timeout {
+        while start.elapsed().as_secs_f64() < timeout {
             let mut mass = WATER.get_mono_mass()
                 + self.static_n_terminus_modification
                 + self.static_c_terminus_modification;
@@ -275,20 +195,15 @@ impl DecoyGenerator {
                     && number_of_variable_modifications <= max_number_of_variable_modifications
                     && number_of_missed_cleavages <= max_number_of_missed_cleavages_u
                 {
-                    if self.is_not_a_target(&sequence_str).await? {
-                        if !annotate_modifications {
-                            return Ok(Some(sequence_str));
-                        } else {
-                            return Ok(Some(
-                                sequence
-                                    .iter()
-                                    .map(|decoy_part| decoy_part.to_string())
-                                    .collect::<String>(),
-                            ));
-                        }
+                    if !annotate_modifications {
+                        return Ok(Some(sequence_str));
                     } else {
-                        // If sequence was target, just generate a new one
-                        continue 'decoy_loop;
+                        return Ok(Some(
+                            sequence
+                                .iter()
+                                .map(|decoy_part| decoy_part.to_string())
+                                .collect::<String>(),
+                        ));
                     }
                 }
 
@@ -356,63 +271,6 @@ impl DecoyGenerator {
             }
         }
         Ok(None)
-    }
-
-    async fn is_not_a_target(&self, sequence: &str) -> Result<bool> {
-        match &self.target_lookup_url {
-            TargetLookupUrl::None => Ok(true),
-            TargetLookupUrl::Database(_) => {
-                let sequence = sequence.to_uppercase();
-                let mass = calc_sequence_mass(sequence.as_str())?;
-                let partition = get_mass_partition(
-                    self.db_configuration
-                        .as_ref()
-                        .unwrap()
-                        .get_partition_limits(),
-                    mass,
-                )?;
-                let peptide_opt = PeptideTable::select(
-                    self.db_client.as_ref().unwrap(),
-                    "WHERE partition = ? AND mass = ? and sequence = ?",
-                    &[
-                        &CqlValue::BigInt(partition as i64),
-                        &CqlValue::BigInt(mass),
-                        &CqlValue::Text(sequence),
-                    ],
-                )
-                .await?;
-                Ok(peptide_opt.is_none())
-            }
-            TargetLookupUrl::Web(url) | TargetLookupUrl::WebBloomFilter(url) => {
-                let url = url.replace(":sequence:", sequence);
-                // let response = match &self.http_client {
-                //     Some(client) => client.get(&url).send().await?,
-                //     None => bail!(
-                //         "No http client available, but TargetLookupType is Web or WebBloomFilter"
-                //     ),
-                // };
-
-                match self
-                    .http_client
-                    .as_ref()
-                    .unwrap()
-                    .get(&url)
-                    .send()
-                    .await?
-                    .status()
-                    .as_u16()
-                {
-                    200 => {
-                        // If sequence was target, just generate a new one
-                        Ok(false)
-                    }
-                    404 => Ok(true),
-                    unknown => {
-                        bail!("Unexpected response status: {}", unknown);
-                    }
-                }
-            }
-        }
     }
 
     /// Generates multiple decoys within the given mass range and parameters.
@@ -521,7 +379,6 @@ impl DecoyGenerator {
     ///
     pub async fn async_clone(&self) -> Result<Self> {
         Ok(Self::new(
-            self.initial_target_lookup_url.clone(),
             self.cleavage_terminus.clone(),
             self.allowed_cleavage_amino_acids.clone(),
             self.missed_cleavage_regex.clone(),

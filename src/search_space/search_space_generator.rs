@@ -29,6 +29,9 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
 // internal imports
+use super::decoy_generator::DecoyGenerator;
+use super::decoy_part::DecoyPart;
+use crate::search_space::target_lookup::TargetLookup;
 use crate::{
     constants::{
         FASTA_DECOY_ENTRY_NAME_PREFIX, FASTA_DECOY_ENTRY_PREFIX, FASTA_TARGET_ENTRY_NAME_PREFIX,
@@ -36,9 +39,6 @@ use crate::{
     },
     functions::gen_fasta_entry,
 };
-
-use super::decoy_generator::DecoyGenerator;
-use super::decoy_part::DecoyPart;
 
 /// Path to the peptide search endpoint of MaCPepDB
 ///
@@ -283,6 +283,11 @@ impl SearchSpaceGenerator {
         max_variable_modifications: i8,
         ptms: Vec<PTM>,
     ) -> Result<usize> {
+        let target_lookup: Option<TargetLookup> = match self.target_lookup_url {
+            Some(ref url) => Some(TargetLookup::new(url).await?),
+            None => None,
+        };
+
         let mut decoy_ctr = decoy_ctr;
 
         let statically_modified_amino_acids = ptms
@@ -341,7 +346,6 @@ impl SearchSpaceGenerator {
             };
 
         let decoy_gen = DecoyGenerator::new(
-            self.target_lookup_url.clone(),
             Terminus::C,
             vec!['K', 'R'],
             Regex::new(r"(?<=[KR])(?!(P|$))")?,
@@ -380,10 +384,16 @@ impl SearchSpaceGenerator {
         pin_mut!(decoy_stream);
 
         while let Some(decoy) = decoy_stream.next().await {
+            let sequence = decoy?;
+            if let Some(ref target_lookup) = target_lookup {
+                if target_lookup.is_target(&sequence).await? {
+                    continue;
+                }
+            }
             fasta_file
                 .write(
                     gen_fasta_entry(
-                        decoy?.as_str(),
+                        sequence.as_str(),
                         decoy_ctr,
                         FASTA_DECOY_ENTRY_PREFIX,
                         FASTA_DECOY_ENTRY_NAME_PREFIX,
