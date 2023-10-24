@@ -1,13 +1,20 @@
+// std imports
+use std::path::Path;
+
 // 3rd party imports
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::ProgressStyle;
+use macpepdb::functions::post_translational_modification::validate_ptm_vec;
+use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
+use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
+use maccoys::search_space::search_space_generator::SearchSpaceGenerator;
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -25,6 +32,35 @@ enum Commands {
         /// Path or http(s)-URL to a MaCPepDB configuration JSON file. If a URL is given, the file will be downloaded and parsed.
         /// If you have no working MaCPepDB do download one, you can use the default from the MaCcoyS repo.
         configuration_resource: String,
+    },
+    /// Build search space for the given mass, mass tolerance and PTMs.
+    ///
+    SearchSpaceBuild {
+        /// Path to search space FASTA file.
+        fasta_file_path: String,
+        /// Path to PTM file
+        ptm_file_path: String,
+        /// Mass
+        mass: f64,
+        /// Lower mass tolerance in PPM
+        lower_mass_tolerance_ppm: i64,
+        /// Upper mass tolerance in PPM
+        upper_mass_tolerance_ppm: i64,
+        /// Maximal number of variable modifications
+        max_variable_modifications: i8,
+        /// Amount of decoys to generate
+        decoys_per_peptide: usize,
+        /// URL for fetching targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        target_url: String,
+        /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        decoy_url: Option<String>,
+        /// Optional URL for checking generated decoy against targets.
+        /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
+        /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
+        /// If not given, decoys will not be checked against the target database and considered as "correct".
+        target_lookup_url: Option<String>,
+        /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        decoy_cache_url: Option<String>,
     },
 }
 
@@ -78,6 +114,40 @@ async fn main() -> Result<()> {
             let build = DatabaseBuild::new(&database_url);
             build.build(&configuration_resource).await?;
             info!("Database build finished");
+        }
+        Commands::SearchSpaceBuild {
+            fasta_file_path,
+            ptm_file_path,
+            mass,
+            lower_mass_tolerance_ppm,
+            upper_mass_tolerance_ppm,
+            max_variable_modifications,
+            decoys_per_peptide,
+            target_url,
+            decoy_url,
+            target_lookup_url,
+            decoy_cache_url,
+        } => {
+            let ptm = PtmReader::read(Path::new(&ptm_file_path))?;
+            validate_ptm_vec(&ptm)?;
+            let search_space_generator = SearchSpaceGenerator::new(
+                target_url.as_str(),
+                decoy_url,
+                target_lookup_url,
+                decoy_cache_url,
+            )
+            .await?;
+            search_space_generator
+                .create(
+                    Path::new(&fasta_file_path),
+                    mass_to_int(mass),
+                    lower_mass_tolerance_ppm,
+                    upper_mass_tolerance_ppm,
+                    max_variable_modifications,
+                    ptm,
+                    decoys_per_peptide,
+                )
+                .await?;
         }
     };
 

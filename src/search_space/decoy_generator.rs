@@ -181,8 +181,8 @@ impl DecoyGenerator {
     /// Generates one decoys within the given mass range and parameters.
     ///
     /// # Arguments
-    /// * `mass_tolerance_lower` - The lower bound of the mass tolerance
-    /// * `mass_tolerance_upper` - The upper bound of the mass tolerance
+    /// * `upper_mass_tolerance_ppm` - The lower bound of the mass tolerance
+    /// * `lower_mass_tolerance_ppm` - The upper bound of the mass tolerance
     /// * `min_decoy_length` - Min decoy length
     /// * `max_decoy_length` - Max decoy length
     /// * `max_number_of_variable_modifications` - The maximum number of modifications
@@ -193,8 +193,8 @@ impl DecoyGenerator {
     pub async fn generate(
         &self,
         target_mass: i64,
-        mass_tolerance_lower: i64,
-        mass_tolerance_upper: i64,
+        upper_mass_tolerance_ppm: i64,
+        lower_mass_tolerance_ppm: i64,
         min_decoy_length: usize,
         max_decoy_length: usize,
         max_number_of_variable_modifications: i8,
@@ -203,6 +203,9 @@ impl DecoyGenerator {
         annotate_modifications: bool,
     ) -> Result<Option<String>> {
         let start = Instant::now();
+        let lower_mass_limit = target_mass - target_mass * lower_mass_tolerance_ppm / 1_000_000;
+        let upper_mass_limit = target_mass + target_mass * upper_mass_tolerance_ppm / 1_000_000;
+
         // Cast once so it can be used multiple times
         let max_number_of_missed_cleavages_u = max_number_of_missed_cleavages as usize;
         let mut rng = thread_rng();
@@ -231,7 +234,7 @@ impl DecoyGenerator {
             }
 
             // Build random sequence
-            while mass < mass_tolerance_upper {
+            while mass < upper_mass_limit {
                 let random_amino_acid_idx = rng.gen_range(0..self.decoy_parts.len());
                 match self.cleavage_terminus {
                     // C-terminus is cleavage site. Adding to N-terminus
@@ -265,8 +268,8 @@ impl DecoyGenerator {
                     .count();
 
                 // Check if mass, missed_cleavages and modifications are within tolerances
-                if mass_tolerance_lower <= mass
-                    && mass <= mass_tolerance_upper
+                if lower_mass_limit <= mass
+                    && mass <= upper_mass_limit
                     && min_decoy_length <= sequence.len()
                     && sequence.len() <= max_decoy_length
                     && number_of_variable_modifications <= max_number_of_variable_modifications
@@ -416,8 +419,8 @@ impl DecoyGenerator {
     /// Stops if the amount of decoys or the timeout is reached.
     ///
     /// # Arguments
-    /// * `mass_tolerance_lower` - The lower bound of the mass tolerance
-    /// * `mass_tolerance_upper` - The upper bound of the mass tolerance
+    /// * `lower_mass_tolerance` - The lower bound of the mass tolerance
+    /// * `upper_mass_tolerance` - The upper bound of the mass tolerance
     /// * `min_decoy_length` - Min decoy length
     /// * `max_decoy_length` - Max decoy length
     /// * `max_number_of_variable_modifications` - The maximum number of modifications
@@ -429,8 +432,8 @@ impl DecoyGenerator {
     pub async fn generate_multiple(
         &mut self,
         target_mass: i64,
-        mass_tolerance_lower: i64,
-        mass_tolerance_upper: i64,
+        lower_mass_tolerance_ppm: i64,
+        upper_mass_tolerance_ppm: i64,
         min_decoy_length: usize,
         max_decoy_length: usize,
         max_number_of_variable_modifications: i8,
@@ -445,8 +448,8 @@ impl DecoyGenerator {
             match self
                 .generate(
                     target_mass,
-                    mass_tolerance_lower,
-                    mass_tolerance_upper,
+                    lower_mass_tolerance_ppm,
+                    upper_mass_tolerance_ppm,
                     min_decoy_length,
                     max_decoy_length,
                     max_number_of_variable_modifications,
@@ -469,7 +472,7 @@ impl DecoyGenerator {
     /// # Arguments
     /// * `target_mass` - The target mass
     /// * `mass_tolerance_lower` - The lower bound of the mass tolerance
-    /// * `mass_tolerance_upper` - The upper bound of the mass tolerance
+    /// * `upper_mass_tolerance` - The upper bound of the mass tolerance
     /// * `min_decoy_length` - Min decoy length
     /// * `max_decoy_length` - Max decoy length
     /// * `max_number_of_variable_modifications` - The maximum number of modifications
@@ -480,8 +483,8 @@ impl DecoyGenerator {
     pub async fn stream<'a>(
         &'a self,
         target_mass: i64,
-        mass_tolerance_lower: i64,
-        mass_tolerance_upper: i64,
+        lower_mass_tolerance_ppm: i64,
+        upper_mass_tolerance_ppm: i64,
         min_decoy_length: usize,
         max_decoy_length: usize,
         max_number_of_variable_modifications: i8,
@@ -495,8 +498,8 @@ impl DecoyGenerator {
                 let start = Instant::now();
                 match self.generate(
                     target_mass,
-                    mass_tolerance_lower,
-                    mass_tolerance_upper,
+                    lower_mass_tolerance_ppm,
+                    upper_mass_tolerance_ppm,
                     min_decoy_length,
                     max_decoy_length,
                     max_number_of_variable_modifications,
@@ -514,7 +517,7 @@ impl DecoyGenerator {
         })
     }
 
-    /// Aynchronous clone of the decoy generator
+    /// Asynchronous clone of the decoy generator
     ///
     pub async fn async_clone(&self) -> Result<Self> {
         Ok(Self::new(

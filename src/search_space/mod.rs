@@ -4,3 +4,5 @@ pub mod decoy_cache;
 pub mod decoy_generator;
 /// Sequence part for the decoy generator
 pub mod decoy_part;
+/// Search space generator
+pub mod search_space_generator;

@@ -24,14 +24,14 @@ anyhow = "1.0.75"
 async-stream = "0.3.5"
 axum = "0.6.20"
 clap = { version = "4.4.6", features = ["derive"] }
-dihardts_omicstools = "1.4.0"
+dihardts_omicstools = "1.5.0"
 fallible-iterator = "0.3.0"
 fancy-regex = "0.11.0"
 futures = "0.3.28"
 indicatif = "0.17.7"
 macpepdb = { path = "../macpepdb-rs" }
 rand = "0.8.5"
-reqwest = { version = "0.11.22", features = ["blocking", "json"] }
+reqwest = { version = "0.11.22", features = ["blocking", "json", "stream"] }
 scylla = "0.8.1"
 serde = "1.0.189"
 serde_json = "1.0.107"
