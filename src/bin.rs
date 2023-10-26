@@ -1,5 +1,5 @@
 // std imports
-use std::fs::write as write_file;
+use std::fs::{read_to_string, write as write_file};
 use std::path::Path;
 
 // 3rd party imports
@@ -16,6 +16,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
+use maccoys::io::mzml::{index::Index, indexed_extractor::IndexedExtractor};
 use maccoys::search_space::search_space_generator::SearchSpaceGenerator;
 use maccoys::web::server::start as start_web_server;
 
@@ -77,6 +78,17 @@ enum Commands {
         /// Chunks to read from file at ones. Increase it if you have a lot on memory. Default: [crate::io::mzml::indexer::DEFAULT_CHUNK_SIZE]
         #[arg(short = 'c')]
         chunks_size: Option<usize>,
+    },
+    /// Extract a spectrum from a spectrum file into a separate valid file. Only mzML is supported yet.
+    ExtractSpectrum {
+        /// Path to original spectrum file
+        original_spectrum_file_path: String,
+        /// Path to index file for the original spectrum file
+        index_file_path: String,
+        /// Spectrum ID
+        spectrum_id: String,
+        /// Path to output file
+        output_file_path: String,
     },
 }
 
@@ -172,6 +184,20 @@ async fn main() -> Result<()> {
         } => {
             let index = Indexer::create_index(Path::new(&spectrum_file_path), chunks_size)?;
             write_file(Path::new(&index_file_path), index.to_json()?.as_bytes())?;
+        }
+        Commands::ExtractSpectrum {
+            original_spectrum_file_path,
+            index_file_path,
+            spectrum_id,
+            output_file_path,
+        } => {
+            let index = Index::from_json(&read_to_string(&Path::new(&index_file_path))?)?;
+            let mut extractor =
+                IndexedExtractor::new(Path::new(&original_spectrum_file_path), &index)?;
+            write_file(
+                &Path::new(&output_file_path),
+                extractor.extract_spectrum(&spectrum_id)?,
+            )?;
         }
     };
 
