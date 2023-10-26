@@ -1,10 +1,12 @@
 // std imports
+use std::fs::write as write_file;
 use std::path::Path;
 
 // 3rd party imports
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::ProgressStyle;
+use maccoys::io::mzml::indexer::Indexer;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
@@ -64,6 +66,17 @@ enum Commands {
         /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
         #[arg(short = 'c')]
         decoy_cache_url: Option<String>,
+    },
+    /// Index a spectrum file for fast access. Only mzML is supported yet.
+    ///
+    IndexSpectrumFile {
+        /// Path to spectrum file
+        spectrum_file_path: String,
+        /// Path to index file
+        index_file_path: String,
+        /// Chunks to read from file at ones. Increase it if you have a lot on memory. Default: [crate::io::mzml::indexer::DEFAULT_CHUNK_SIZE]
+        #[arg(short = 'c')]
+        chunks_size: Option<usize>,
     },
 }
 
@@ -151,6 +164,14 @@ async fn main() -> Result<()> {
                     decoys_per_peptide,
                 )
                 .await?;
+        }
+        Commands::IndexSpectrumFile {
+            spectrum_file_path,
+            index_file_path,
+            chunks_size,
+        } => {
+            let index = Indexer::create_index(Path::new(&spectrum_file_path), chunks_size)?;
+            write_file(Path::new(&index_file_path), index.to_json()?.as_bytes())?;
         }
     };
 
