@@ -6,7 +6,6 @@ use std::path::Path;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::ProgressStyle;
-use maccoys::io::mzml::indexer::Indexer;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
@@ -16,7 +15,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::io::mzml::{index::Index, indexed_extractor::IndexedExtractor};
+use maccoys::io::mzml::{index::Index, indexed_extractor::IndexedExtractor, indexer::Indexer};
 use maccoys::search_space::search_space_generator::SearchSpaceGenerator;
 use maccoys::web::server::start as start_web_server;
 
