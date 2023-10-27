@@ -5,6 +5,9 @@ use std::path::Path;
 // 3rd party imports
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dihardts_omicstools::proteomics::io::mzml::{
+    index::Index, indexed_reader::IndexedReader, indexer::Indexer,
+};
 use indicatif::ProgressStyle;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
@@ -15,7 +18,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::io::mzml::{index::Index, indexed_extractor::IndexedExtractor, indexer::Indexer};
 use maccoys::search_space::search_space_generator::SearchSpaceGenerator;
 use maccoys::web::server::start as start_web_server;
 
@@ -192,7 +194,7 @@ async fn main() -> Result<()> {
         } => {
             let index = Index::from_json(&read_to_string(&Path::new(&index_file_path))?)?;
             let mut extractor =
-                IndexedExtractor::new(Path::new(&original_spectrum_file_path), &index)?;
+                IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;
             write_file(
                 &Path::new(&output_file_path),
                 extractor.extract_spectrum(&spectrum_id)?,
