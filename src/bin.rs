@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 // std imports
 use std::fs::{read_to_string, write as write_file};
 use std::path::Path;
@@ -5,8 +6,10 @@ use std::path::Path;
 // 3rd party imports
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dihardts_omicstools::mass_spectrometry::spectrum::Spectrum as SpectrumTrait;
+use dihardts_omicstools::proteomics::io::mzml::reader::Spectrum;
 use dihardts_omicstools::proteomics::io::mzml::{
-    index::Index, indexed_reader::IndexedReader, indexer::Indexer,
+    index::Index, indexed_reader::IndexedReader, indexer::Indexer, reader::Reader as MzmlReader,
 };
 use indicatif::ProgressStyle;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
@@ -183,8 +186,34 @@ async fn main() -> Result<()> {
             index_file_path,
             chunks_size,
         } => {
-            let index = Indexer::create_index(Path::new(&spectrum_file_path), chunks_size)?;
-            write_file(Path::new(&index_file_path), index.to_json()?.as_bytes())?;
+            let spectra_file = Path::new(&spectrum_file_path);
+            let index = Indexer::create_index(&spectra_file, chunks_size)?;
+            let mut indexed_reader = IndexedReader::new(&spectra_file, &index)?;
+            let mut ms2_spectra_map: HashMap<String, (usize, usize)> = HashMap::new();
+            for (spec_id, spec_offsets) in index.get_spectra() {
+                match MzmlReader::parse_spectrum_xml(
+                    indexed_reader.get_raw_spectrum(spec_id)?.as_slice(),
+                )? {
+                    Spectrum::MsNSpectrum(spec) => {
+                        if spec.get_ms_level() == 2 {
+                            ms2_spectra_map.insert(spec_id.clone(), spec_offsets.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let ms2_filtered_index = Index::new(
+                index.get_file_path().clone(),
+                index.get_indention().to_string(),
+                index.get_default_data_processing_ref().to_string(),
+                index.get_general_information_len(),
+                ms2_spectra_map,
+                HashMap::new(),
+            );
+            write_file(
+                Path::new(&index_file_path),
+                ms2_filtered_index.to_json()?.as_bytes(),
+            )?;
         }
         Commands::ExtractSpectrum {
             original_spectrum_file_path,
