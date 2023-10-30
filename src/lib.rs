@@ -10,6 +10,8 @@ pub mod constants;
 pub mod database;
 /// Various functions for converting, parsing and generating data.
 pub mod functions;
+/// IO module for reading and writing files.
+pub mod io;
 /// Module for generating MaCcoyS search spaces
 pub mod search_space;
 /// Web API endpoints for adding decoys to a MaCPepDB database used only for decoys.
