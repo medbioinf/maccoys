@@ -1,10 +1,14 @@
 // std import
-use std::fs::read_to_string;
 use std::path::Path;
+use std::{collections::HashSet, fs::read_to_string};
 
 // 3rd party imports
-use anyhow::Result;
-use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, ISOLEUCINE, PYRROLYSINE};
+use anyhow::{bail, Result};
+use dihardts_omicstools::chemistry::amino_acid::CANONICAL_AMINO_ACIDS;
+use dihardts_omicstools::{
+    chemistry::amino_acid::{AminoAcid, ISOLEUCINE, NON_CANONICAL_AMINO_ACIDS, PYRROLYSINE},
+    proteomics::post_translational_modifications::PostTranslationalModification,
+};
 use fancy_regex::Regex;
 
 // internal imports
@@ -14,12 +18,22 @@ use crate::constants::FASTA_DECOY_ENTRY_PREFIX;
 ///
 pub struct Configuration {
     content: String,
+    num_variable_modifications: u8,
+    used_static_modifications: HashSet<char>,
+    is_n_term_bond_used: bool,
+    is_c_term_bond_used: bool,
 }
 
 impl Configuration {
     pub fn new(default_comet_file_path: &Path) -> Result<Self> {
         let mut conf = Self {
             content: read_to_string(default_comet_file_path)?,
+            num_variable_modifications: 0,
+            used_static_modifications: HashSet::with_capacity(
+                CANONICAL_AMINO_ACIDS.len() + NON_CANONICAL_AMINO_ACIDS.len(),
+            ),
+            is_n_term_bond_used: false,
+            is_c_term_bond_used: false,
         };
         conf.cleanup_content()?;
 
@@ -131,6 +145,103 @@ impl Configuration {
             "max_variable_mods_in_peptide",
             &max_variable_mods.to_string(),
         )?;
+        Ok(())
+    }
+
+    /// Sets the post translational modifications
+    /// * Static/anywhere will be set as `add_<amino_acid_code>_<amino_acid_name>`
+    /// * Static/n-bond will be set as `add_Nterm_peptide`
+    /// * Static/c-bond will be set as `add_Cterm_peptide`
+    /// * Variable will be set as `variable_mod0<index>` if it is
+    /// TODO: How to handle Static/terminal? As variable? Otherwise there is no option to set a terminal modification to a specific amino acid in comet.
+    ///
+    /// # Arguments
+    /// * `ptms` - Post translational modifications to set
+    /// * `max_variable_modifications` - Maximum number of variable modifications per peptide.
+    ///
+    pub fn set_ptms(
+        &mut self,
+        ptms: &Vec<PostTranslationalModification>,
+        max_variable_modifications: i8,
+    ) -> Result<()> {
+        for ptm in ptms {
+            // Handle static PTMs for any position
+            if ptm.is_static() {
+                if ptm.is_anywhere() {
+                    if self
+                        .used_static_modifications
+                        .contains(ptm.get_amino_acid().get_code())
+                    {
+                        bail!(
+                            "Static modification for {} is already used!",
+                            ptm.get_amino_acid().get_code()
+                        );
+                    }
+                    let option_name =
+                        // Cannot use `.contains()` as AminoAcid nor NonCanonicalAminoAcid implement `PartialEq`
+                        match NON_CANONICAL_AMINO_ACIDS
+                            .iter()
+                            .find(|non_canonical_amino_acid| {
+                                non_canonical_amino_acid.get_code()
+                                    == ptm.get_amino_acid().get_code()
+                            }) {
+                            Some(_) => format!(
+                                "add_{}_{}",
+                                ptm.get_amino_acid().get_code(),
+                                ptm.get_amino_acid().get_name().to_lowercase()
+                            ),
+                            None => {
+                                format!("add_{}_user_amino_acid", ptm.get_amino_acid().get_code(),)
+                            }
+                        };
+                    self.set_option(&option_name, &ptm.get_mass_delta().to_string())?;
+                    self.used_static_modifications
+                        .insert(*ptm.get_amino_acid().get_code());
+                }
+                if ptm.is_n_bond() {
+                    if self.is_n_term_bond_used {
+                        bail!("N-term bond is already used!");
+                    }
+                    self.set_option("add_Nterm_peptide", &ptm.get_mass_delta().to_string())?;
+                    self.is_n_term_bond_used = true;
+                }
+                if ptm.is_c_bond() {
+                    if self.is_c_term_bond_used {
+                        bail!("C-term bond is already used!");
+                    }
+                    self.set_option("add_Cterm_peptide", &ptm.get_mass_delta().to_string())?;
+                    self.is_c_term_bond_used = true;
+                }
+            }
+            if ptm.is_variable() {
+                self.num_variable_modifications += 1;
+                if self.num_variable_modifications > 9 {
+                    bail!("Comet only supports 9 variable modifications!");
+                }
+                let option_name = format!("variable_mod0{}", self.num_variable_modifications);
+                let terminus = if ptm.is_n_terminus() {
+                    2
+                } else if ptm.is_c_terminus() {
+                    1
+                } else {
+                    0
+                };
+                let distance = if ptm.is_n_terminus() || ptm.is_c_terminus() {
+                    0
+                } else {
+                    -1
+                };
+                let value = format!(
+                    "{} {} 0 {} {} {} 0 0.0",
+                    ptm.get_mass_delta(),
+                    ptm.get_amino_acid().get_code(),
+                    max_variable_modifications,
+                    terminus,
+                    distance
+                );
+                self.set_option(&option_name, &value)?;
+            }
+        }
         Ok(())
     }
 }
