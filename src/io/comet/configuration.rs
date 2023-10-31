@@ -1,6 +1,7 @@
 // std import
+use std::collections::HashSet;
+use std::fs::{read_to_string, write as write_to_file};
 use std::path::Path;
-use std::{collections::HashSet, fs::read_to_string};
 
 // 3rd party imports
 use anyhow::{bail, Result};
@@ -50,7 +51,6 @@ impl Configuration {
     pub fn set_option(&mut self, option_name: &str, value: &str) -> Result<()> {
         let raw_replace_regex = format!(r"(?m)^{} = .+$", option_name); // (?m) is multiline flags
         let replacement_regex = Regex::new(&raw_replace_regex)?;
-        println!("{:?}", replacement_regex);
         self.content = replacement_regex
             .replace(&self.content, format!("{} = {}", option_name, value))
             .to_string();
@@ -242,6 +242,16 @@ impl Configuration {
                 self.set_option(&option_name, &value)?;
             }
         }
+        Ok(())
+    }
+
+    /// Writes the configuration to the given path.
+    ///
+    /// # Arguments
+    /// * `path` - Path to write the configuration to.
+    ///
+    pub fn to_file(&self, path: &Path) -> Result<()> {
+        write_to_file(path, &self.content)?;
         Ok(())
     }
 }
