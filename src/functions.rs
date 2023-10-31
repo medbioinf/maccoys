@@ -195,11 +195,11 @@ pub async fn search(
             for precursor_charge in precursor_charges {
                 let mass = mass_to_int(mass_to_charge_to_dalton(*precursor_mz, precursor_charge));
                 let fasta_file_path = work_dir.join(format!(
-                    "__{}__{}__{}.fasta",
+                    "{}__{}__{}.fasta",
                     sanitized_spec_id, precursor_mz, precursor_charge
                 ));
                 let comet_config_path = work_dir.join(format!(
-                    "__{}__{}__{}.comet.params",
+                    "{}__{}__{}.comet.params",
                     sanitized_spec_id, precursor_mz, precursor_charge
                 ));
                 comet_config.set_charge(precursor_charge)?;
