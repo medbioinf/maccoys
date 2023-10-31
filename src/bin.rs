@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 // std imports
+use std::collections::HashMap;
 use std::fs::{read_to_string, write as write_file};
 use std::path::Path;
 
@@ -12,7 +12,6 @@ use dihardts_omicstools::proteomics::io::mzml::{
     index::Index, indexed_reader::IndexedReader, indexer::Indexer, reader::Reader as MzmlReader,
 };
 use indicatif::ProgressStyle;
-use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -21,7 +20,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::search_space::search_space_generator::SearchSpaceGenerator;
+use maccoys::functions::create_search_space;
+use maccoys::functions::search;
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -94,6 +94,46 @@ enum Commands {
         /// Path to output file
         output_file_path: String,
     },
+    /// Creates extracts the given spectrum from the spectra file, creates a search space for the spectrum
+    /// and creates the search engine config.
+    Search {
+        /// Path to original spectrum file
+        original_spectrum_file_path: String,
+        /// Path to index file for the original spectrum file
+        index_file_path: String,
+        /// Spectrum ID
+        spectrum_id: String,
+        /// Work directory
+        work_dir: String,
+        /// Path to default comet config file
+        default_comet_file_path: String,
+        /// Path to PTM file
+        ptm_file_path: String,
+        /// Lower mass tolerance in PPM
+        lower_mass_tolerance_ppm: i64,
+        /// Upper mass tolerance in PPM
+        upper_mass_tolerance_ppm: i64,
+        /// Maximal number of variable modifications
+        max_variable_modifications: i8,
+        /// Charge limit used when spectrum has not charges assigned. Every charge from 1 to max_charge will be tried.
+        max_charge: u8,
+        /// Amount of decoys to generate
+        decoys_per_peptide: usize,
+        /// URL for fetching targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        target_url: String,
+        /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        #[arg(short)]
+        decoy_url: Option<String>,
+        /// Optional URL for checking generated decoy against targets.
+        /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
+        /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
+        /// If not given, decoys will not be checked against the target database and considered as "correct".
+        #[arg(short)]
+        target_lookup_url: Option<String>,
+        /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        #[arg(short = 'c')]
+        decoy_cache_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -160,26 +200,21 @@ async fn main() -> Result<()> {
             target_lookup_url,
             decoy_cache_url,
         } => {
-            let ptm = PtmReader::read(Path::new(&ptm_file_path))?;
-            validate_ptm_vec(&ptm)?;
-            let search_space_generator = SearchSpaceGenerator::new(
-                target_url.as_str(),
+            let ptms = PtmReader::read(Path::new(&ptm_file_path))?;
+            create_search_space(
+                Path::new(&fasta_file_path),
+                &ptms,
+                mass_to_int(mass),
+                lower_mass_tolerance_ppm,
+                upper_mass_tolerance_ppm,
+                max_variable_modifications,
+                decoys_per_peptide,
+                target_url,
                 decoy_url,
                 target_lookup_url,
                 decoy_cache_url,
             )
             .await?;
-            search_space_generator
-                .create(
-                    Path::new(&fasta_file_path),
-                    mass_to_int(mass),
-                    lower_mass_tolerance_ppm,
-                    upper_mass_tolerance_ppm,
-                    max_variable_modifications,
-                    ptm,
-                    decoys_per_peptide,
-                )
-                .await?;
         }
         Commands::IndexSpectrumFile {
             spectrum_file_path,
@@ -228,6 +263,48 @@ async fn main() -> Result<()> {
                 &Path::new(&output_file_path),
                 extractor.extract_spectrum(&spectrum_id)?,
             )?;
+        }
+        Commands::Search {
+            original_spectrum_file_path,
+            index_file_path,
+            spectrum_id,
+            work_dir,
+            default_comet_file_path,
+            ptm_file_path,
+            lower_mass_tolerance_ppm,
+            upper_mass_tolerance_ppm,
+            max_variable_modifications,
+            max_charge,
+            decoys_per_peptide,
+            target_url,
+            decoy_url,
+            target_lookup_url,
+            decoy_cache_url,
+        } => {
+            let original_spectrum_file_path = Path::new(&original_spectrum_file_path);
+            let index_file_path = Path::new(&index_file_path);
+            let work_dir = Path::new(&work_dir);
+            let default_comet_file_path = Path::new(&default_comet_file_path);
+            let ptms = PtmReader::read(Path::new(&ptm_file_path))?;
+
+            search(
+                &original_spectrum_file_path,
+                &index_file_path,
+                &spectrum_id,
+                &work_dir,
+                &default_comet_file_path,
+                &ptms,
+                lower_mass_tolerance_ppm,
+                upper_mass_tolerance_ppm,
+                max_variable_modifications,
+                max_charge,
+                decoys_per_peptide,
+                &target_url,
+                decoy_url,
+                target_lookup_url,
+                decoy_cache_url,
+            )
+            .await?;
         }
     };
 

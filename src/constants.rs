@@ -17,3 +17,7 @@ pub const FASTA_DECOY_ENTRY_NAME_PREFIX: &'static str = "D";
 /// Max length for sequence lines in FASTA files
 ///
 pub const FASTA_SEQUENCE_LINE_LENGTH: usize = 60;
+
+/// Max number of PSMs for the comet search
+///
+pub const COMET_MAX_PSMS: u32 = 10000;
