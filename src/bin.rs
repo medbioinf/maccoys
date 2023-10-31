@@ -107,8 +107,6 @@ enum Commands {
         work_dir: String,
         /// Path to default comet config file
         default_comet_file_path: String,
-        /// Path to PTM file
-        ptm_file_path: String,
         /// Lower mass tolerance in PPM
         lower_mass_tolerance_ppm: i64,
         /// Upper mass tolerance in PPM
@@ -133,6 +131,9 @@ enum Commands {
         /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
         #[arg(short = 'c')]
         decoy_cache_url: Option<String>,
+        /// Path to PTM file
+        #[arg(short)]
+        ptm_file_path: Option<String>,
     },
 }
 
@@ -270,7 +271,6 @@ async fn main() -> Result<()> {
             spectrum_id,
             work_dir,
             default_comet_file_path,
-            ptm_file_path,
             lower_mass_tolerance_ppm,
             upper_mass_tolerance_ppm,
             max_variable_modifications,
@@ -280,12 +280,16 @@ async fn main() -> Result<()> {
             decoy_url,
             target_lookup_url,
             decoy_cache_url,
+            ptm_file_path,
         } => {
             let original_spectrum_file_path = Path::new(&original_spectrum_file_path);
             let index_file_path = Path::new(&index_file_path);
             let work_dir = Path::new(&work_dir);
             let default_comet_file_path = Path::new(&default_comet_file_path);
-            let ptms = PtmReader::read(Path::new(&ptm_file_path))?;
+            let ptms = match ptm_file_path {
+                Some(ptm_file_path) => PtmReader::read(Path::new(&ptm_file_path))?,
+                None => Vec::new(),
+            };
 
             search(
                 &original_spectrum_file_path,
