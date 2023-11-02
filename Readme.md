@@ -8,6 +8,7 @@ TODO: Separating of PSM
 
 ## Dependencieas
 * Rust nightly >= 2023-07-12
+* Nextflow
 
 ## Usage
 
@@ -31,10 +32,38 @@ Example:
 cargo run -r -- index-spectrum-file ./mzmls/QExHF06833std.mzML  ./tmp/QExHF06833std.index.json
 ```
 
-### Run searches
+### Identify a single MS2 spectrum
 `cargo run -r -- search --help` will give you an overview what is necessary to identify a MS2 spectra.
 
 Example:
 ```
 cargo run -r -- search ./mzmls/QExHF06833std.mzML ./tmp/QExHF06833std.index.json 'controllerType=0 controllerNumber=1 scan=28374' ./tmp test_files/comet.params 5 5 3 6 10  scylla://localhost:9042/macpepdb_mouse -p ../macpepdb-rs/test_files/mods.csv
 ```
+
+### Batch processing
+For a identifying multiple mzMLs including all MS2 use the provided Nextflow workflow.
+
+Example:
+```
+nextflow run maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./mzmls --result-dir ./tmp --search-name test --target-url scylla://localhost:9042/macpepdb_mouse
+```
+
+Arguments are mostly equal to the MaCcoyS binary.
+
+#### Required arguments
+| Argument | Description |
+| --- | --- |
+| --maccoys-bin | MaCcoyS binary (need to be compiled previously) |
+| --mzml-dir | Directory with mzML |
+| --lower-mass-tol | Lower mass tolerance of the MS (ppm) |
+| --upper-mass-tol | Upper mass tolerance of the MS (ppm) |
+| --max-var-ptm | Max. variable PTM per peptide |
+| --decoys-per-target | Decoys per target |
+| --max-charge | Max. charge tried for spectra where precurser charge was not reported. |
+| --target-url | Web or database URL for fetching target from MaCPepDB |
+| --results-root-dir | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
+
+#### Required arguments
+| Argument | Description |
+| --- | --- |
+| -- ptm-file | Files defining PTMs |
