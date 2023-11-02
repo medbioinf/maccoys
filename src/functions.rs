@@ -2,7 +2,6 @@
 use std::cmp::{max, min};
 use std::fs::{read_to_string, write as write_file};
 use std::path::Path;
-use std::process::Command;
 
 // 3rd party imports
 use anyhow::{bail, Context, Result};
@@ -22,6 +21,7 @@ use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
+use tokio::process::Command;
 use tracing::{error, info};
 
 use crate::constants::COMET_MAX_PSMS;
@@ -225,8 +225,14 @@ pub async fn search(
                     format!("-D{}", fasta_file_path.to_str().unwrap()),
                     extracted_spectrum_file_path.to_str().unwrap().to_string(),
                 ];
-                let output = Command::new("comet").args(comet_arguments).output()?;
-                debug!("{}", output.status);
+                let output = Command::new("comet").args(comet_arguments).output().await?;
+
+                info!("{}", String::from_utf8_lossy(&output.stdout));
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    error!("{}", &stderr);
+                    bail!(stderr)
+                }
             }
         }
     }
