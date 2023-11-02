@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 // 3rd party imports
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use dihardts_omicstools::mass_spectrometry::spectrum::{
     MsNSpectrum as MsNSpectrumTrait, Precursor as PrecursorTrait,
 };
@@ -22,7 +22,7 @@ use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
-use tracing::{debug, error};
+use tracing::{error, info};
 
 use crate::constants::COMET_MAX_PSMS;
 // internal imports
@@ -165,14 +165,14 @@ pub async fn search(
     write_file(
         &extracted_spectrum_file_path,
         extractor.extract_spectrum(&spectrum_id)?,
-    )?;
+    )
+    .context("Could not write extracted spectrum.")?;
     let spectrum =
         match MzmlReader::parse_spectrum_xml(extractor.get_raw_spectrum(&spectrum_id)?.as_slice())?
         {
             Spectrum::MsNSpectrum(spec) => spec,
             _ => {
-                error!("Extracted spectrum is not a MS2 spectrum");
-                return Ok(());
+                bail!("Extracted spectrum is not a MS2 spectrum");
             }
         };
     let mut comet_config = CometConfiguration::new(Path::new(&default_comet_file_path))?;
@@ -203,7 +203,9 @@ pub async fn search(
                     sanitized_spec_id, precursor_mz, precursor_charge
                 ));
                 comet_config.set_charge(precursor_charge)?;
-                comet_config.to_file(&comet_config_path)?;
+                comet_config
+                    .to_file(&comet_config_path)
+                    .context("Could not write adjusted Comet parameter file.")?;
                 create_search_space(
                     &fasta_file_path,
                     ptms,
