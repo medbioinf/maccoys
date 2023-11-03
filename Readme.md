@@ -64,7 +64,7 @@ Arguments are mostly equal to the MaCcoyS binary.
 #### Required arguments
 | Argument | Description |
 | --- | --- |
-| -- ptm-file | Files defining PTMs |
+| --ptm-file | Files defining PTMs |
 
 
 ## Development
