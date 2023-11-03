@@ -53,7 +53,7 @@ process search {
 
     output:
     val "${mzml.getBaseName()}"
-    path "*.txt"
+    path "*.tsv"
 
     """
     ${params.maccoysBin} search \\
@@ -70,6 +70,9 @@ process search {
         ${params.targetUrl} \\
         ${params.ptmFile ? '-p ' + params.ptmFile : ''} 
 
+    for file in *.txt; do
+        mv -- "\$file" "\$(basename \$file .txt).tsv"
+    done
     """
 }
 
@@ -81,10 +84,10 @@ process rescoring {
     path "*"
 
     output:
-    path "*.txt", includeInputs: true
+    path "*.tsv", includeInputs: true
 
     """
-    ${params.maccoysBin} rescore *.txt
+    ${params.maccoysBin} rescore *.tsv
     """
 }
 
