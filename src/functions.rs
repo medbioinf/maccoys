@@ -21,6 +21,7 @@ use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
+use pyo3::prelude::*;
 use tokio::process::Command;
 use tracing::{error, info};
 
@@ -252,29 +253,28 @@ pub async fn search(
 /// * `psm_file_path` - Path to PSM file
 ///
 pub async fn rescore_psm_file(psm_file_path: &Path) -> Result<()> {
-    let comet_header_row_str = format!("{}", COMET_HEADER_ROW);
-
-    let comet_arguments: Vec<&str> = vec![
-        "-m",
-        "maccoys_scoring",
-        psm_file_path.to_str().unwrap(),
-        COMET_SEPARATOR,
-        comet_header_row_str.as_str(),
-        COMET_EXP_BASE_SCORE,
-        EXP_SCORE_NAME,
-        COMET_DIST_BASE_SCORE,
-        DIST_SCORE_NAME,
-    ];
-    let output = Command::new("python")
-        .args(comet_arguments)
-        .output()
-        .await?;
-
-    info!("{}", String::from_utf8_lossy(&output.stdout));
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        error!("{}", &stderr);
-        bail!(stderr)
-    }
+    let py_scoring_src = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/py_src/maccoys_scoring/scoring.py"
+    ));
+    Python::with_gil(|py| -> PyResult<Py<PyAny>> {
+        let rescore_psm_file_fn: Py<PyAny> =
+            PyModule::from_code(py, py_scoring_src, "scoring.py", "maccoys_scoring")?
+                .getattr("rescore_psm_file")?
+                .into();
+        return rescore_psm_file_fn.call(
+            py,
+            (
+                psm_file_path,
+                COMET_SEPARATOR,
+                COMET_HEADER_ROW,
+                COMET_EXP_BASE_SCORE,
+                EXP_SCORE_NAME,
+                COMET_DIST_BASE_SCORE,
+                DIST_SCORE_NAME,
+            ),
+            None,
+        );
+    })?;
     Ok(())
 }
