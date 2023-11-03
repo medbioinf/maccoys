@@ -113,6 +113,10 @@ enum Commands {
         upper_mass_tolerance_ppm: i64,
         /// Maximal number of variable modifications
         max_variable_modifications: i8,
+        /// Fragment tolerance (for Comet fragment_bin_tol)
+        fragment_tolerance: f64,
+        /// Fragment bin tolerance offset (for Comet)
+        fragment_bin_offset: f64,
         /// Charge limit used when spectrum has not charges assigned. Every charge from 1 to max_charge will be tried.
         max_charge: u8,
         /// Amount of decoys to generate
@@ -295,6 +299,8 @@ async fn main() -> Result<()> {
             lower_mass_tolerance_ppm,
             upper_mass_tolerance_ppm,
             max_variable_modifications,
+            fragment_tolerance,
+            fragment_bin_offset,
             max_charge,
             decoys_per_peptide,
             target_url,
@@ -322,6 +328,8 @@ async fn main() -> Result<()> {
                 lower_mass_tolerance_ppm,
                 upper_mass_tolerance_ppm,
                 max_variable_modifications,
+                fragment_tolerance,
+                fragment_bin_offset,
                 max_charge,
                 decoys_per_peptide,
                 &target_url,

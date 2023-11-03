@@ -1,5 +1,7 @@
 nextflow.enable.dsl = 2
 
+// The pre-set parameters are for high res mass spectrometry data, adjust them to your needs
+
 // required arguments
 params.maccoysBin = ""
 params.mzmlDir = ""
@@ -10,12 +12,13 @@ params.decoysPerTarget = 10
 params.maxCharge = 6
 params.targetUrl = ""
 params.resultsDir = ""
+params.fragmentTolerance = "0.02"
+params.fragmentBinOffset = "0.0"
 // optional arguments
 params.ptmFile = ""
 params.decoyUrl = ""
 params.decoyCacheUrl = ""
 params.targetLookupUrl = ""
-
 
 // process raw_file_conversion {
 // }
@@ -67,13 +70,15 @@ process search {
         ${params.lowerMassTol} \\
         ${params.upperMassTol} \\
         ${params.maxVarPtm} \\
+        ${params.fragmentTolerance} \\
+        ${params.fragmentBinOffset} \\
         ${params.maxCharge} \\
         ${params.decoysPerTarget} \\
         ${params.targetUrl} \\
-        ${params.ptmFile ? '-p ' + params.ptmFile : ''} \\
-        ${params.decoyUrl ? '-d ' + params.decoyUrl : ''} \\
-        ${params.decoyCacheUrl ? '-c ' + params.decoyCacheUrl : ''} \\
-        ${params.targetLookupUrl ? '-p ' + params.targetLookupUrl : ''} \\
+        ${params.ptmFile ? '-p ' + params.ptmFile + ' \\': '\\'}
+        ${params.decoyUrl ? '-d ' + params.decoyUrl + ' \\' : '\\'}
+        ${params.decoyCacheUrl ? '-c ' + params.decoyCacheUrl + ' \\' : '\\'}
+        ${params.targetLookupUrl ? '-p ' + params.targetLookupUrl + ' \\' : '\\'}
 
     for file in *.txt; do
         mv -- "\$file" "\$(basename \$file .txt).tsv"

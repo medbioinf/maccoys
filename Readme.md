@@ -35,7 +35,7 @@ cargo run -r -- index-spectrum-file ./mzmls/QExHF06833std.mzML  ./tmp/QExHF06833
 
 Example:
 ```
-cargo run -r -- search ./mzmls/QExHF06833std.mzML ./tmp/QExHF06833std.index.json 'controllerType=0 controllerNumber=1 scan=28374' ./tmp test_files/comet.params 5 5 3 6 10  scylla://localhost:9042/macpepdb_mouse -p ../macpepdb-rs/test_files/mods.csv
+cargo run -r -- search ./mzmls/QExHF06833std.mzML ./tmp/QExHF06833std.index.json 'controllerType=0 controllerNumber=1 scan=28374' ./tmp test_files/comet.params 5 5 3 0.02 0.0 6 10  scylla://localhost:9042/macpepdb_mouse -p ../macpepdb-rs/test_files/mods.csv
 ```
 
 ### Batch processing
@@ -43,7 +43,7 @@ For a identifying multiple mzMLs including all MS2 use the provided Nextflow wor
 
 Example:
 ```
-nextflow run maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./mzmls --result-dir ./tmp --search-name test --target-url scylla://localhost:9042/macpepdb_mouse
+nextflow run maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./mzmls --result-dir ./tmp --target-url scylla://localhost:9042/macpepdb_mouse
 ```
 
 Arguments are mostly equal to the MaCcoyS binary.
@@ -57,6 +57,8 @@ Arguments are mostly equal to the MaCcoyS binary.
 | --upper-mass-tol | Upper mass tolerance of the MS (ppm) |
 | --max-var-ptm | Max. variable PTM per peptide |
 | --decoys-per-target | Decoys per target |
+| --fragment-tolerance | Fragment tolerance (for Comet `fragment_bin_tolerance`) |
+| --fragment-bin-offset | Fragment bin offset (for Comet) |
 | --max-charge | Max. charge tried for spectra where precurser charge was not reported. |
 | --target-url | Web or database URL for fetching target from MaCPepDB |
 | --results-root-dir | Empty directory for storing results. Directory name is also the name used in the web API / GUI |

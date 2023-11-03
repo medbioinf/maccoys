@@ -150,6 +150,8 @@ pub async fn search(
     lower_mass_tolerance_ppm: i64,
     upper_mass_tolerance_ppm: i64,
     max_variable_modifications: i8,
+    fragment_tolerance: f64,
+    fragment_bin_offset: f64,
     max_charge: u8,
     decoys_per_peptide: usize,
     target_url: &str,
@@ -185,6 +187,8 @@ pub async fn search(
     comet_config.set_max_variable_mods(max_variable_modifications)?;
     comet_config.set_ptms(&ptms, max_variable_modifications)?;
     comet_config.set_num_results(COMET_MAX_PSMS)?;
+    comet_config.set_fragment_bin_tolerance(fragment_tolerance)?;
+    comet_config.set_fragment_bin_offset(fragment_bin_offset)?;
 
     for precursor in spectrum.get_precursors() {
         for (precursor_mz, precursor_charges) in precursor.get_ions() {

@@ -148,6 +148,26 @@ impl Configuration {
         Ok(())
     }
 
+    /// Sets fragment bin tolerance.
+    ///
+    /// # Arguments
+    /// * `tolerance` - Fragment tolerance in ppm.
+    ///
+    pub fn set_fragment_bin_tolerance(&mut self, tolerance: f64) -> Result<()> {
+        self.set_option("fragment_bin_tol", &tolerance.to_string())?;
+        Ok(())
+    }
+
+    /// Sets fragment bin offset.
+    ///
+    /// # Arguments
+    /// * `offset` - Fragment tolerance in ppm.
+    ///
+    pub fn set_fragment_bin_offset(&mut self, offset: f64) -> Result<()> {
+        self.set_option("fragment_bin_offset", &offset.to_string())?;
+        Ok(())
+    }
+
     /// Sets the post translational modifications
     /// * Static/anywhere will be set as `add_<amino_acid_code>_<amino_acid_name>`
     /// * Static/n-bond will be set as `add_Nterm_peptide`
