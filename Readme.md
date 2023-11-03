@@ -65,6 +65,9 @@ Arguments are mostly equal to the MaCcoyS binary.
 | Argument | Description |
 | --- | --- |
 | --ptm-file | Files defining PTMs |
+| --decoy-url | `http` or `scylla` URL for fetching decoys |
+| --decoy-cache-url | `http` or `scylla` URL for storing decoys |
+| --target-lookup-url | `http`, `bloom+http` or `scylla` URL for target lookup |
 
 
 ## Development

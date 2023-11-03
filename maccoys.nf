@@ -12,7 +12,9 @@ params.targetUrl = ""
 params.resultsDir = ""
 // optional arguments
 params.ptmFile = ""
-// TODO: Add remaining optional arguments: target lookup, decoy db and decoy cache
+params.decoyUrl = ""
+params.decoyCacheUrl = ""
+params.targetLookupUrl = ""
 
 
 // process raw_file_conversion {
@@ -68,7 +70,10 @@ process search {
         ${params.maxCharge} \\
         ${params.decoysPerTarget} \\
         ${params.targetUrl} \\
-        ${params.ptmFile ? '-p ' + params.ptmFile : ''} 
+        ${params.ptmFile ? '-p ' + params.ptmFile : ''} \\
+        ${params.decoyUrl ? '-d ' + params.decoyUrl : ''} \\
+        ${params.decoyCacheUrl ? '-c ' + params.decoyCacheUrl : ''} \\
+        ${params.targetLookupUrl ? '-p ' + params.targetLookupUrl : ''} \\
 
     for file in *.txt; do
         mv -- "\$file" "\$(basename \$file .txt).tsv"
