@@ -24,7 +24,10 @@ use macpepdb::mass::convert::to_int as mass_to_int;
 use tokio::process::Command;
 use tracing::{error, info};
 
-use crate::constants::COMET_MAX_PSMS;
+use crate::constants::{
+    COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_HEADER_ROW, COMET_MAX_PSMS, COMET_SEPARATOR,
+    DIST_SCORE_NAME, EXP_SCORE_NAME,
+};
 // internal imports
 use crate::{
     constants::FASTA_SEQUENCE_LINE_LENGTH,
@@ -237,5 +240,41 @@ pub async fn search(
         }
     }
 
+    Ok(())
+}
+
+/// Calculates the scores for the given PSM file,
+/// using the python module `maccoys_scoring`.
+///
+/// (This will actually call the module via CLI as there are some issues compiling Python directly into Rust)
+///
+/// # Arguments
+/// * `psm_file_path` - Path to PSM file
+///
+pub async fn rescore_psm_file(psm_file_path: &Path) -> Result<()> {
+    let comet_header_row_str = format!("{}", COMET_HEADER_ROW);
+
+    let comet_arguments: Vec<&str> = vec![
+        "-m",
+        "maccoys_scoring",
+        psm_file_path.to_str().unwrap(),
+        COMET_SEPARATOR,
+        comet_header_row_str.as_str(),
+        COMET_EXP_BASE_SCORE,
+        EXP_SCORE_NAME,
+        COMET_DIST_BASE_SCORE,
+        DIST_SCORE_NAME,
+    ];
+    let output = Command::new("python")
+        .args(comet_arguments)
+        .output()
+        .await?;
+
+    info!("{}", String::from_utf8_lossy(&output.stdout));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        error!("{}", &stderr);
+        bail!(stderr)
+    }
     Ok(())
 }

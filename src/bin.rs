@@ -20,8 +20,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::functions::create_search_space;
 use maccoys::functions::search;
+use maccoys::functions::{create_search_space, rescore_psm_file};
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -134,6 +134,11 @@ enum Commands {
         /// Path to PTM file
         #[arg(short)]
         ptm_file_path: Option<String>,
+    },
+    /// Calculates the exponential and distances scores for the given PSM file.
+    Rescore {
+        /// Path to PSM file
+        psm_file_path: String,
     },
 }
 
@@ -326,6 +331,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Commands::Rescore { psm_file_path } => rescore_psm_file(&Path::new(&psm_file_path)).await?,
     };
 
     Ok(())
