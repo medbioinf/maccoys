@@ -97,6 +97,11 @@ workflow() {
     mzmls = Channel.fromPath(params.mzmlDir + "/*.{mzML,mzml}")
     create_default_comet_params()
     indexing(mzmls)
+    /** 
+        Output of indexing is a Channel with tuples of (mzml, mzml_index, spectrum_ids (plural))
+        To start a process for each spectrum_id we need to split them up and create a channel returning
+        tuples of (mzml, mzml_index, spectrum_id (singular))
+    */
     spectra_table = indexing.out.map { mzml, mzml_index, spectrum_ids -> 
         spectrum_ids.split("\n").collect { spectrum_id ->
             tuple(mzml, mzml_index, spectrum_id)
