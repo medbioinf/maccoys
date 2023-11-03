@@ -46,14 +46,14 @@ process indexing {
 
 process search {
     maxForks 4
-    publishDir "${params.resultsDir}/${mzml.getBaseName()}", mode: 'copy'
 
     input:
     tuple path(mzml), path(mzml_index), val(spectrum_id)
     path default_comet_params
 
     output:
-    path "*.txt", emit: psmFile // TSV files from comet
+    val "${mzml.getBaseName()}"
+    path "*.txt"
 
     """
     ${params.maccoysBin} search \\
@@ -73,15 +73,20 @@ process search {
     """
 }
 
-// process hyperscore {
-//     input:
-//     path psm_file
+process rescoring {
+    publishDir "${params.resultsDir}/${mzml_base_name}", mode: 'copy'
 
-//     main:
-//     """
-//     python -m max_decoy hyperscore -f ${psm_file} -t 'new'
-//     """
-// }
+    input:
+    val mzml_base_name
+    path "*"
+
+    output:
+    path "*.txt", includeInputs: true
+
+    """
+    ${params.maccoysBin} rescore *.txt
+    """
+}
 
 // process filter  {
 //     input: 
@@ -98,6 +103,6 @@ workflow() {
         }
     }.flatten().collate(3)
     search(spectra_table, create_default_comet_params.out)
-    // hyperscore(search.out)
+    rescoring(search.out)
     // filter()
 }
