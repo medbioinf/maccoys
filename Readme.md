@@ -5,10 +5,8 @@ MaCcoyS creates a spectrum specific search space with all available targets matc
 The PSM validation is not relying on the FDR as usual but on a newly introduced hyper score. Therefore the exponential distribution is fitted to the PSM distribution per spectrum. If the PSM distribution is fitting well, this is tested using the \[???\] test, cumulative distribution function is used to calculate a survival score for each spectrum which is the new hyperscore.   
 TODO: Separating of PSM
 
-
-## Dependencieas
-* Rust nightly >= 2023-07-12
-* Nextflow
+## Installation
+Coming as soon as published to `crates.io` and `pypy.org`. For now see section [Development](#development)
 
 ## Usage
 
@@ -67,3 +65,19 @@ Arguments are mostly equal to the MaCcoyS binary.
 | Argument | Description |
 | --- | --- |
 | -- ptm-file | Files defining PTMs |
+
+
+## Development
+
+### Dependencies
+* Rust nightly >= 2023-07-12
+* Nextflow
+* Conda | Mamba | Micromamba
+
+### Preparation
+1. Install Rust & Cargo. The easiest way is to install and use `rustup`
+2. `rustup toolchain install nightly-2023-07-12`
+3. Install Conda or one of it derivates
+4. `conda env create -f environment.yaml`
+5. `conda activate maccoys`
+6. Install Nextflow
