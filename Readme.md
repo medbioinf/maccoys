@@ -51,26 +51,26 @@ Arguments are mostly equal to the MaCcoyS binary.
 #### Required arguments
 | Argument | Description |
 | --- | --- |
-| --maccoys-bin | MaCcoyS binary (need to be compiled previously) |
-| --mzml-dir | Directory with mzML |
-| --lower-mass-tol | Lower mass tolerance of the MS (ppm) |
-| --upper-mass-tol | Upper mass tolerance of the MS (ppm) |
-| --max-var-ptm | Max. variable PTM per peptide |
-| --decoys-per-target | Decoys per target |
-| --fragment-tolerance | Fragment tolerance (for Comet `fragment_bin_tolerance`) |
-| --fragment-bin-offset | Fragment bin offset (for Comet) |
-| --max-charge | Max. charge tried for spectra where precurser charge was not reported. |
-| --target-url | Web or database URL for fetching target from MaCPepDB |
-| --results-root-dir | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
+| `--maccoys-bin` | MaCcoyS binary (need to be compiled previously) |
+| `--mzml-dir` | Directory with mzML |
+| `--lower-mass-tol` | Lower mass tolerance of the MS (ppm) |
+| `--upper-mass-tol` | Upper mass tolerance of the MS (ppm) |
+| `--max-var-ptm` | Max. variable PTM per peptide |
+| `--decoys-per-target` | Decoys per target |
+| `--fragment-tolerance` | Fragment tolerance (for Comet `fragment_bin_tolerance`) |
+| `--fragment-bin-offset` | Fragment bin offset (for Comet) |
+| `--max-charge` | Max. charge tried for spectra where precurser charge was not reported. |
+| `--target-url` | Web or database URL for fetching target from MaCPepDB |
+| `--results-root-dir` | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
 
-#### Required arguments
+#### Optional arguments
 | Argument | Description |
 | --- | --- |
-| --ptm-file | Files defining PTMs |
-| --decoy-url | `http` or `scylla` URL for fetching decoys |
-| --decoy-cache-url | `http` or `scylla` URL for storing decoys |
-| --target-lookup-url | `http`, `bloom+http` or `scylla` URL for target lookup |
-| --keep-search-files | Set this to non-zero to keep the search files (search engine config, FASTA files) |  
+| `--ptm-file` | Files defining PTMs |
+| `--decoy-url` | `http` or `scylla` URL for fetching decoys |
+| `--decoy-cache-url` | `http` or `scylla` URL for storing decoys |
+| `--target-lookup-url` | `http`, `bloom+http` or `scylla` URL for target lookup |
+| `--keep-search-files` | Set this to non-zero to keep the search files (search engine config, FASTA files) |  
 
 
 ## Development
