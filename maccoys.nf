@@ -14,6 +14,7 @@ params.targetUrl = ""
 params.resultsDir = ""
 params.fragmentTolerance = "0.02"
 params.fragmentBinOffset = "0.0"
+params.macpepdbWebApi = ""
 // optional arguments
 params.ptmFile = ""
 params.decoyUrl = ""
@@ -103,6 +104,7 @@ process rescoring {
     path "*"
 
     output:
+    val mzml_base_name
     path "*.tsv", includeInputs: true
 
     """

@@ -261,6 +261,7 @@ pub async fn rescore_psm_file(psm_file_path: &Path) -> Result<()> {
     let comet_arguments: Vec<&str> = vec![
         "-m",
         "maccoys_scoring",
+        "scoring",
         psm_file_path.to_str().unwrap(),
         COMET_SEPARATOR,
         comet_header_row_str.as_str(),
