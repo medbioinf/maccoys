@@ -45,7 +45,7 @@ process indexing {
     script:
     """
     mkdir -p ${params.resultsDir}/${mzml.getBaseName()}
-    cargo run -r -- index-spectrum-file ${mzml} index.json
+    ${params.maccoysBin} index-spectrum-file ${mzml} index.json
     jq '.spectra | keys[]' index.json | sed 's;";;g' | tail -n 3
     """
 }
