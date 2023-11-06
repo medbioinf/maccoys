@@ -163,7 +163,8 @@ pub async fn search(
         .replace_all(spectrum_id, "_")
         .to_string();
 
-    let extracted_spectrum_file_path = work_dir.join(format!("{}.mzML", sanitized_spec_id));
+    let extracted_spectrum_file_path =
+        work_dir.join(format!("{}.extracted.mzML", sanitized_spec_id));
     // Extract the spectrum from the original spectrum file
     let index = Index::from_json(&read_to_string(&index_file_path)?)?;
     let mut extractor = IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;

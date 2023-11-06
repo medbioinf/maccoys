@@ -19,6 +19,7 @@ params.ptmFile = ""
 params.decoyUrl = ""
 params.decoyCacheUrl = ""
 params.targetLookupUrl = ""
+params.keepSearchFiles = "0"    // If non-0, the search engine config and FASTA files will be deleted after the search
 
 // process raw_file_conversion {
 // }
@@ -79,6 +80,14 @@ process search {
         ${params.decoyUrl ? '-d ' + params.decoyUrl + ' \\' : '\\'}
         ${params.decoyCacheUrl ? '-c ' + params.decoyCacheUrl + ' \\' : '\\'}
         ${params.targetLookupUrl ? '-p ' + params.targetLookupUrl + ' \\' : '\\'}
+
+    # delete extracted mzML file as they can be saftly restored from the orignal mzML file
+    rm *.extracted.mzML
+
+    if [ "${params.keepSearchFiles}" -eq "0" ]; then
+        rm *.fasta
+        rm *.comet.params
+    fi
 
     for file in *.txt; do
         mv -- "\$file" "\$(basename \$file .txt).tsv"

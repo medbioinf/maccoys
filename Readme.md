@@ -70,6 +70,7 @@ Arguments are mostly equal to the MaCcoyS binary.
 | --decoy-url | `http` or `scylla` URL for fetching decoys |
 | --decoy-cache-url | `http` or `scylla` URL for storing decoys |
 | --target-lookup-url | `http`, `bloom+http` or `scylla` URL for target lookup |
+| --keep-search-files | Set this to non-zero to keep the search files (search engine config, FASTA files) |  
 
 
 ## Development
