@@ -14,6 +14,7 @@ params.targetUrl = ""
 params.resultsDir = ""
 params.fragmentTolerance = "0.02"
 params.fragmentBinOffset = "0.0"
+params.macpepdbWebApi = ""
 // optional arguments
 params.ptmFile = ""
 params.decoyUrl = ""
@@ -96,6 +97,20 @@ process search {
 }
 
 process rescoring {
+    input:
+    val mzml_base_name
+    path "*"
+
+    output:
+    val mzml_base_name
+    path "*.tsv", includeInputs: true
+
+    """
+    ${params.maccoysBin} rescore *.tsv
+    """
+}
+
+process annotate {
     publishDir "${params.resultsDir}/${mzml_base_name}", mode: 'copy'
 
     input:
@@ -106,7 +121,7 @@ process rescoring {
     path "*.tsv", includeInputs: true
 
     """
-    ${params.maccoysBin} rescore *.tsv
+    # python -m maccoys_scoring annotate *.tsv ${params.macpepdbWebApi} ... TODO ...
     """
 }
 
@@ -131,5 +146,6 @@ workflow() {
     }.flatten().collate(3)
     search(spectra_table, create_default_comet_params.out)
     rescoring(search.out)
+    annotate(rescoring.out)
     // filter()
 }
