@@ -121,7 +121,7 @@ process annotate {
     path "*.tsv", includeInputs: true
 
     """
-    # python -m maccoys_scoring annotate *.tsv ${params.macpepdbWebApi} ... TODO ...
+    python -m maccoys_scoring annotate *.tsv ${params.macpepdbWebApi}
     """
 }
 
