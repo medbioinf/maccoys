@@ -43,7 +43,7 @@ For a identifying multiple mzMLs including all MS2 use the provided Nextflow wor
 
 Example:
 ```
-nextflow run maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./mzmls --result-dir ./tmp --target-url scylla://localhost:9042/macpepdb_mouse
+nextflow run -w ./tmp/work maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./tmp/mzmls --results-dir ./tmp/results --target-url scylla://localhost:9042/macpepdb_mouse --fragment-tolerance 0.02 --fragment-bin-offset 0.0
 ```
 
 Arguments are mostly equal to the MaCcoyS binary.

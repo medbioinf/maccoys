@@ -1,5 +1,18 @@
+# Rust & Cargo files
 /target
 /Cargo.lock
+
+# Nextflow output
+/.nextflow
+/.nextflow.log
+/.nextflow.log.*
+
+# General
+/tmp
+*.tmp
+
+#### Python files
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
