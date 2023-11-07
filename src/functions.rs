@@ -201,15 +201,13 @@ pub async fn search(
             };
 
             for precursor_charge in precursor_charges {
+                let file_base_name = format!(
+                    "{}__{}__{}",
+                    sanitized_spec_id, precursor_mz, precursor_charge
+                );
                 let mass = mass_to_int(mass_to_charge_to_dalton(*precursor_mz, precursor_charge));
-                let fasta_file_path = work_dir.join(format!(
-                    "{}__{}__{}.fasta",
-                    sanitized_spec_id, precursor_mz, precursor_charge
-                ));
-                let comet_config_path = work_dir.join(format!(
-                    "{}__{}__{}.comet.params",
-                    sanitized_spec_id, precursor_mz, precursor_charge
-                ));
+                let fasta_file_path = work_dir.join(format!("{}.fasta", file_base_name));
+                let comet_config_path = work_dir.join(format!("{}.comet.params", file_base_name));
                 comet_config.set_charge(precursor_charge)?;
                 comet_config
                     .to_file(&comet_config_path)
@@ -231,6 +229,7 @@ pub async fn search(
                 let comet_arguments = vec![
                     format!("-P{}", comet_config_path.to_str().unwrap()),
                     format!("-D{}", fasta_file_path.to_str().unwrap()),
+                    format!("-N{}", file_base_name),
                     extracted_spectrum_file_path.to_str().unwrap().to_string(),
                 ];
                 let output = Command::new("comet").args(comet_arguments).output().await?;
