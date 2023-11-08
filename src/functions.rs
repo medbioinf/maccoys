@@ -25,8 +25,7 @@ use tokio::process::Command;
 use tracing::{error, info};
 
 use crate::constants::{
-    COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_HEADER_ROW, COMET_MAX_PSMS, COMET_SEPARATOR,
-    DIST_SCORE_NAME, EXP_SCORE_NAME,
+    COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_MAX_PSMS, DIST_SCORE_NAME, EXP_SCORE_NAME,
 };
 // internal imports
 use crate::{
@@ -256,15 +255,12 @@ pub async fn search(
 /// * `psm_file_path` - Path to PSM file
 ///
 pub async fn rescore_psm_file(psm_file_path: &Path) -> Result<()> {
-    let comet_header_row_str = format!("{}", COMET_HEADER_ROW);
-
     let comet_arguments: Vec<&str> = vec![
         "-m",
         "maccoys_scoring",
+        "comet",
         "scoring",
         psm_file_path.to_str().unwrap(),
-        COMET_SEPARATOR,
-        comet_header_row_str.as_str(),
         COMET_EXP_BASE_SCORE,
         EXP_SCORE_NAME,
         COMET_DIST_BASE_SCORE,

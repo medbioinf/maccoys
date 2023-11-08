@@ -6,8 +6,16 @@ MaCcoyS Scoring entrypoint for executing the module directly with `python -m mac
 import argparse
 from pathlib import Path
 
+# 3rd party imports
+import pandas as pd
+
 # internal import
-from maccoys_scoring.scoring import rescore_psm_file
+from maccoys_scoring.io.comet_tsv import (
+    read as read_comet_tsv,
+    overwrite as overwrite_comet_tsv,
+)
+from maccoys_scoring.scoring import calculate_distance_score, calculate_exp_score
+from maccoys_scoring.search_engine_type import SearchEngineType
 
 
 def add_scoring_cli(subparser: argparse._SubParsersAction):
@@ -17,16 +25,6 @@ def add_scoring_cli(subparser: argparse._SubParsersAction):
         "psms_file",
         type=str,
         help="Path to PSM file",
-    )
-    parser.add_argument(
-        "sep",
-        type=str,
-        help="Separator of the PSM file, e.g. `$'\t'` (in bash) for tab-separated. Be aware, that your shell might interpret the separator, so you might need to escape it as shown",
-    )
-    parser.add_argument(
-        "header_row",
-        type=int,
-        help="Zero-based index of the header row, e.g. Comet's PSM files has a comment/revision in first line, so header_row=1",
     )
     parser.add_argument(
         "exp_score_base_col",
@@ -50,18 +48,30 @@ def add_scoring_cli(subparser: argparse._SubParsersAction):
     )
 
     def rescore_func(cli_args):
-        if len(cli_args.sep) > 1:
-            print("Separator must be a single character")
-            return 1
-        rescore_psm_file(
-            Path(cli_args.psms_file).absolute(),
-            cli_args.sep,
-            cli_args.header_row,
-            cli_args.exp_score_base_col,
-            cli_args.exp_score_col,
-            cli_args.dist_score_base_col,
-            cli_args.dist_score_col,
+        search_engine_type = SearchEngineType.from_str(cli_args.search_engine_type)
+        psm_file_path = Path(cli_args.psms_file).absolute()
+
+        psms = pd.DataFrame()
+        match search_engine_type:
+            case SearchEngineType.COMET:
+                psms = read_comet_tsv(
+                    psm_file_path,
+                )
+
+        psms[cli_args.exp_score_col] = calculate_exp_score(
+            psms, cli_args.exp_score_base_col
         )
+
+        psms[cli_args.dist_score_col] = calculate_distance_score(
+            psms, cli_args.dist_score_base_col
+        )
+
+        match search_engine_type:
+            case SearchEngineType.COMET:
+                overwrite_comet_tsv(
+                    psm_file_path,
+                    psms,
+                )
 
     parser.set_defaults(func=rescore_func)
 
@@ -73,6 +83,13 @@ def main():
     cli = argparse.ArgumentParser(
         prog="MaCcoyS Scoring",
         description="Rescores PSMs based on the assumption that the PSM-distribution is a exponential distribution.",
+    )
+
+    cli.add_argument(
+        "search_engine_type",
+        type=str,
+        choices=SearchEngineType.get_all_names(),
+        help="Search engine used to generate the PSM file",
     )
 
     subparser = cli.add_subparsers()
