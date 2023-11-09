@@ -62,10 +62,14 @@ process search {
     path default_comet_params
 
     output:
-    val "${mzml.getBaseName()}"
+    stdout
     path "*.tsv"
 
     """
+    # Create the result directory for this spectrum ID
+    spec_id_result_dir=${params.resultsDir}/${mzml.getBaseName()}/\$(${params.maccoysBin} sanitize-spectrum-id '${spectrum_id}')
+    mkdir -p \$spec_id_result_dir
+
     ${params.maccoysBin} search \\
         ${mzml} \\
         ${mzml_index} \\
@@ -86,7 +90,7 @@ process search {
         ${params.targetLookupUrl ? '-p ' + params.targetLookupUrl + ' \\' : '\\'}
 
     # delete extracted mzML file as they can be saftly restored from the orignal mzML file
-    rm *.extracted.mzML
+    rm extracted.mzML
 
     if [ "${params.keepSearchFiles}" -eq "0" ]; then
         rm *.fasta
@@ -94,20 +98,23 @@ process search {
     fi
 
     for file in *.txt; do
-        mv -- "\$file" "\$(basename \$file .txt).tsv"
+        mv -- "\$file" "\$(basename \$file .txt).psms.tsv"
     done
+
+    # Return the result directory for this spectrum ID as stdout, so it is available as `val` in the next process
+    echo -n \$spec_id_result_dir
     """
+
 }
 
 process post_processing {
-    publishDir "${params.resultsDir}/${mzml_base_name}", mode: 'copy'
+    publishDir "${spectrum_result_dir}", mode: 'copy'
 
     input:
-    val mzml_base_name
+    val spectrum_result_dir
     path "*"
 
     output:
-    val mzml_base_name
     path "*.tsv", includeInputs: true
 
     """

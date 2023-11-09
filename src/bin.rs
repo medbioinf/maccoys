@@ -21,7 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::search;
-use maccoys::functions::{create_search_space, post_process};
+use maccoys::functions::{create_search_space, post_process, sanitize_spectrum_id};
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -145,6 +145,14 @@ enum Commands {
         psm_file_path: String,
         /// Path to file were goodness values will be stored
         goodness_file_path: String,
+    },
+    /// Sanitize spectrum ID (get rid of any special characters)
+    SanitizeSpectrumId {
+        /// Spectrum ID
+        spectrum_id: String,
+        /// If set, output does not contain a newline at the end
+        #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+        trim: bool,
     },
 }
 
@@ -345,6 +353,13 @@ async fn main() -> Result<()> {
             psm_file_path,
             goodness_file_path,
         } => post_process(&Path::new(&psm_file_path), &Path::new(&goodness_file_path)).await?,
+        Commands::SanitizeSpectrumId { spectrum_id, trim } => {
+            if !trim {
+                println!("{}", sanitize_spectrum_id(&spectrum_id));
+            } else {
+                print!("{}", sanitize_spectrum_id(&spectrum_id));
+            }
+        }
     };
 
     Ok(())

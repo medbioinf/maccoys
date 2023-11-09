@@ -158,12 +158,7 @@ pub async fn search(
     target_lookup_url: Option<String>,
     decoy_cache_url: Option<String>,
 ) -> Result<()> {
-    let sanitized_spec_id = NON_WORD_CHAR_REGEX
-        .replace_all(spectrum_id, "_")
-        .to_string();
-
-    let extracted_spectrum_file_path =
-        work_dir.join(format!("{}.extracted.mzML", sanitized_spec_id));
+    let extracted_spectrum_file_path = work_dir.join("extracted.mzML");
     // Extract the spectrum from the original spectrum file
     let index = Index::from_json(&read_to_string(&index_file_path)?)?;
     let mut extractor = IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;
@@ -200,10 +195,7 @@ pub async fn search(
             };
 
             for precursor_charge in precursor_charges {
-                let file_base_name = format!(
-                    "{}__{}__{}",
-                    sanitized_spec_id, precursor_mz, precursor_charge
-                );
+                let file_base_name = format!("{}", precursor_charge);
                 let mass = mass_to_int(mass_to_charge_to_dalton(*precursor_mz, precursor_charge));
                 let fasta_file_path = work_dir.join(format!("{}.fasta", file_base_name));
                 let comet_config_path = work_dir.join(format!("{}.comet.params", file_base_name));
@@ -302,4 +294,15 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
         bail!(stderr)
     }
     Ok(())
+}
+
+/// Sanitizes the given spectrum ID by replacing all non word characters with `_`.
+///
+/// # Arguments
+/// * `spectrum_id` - Spectrum ID
+///
+pub fn sanitize_spectrum_id(spectrum_id: &str) -> String {
+    NON_WORD_CHAR_REGEX
+        .replace_all(spectrum_id, "_")
+        .to_string()
 }
