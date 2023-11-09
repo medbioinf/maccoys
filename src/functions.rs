@@ -246,15 +246,39 @@ pub async fn search(
     Ok(())
 }
 
-/// Calculates the scores for the given PSM file,
+/// Calculates the goodness of fit and scores for the given PSM file,
 /// using the python module `maccoys_scoring`.
 ///
 /// (This will actually call the module via CLI as there are some issues compiling Python directly into Rust)
 ///
 /// # Arguments
 /// * `psm_file_path` - Path to PSM file
+/// * `goodness_file_path` - Path to output file for goodness of fit
 ///
-pub async fn rescore_psm_file(psm_file_path: &Path) -> Result<()> {
+pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Result<()> {
+    // goodness of fit
+    let comet_arguments: Vec<&str> = vec![
+        "-m",
+        "maccoys_scoring",
+        "comet",
+        "goodness",
+        psm_file_path.to_str().unwrap(),
+        COMET_EXP_BASE_SCORE,
+        goodness_file_path.to_str().unwrap(),
+    ];
+    let output = Command::new("python")
+        .args(comet_arguments)
+        .output()
+        .await?;
+
+    info!("{}", String::from_utf8_lossy(&output.stdout));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        error!("{}", &stderr);
+        bail!(stderr)
+    }
+
+    // rescoring
     let comet_arguments: Vec<&str> = vec![
         "-m",
         "maccoys_scoring",

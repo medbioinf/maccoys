@@ -22,6 +22,9 @@ params.decoyCacheUrl = ""
 params.targetLookupUrl = ""
 params.keepSearchFiles = "0"    // If non-0, the search engine config and FASTA files will be deleted after the search
 
+// debugging arguments
+params.limitMs2 = ""
+
 // process raw_file_conversion {
 // }
 
@@ -47,7 +50,7 @@ process indexing {
     """
     mkdir -p ${params.resultsDir}/${mzml.getBaseName()}
     ${params.maccoysBin} index-spectrum-file ${mzml} index.json
-    jq '.spectra | keys[]' index.json | sed 's;";;g'
+    jq '.spectra | keys[]' index.json | sed 's;";;g' ${params.limitMs2 ? ' | tail -n ' + params.limitMs2 : '' }
     """
 }
 
@@ -96,7 +99,7 @@ process search {
     """
 }
 
-process rescoring {
+process post_processing {
     publishDir "${params.resultsDir}/${mzml_base_name}", mode: 'copy'
 
     input:
@@ -108,7 +111,8 @@ process rescoring {
     path "*.tsv", includeInputs: true
 
     """
-    ${params.maccoysBin} rescore *.tsv
+    psm_file=(*.tsv)
+    ${params.maccoysBin} post-process \$psm_file \$(basename \$psm_file .tsv).goodness.tsv
     """
 }
 
@@ -132,6 +136,6 @@ workflow() {
         }
     }.flatten().collate(3)
     search(spectra_table, create_default_comet_params.out)
-    rescoring(search.out)
+    post_processing(search.out)
     // filter()
 }

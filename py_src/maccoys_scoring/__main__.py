@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 # internal import
+from maccoys_scoring.goodness_of_fit import calc_goodnesses
 from maccoys_scoring.io.comet_tsv import (
     read as read_comet_tsv,
     overwrite as overwrite_comet_tsv,
@@ -76,6 +77,51 @@ def add_scoring_cli(subparser: argparse._SubParsersAction):
     parser.set_defaults(func=rescore_func)
 
 
+def add_goodness_cli(subparser: argparse._SubParsersAction):
+    parser = subparser.add_parser(
+        "goodness",
+        help="Calculates goodness of fit tests fro different distributions and null distributions",
+    )
+
+    parser.add_argument(
+        "psms_file",
+        type=str,
+        help="Path to PSM file",
+    )
+    parser.add_argument(
+        "base_score_col",
+        type=str,
+        help="Column of the score to be used for the goodness of fit tests",
+    )
+    parser.add_argument(
+        "out",
+        type=str,
+        help="Output file",
+    )
+
+    def goodness_func(cli_args):
+        out_file_path = Path(cli_args.out).absolute()
+        search_engine_type = SearchEngineType.from_str(cli_args.search_engine_type)
+        psm_file_path = Path(cli_args.psms_file).absolute()
+
+        psms = pd.DataFrame()
+        match search_engine_type:
+            case SearchEngineType.COMET:
+                psms = read_comet_tsv(
+                    psm_file_path,
+                )
+
+        goodness_df = calc_goodnesses(
+            psms,
+            cli_args.base_score_col,
+        )
+
+        with out_file_path.open("w") as out_file:
+            out_file.write(goodness_df.to_csv(sep="\t", index=False))
+
+    parser.set_defaults(func=goodness_func)
+
+
 def main():
     """
     Main entrypoint for the CLI
@@ -94,6 +140,7 @@ def main():
 
     subparser = cli.add_subparsers()
     add_scoring_cli(subparser)
+    add_goodness_cli(subparser)
     # TODO: add CLI for annotation here
 
     # Call function for CLI args

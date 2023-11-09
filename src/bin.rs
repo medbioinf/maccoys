@@ -21,7 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::search;
-use maccoys::functions::{create_search_space, rescore_psm_file};
+use maccoys::functions::{create_search_space, post_process};
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -139,10 +139,12 @@ enum Commands {
         #[arg(short)]
         ptm_file_path: Option<String>,
     },
-    /// Calculates the exponential and distances scores for the given PSM file.
-    Rescore {
+    /// Calculates the goodness of fit and the the exponential and distances scores for the given PSM file.
+    PostProcess {
         /// Path to PSM file
         psm_file_path: String,
+        /// Path to file were goodness values will be stored
+        goodness_file_path: String,
     },
 }
 
@@ -339,7 +341,10 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::Rescore { psm_file_path } => rescore_psm_file(&Path::new(&psm_file_path)).await?,
+        Commands::PostProcess {
+            psm_file_path,
+            goodness_file_path,
+        } => post_process(&Path::new(&psm_file_path), &Path::new(&goodness_file_path)).await?,
     };
 
     Ok(())
