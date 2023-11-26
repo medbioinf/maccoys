@@ -8,6 +8,11 @@ import scipy
 from statsmodels.stats.diagnostic import lilliefors as statsmodels_lilliefors
 
 
+SIGNIFICANCE_LEVEL_ALPHA: float = 0.05
+"""Significance level for Anderson-Darling test
+"""
+
+
 def anderson_darling(x: pd.Series, dist: str) -> Tuple[float, float]:
     """Anderson-Darling test for goodness of fit.
 
@@ -19,7 +24,22 @@ def anderson_darling(x: pd.Series, dist: str) -> Tuple[float, float]:
         Tuple[float, float]: Test statistic and p-value
     """
     test_res = scipy.stats.anderson(x, dist=dist)
-    return (test_res.statistic, 0.0)
+    pvalue: float = -1.0  # not an actual p-value, 0.0 means reject H0
+    # 1. Choose alpha (0.05)
+    # 2. Get index (i) of sig level >= alpha
+    # 3. Check if crit val[i] > test stat == not significant (fail to reject H0)
+    matching_sig_level_indexes: np.ndarray = np.where(
+        np.array(test_res.significance_level) <= SIGNIFICANCE_LEVEL_ALPHA * 100
+    )[0]
+    if matching_sig_level_indexes[0].size > 0:
+        crit_value_idx = (
+            matching_sig_level_indexes.min()
+        )  # get largest significance level, they are order descending
+        if test_res.critical_values[crit_value_idx] > test_res.statistic:
+            pvalue = 1.0
+        else:
+            pvalue = 0.0
+    return (test_res.statistic, pvalue)
 
 
 def kolmogorov_smirnov(x: pd.Series, dist: str) -> Tuple[float, float]:
@@ -80,7 +100,7 @@ DISTRIBUTIONS: Dict[str, scipy.stats.rv_continuous] = {
 GOODNESS_OF_FIT_TESTS: Tuple[
     Tuple[str, List[str], Callable[[pd.Series, str], Tuple[float, float]]], ...
 ] = (
-    # ("Anderson-Darling", ["norm", "expon"], anderson_darling),    # TODO: Need to understand the interpretation of the test statistic
+    ("Anderson-Darling", ["norm", "expon"], anderson_darling),
     ("Kolmogorov-Smirnov", list(DISTRIBUTIONS.keys()), kolmogorov_smirnov),
     ("Cramer-von Mises", list(DISTRIBUTIONS.keys()), cramer_von_mises),
     ("Lilliefirs", ["norm", "exp"], lilliefors),
