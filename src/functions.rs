@@ -261,12 +261,15 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
     let output = Command::new("python")
         .args(comet_arguments)
         .output()
-        .await?;
+        .await
+        .context(
+            "Error when calling Python module `maccoys_scoring` for calculating goodness of fit",
+        )?;
 
     info!("{}", String::from_utf8_lossy(&output.stdout));
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        error!("{}", &stderr);
+        error!("{:?}", &stderr);
         bail!(stderr)
     }
 
@@ -285,12 +288,13 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
     let output = Command::new("python")
         .args(comet_arguments)
         .output()
-        .await?;
+        .await
+        .context("Error when calling Python module `maccoys_scoring` for scoring")?;
 
     info!("{}", String::from_utf8_lossy(&output.stdout));
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        error!("{}", &stderr);
+        error!("{:?}", &stderr);
         bail!(stderr)
     }
     Ok(())
