@@ -4,7 +4,7 @@ nextflow.enable.dsl = 2
 
 // required arguments
 params.maccoysBin = ""
-params.mzmlDir = ""
+params.specDir = ""
 params.lowerMassTol = 10
 params.upperMassTol = 10
 params.maxVarPtm = 3
@@ -25,8 +25,29 @@ params.keepSearchFiles = "0"    // If non-0, the search engine config and FASTA 
 // debugging arguments
 params.limitMs2 = ""
 
-// process raw_file_conversion {
-// }
+process convert_thermo_raw_files {
+    maxForks 2
+    container 'chambm/pwiz-skyline-i-agree-to-the-vendor-licenses'
+    // by mounting the parent directory we can use a symlink to the raw file in the workdir
+    containerOptions { "-v ${raw_file.getParent()}:/data" }
+
+    input:
+    path raw_file
+
+    output:
+    path "${raw_file.getBaseName()}.mzML"
+
+    // can only run when profile conversion is enabled
+    when: workflow.profile == 'conversion'
+
+    """
+    if [ ! -f ${raw_file.getBaseName()}.mzML ]; then
+        wine msconvert ${raw_file} --mzML --zlib --filter "peakPicking true 1-"
+    else
+        echo "File ${raw_file.getBaseName()}.mzML already exists"
+    fi
+    """
+}
 
 process create_default_comet_params {
     output:
@@ -129,7 +150,13 @@ process post_processing {
 
 
 workflow() {
-    mzmls = Channel.fromPath(params.mzmlDir + "/*.{mzML,mzml}")
+    raws = Channel.fromPath(params.specDir + "/*.{raw}")
+    mzmls = Channel.fromPath(params.specDir + "/*.{mzML,mzml}")
+
+    converted_raws = convert_thermo_raw_files(raws)
+
+    // Merge mzmls and converted_raws
+    mzmls = mzmls.concat(converted_raws)
     create_default_comet_params()
     indexing(mzmls)
     /** 

@@ -52,7 +52,7 @@ Arguments are mostly equal to the MaCcoyS binary.
 | Argument | Description |
 | --- | --- |
 | `--maccoys-bin` | MaCcoyS binary (need to be compiled previously) |
-| `--mzml-dir` | Directory with mzML |
+| `--spec-dir` | Directory with Thermo raw files (*.raw) or mzML files (*.mzml/*.mzML) |
 | `--lower-mass-tol` | Lower mass tolerance of the MS (ppm) |
 | `--upper-mass-tol` | Upper mass tolerance of the MS (ppm) |
 | `--max-var-ptm` | Max. variable PTM per peptide |
@@ -71,6 +71,18 @@ Arguments are mostly equal to the MaCcoyS binary.
 | `--decoy-cache-url` | `http` or `scylla` URL for storing decoys |
 | `--target-lookup-url` | `http`, `bloom+http` or `scylla` URL for target lookup |
 | `--keep-search-files` | Set this to non-zero to keep the search files (search engine config, FASTA files) |  
+
+#### Non-mzML files
+The workflow is able to convert non-mzML file. This is done using Docker images, therefore the run command is a bit different: `nextflow run -profile conversion maccoys.nf ...`
+
+
+##### Apple Silicon (M1, M2, ...)
+```
+env DOCKER_DEFAULT_PLATFORM=linux/amd64 nextflow run -profile docker maccoys.nf ...
+```
+
+TL;DR The used docker images for file conversion are not provided for ARM 64 CPUs, therefore Docker will print a warning on sdterr, which will stop the Nextflow process.
+
 
 
 ## Development
