@@ -21,13 +21,18 @@ use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
+use polars::prelude::*;
 use tokio::process::Command;
 use tracing::{error, info};
 
 use crate::constants::{
     COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_MAX_PSMS, DIST_SCORE_NAME, EXP_SCORE_NAME,
+    FASTA_DECOY_ENTRY_PREFIX,
 };
 // internal imports
+use crate::io::comet::peptide_spectrum_match_tsv::{
+    overwrite as overwrite_comet_tsv, read as read_comet_tsv,
+};
 use crate::{
     constants::FASTA_SEQUENCE_LINE_LENGTH,
     io::comet::configuration::Configuration as CometConfiguration,
@@ -248,6 +253,11 @@ pub async fn search(
 /// * `goodness_file_path` - Path to output file for goodness of fit
 ///
 pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Result<()> {
+    // fdr calculation
+    let mut psms = read_comet_tsv(psm_file_path)?;
+    psms = mark_target_and_decoys(psms)?;
+    psms = false_discovery_rate(psms)?;
+    overwrite_comet_tsv(psms, psm_file_path)?;
     // goodness of fit
     let comet_arguments: Vec<&str> = vec![
         "-m",
@@ -309,4 +319,36 @@ pub fn sanitize_spectrum_id(spectrum_id: &str) -> String {
     NON_WORD_CHAR_REGEX
         .replace_all(spectrum_id, "_")
         .to_string()
+}
+
+/// Add a column `is_target` to the given PSMs DataFrame.
+///
+/// # Arguments
+/// * `psms` - PSMs DataFrame
+///
+pub fn mark_target_and_decoys(psms: DataFrame) -> Result<DataFrame> {
+    let mut psms = psms.lazy();
+    psms = psms.with_column(
+        col("protein")
+            .str()
+            .starts_with(lit(FASTA_DECOY_ENTRY_PREFIX))
+            .alias("is_target"),
+    );
+    Ok(psms.collect()?)
+}
+
+/// Calculates the false discovery rate for the given PSMs DataFrame.
+/// The DataFrame must have an `is_target`-column.
+///
+/// # Arguments
+/// * `psms` - PSMs DataFrame
+///
+pub fn false_discovery_rate(psms: DataFrame) -> Result<DataFrame> {
+    let num_psms = psms.height();
+    let mut psms = psms.lazy();
+    psms = psms.with_column(col("is_target").not().cum_sum(false).alias("fdr"));
+    psms = psms.with_column(cast(col("fdr"), DataType::Float64).alias("fdr"));
+    let index: Series = (1..=num_psms).map(|idx| idx as f64).collect();
+    psms = psms.with_column((col("fdr") / lit(index)).alias("fdr"));
+    Ok(psms.collect()?)
 }

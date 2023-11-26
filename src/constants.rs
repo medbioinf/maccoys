@@ -45,3 +45,7 @@ pub const COMET_DIST_BASE_SCORE: &'static str = COMET_EXP_BASE_SCORE;
 /// Name for new distance score
 ///
 pub const DIST_SCORE_NAME: &'static str = "dist_score";
+
+/// FDR col name
+///
+pub const FDR_COL_NAME: &'static str = "fdr";
