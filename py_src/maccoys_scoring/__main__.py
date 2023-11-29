@@ -53,7 +53,6 @@ def add_scoring_cli(subparser: argparse._SubParsersAction):
     )
 
     async def rescore_func(cli_args):
-        logging.info("Rescoring")
         if len(cli_args.sep) > 1:
             print("Separator must be a single character")
             return 1
@@ -116,8 +115,6 @@ def main():
     # Call function for CLI args
     cli_args = cli.parse_args()
     loop = asyncio.get_event_loop()
-    logging.info("hi")
-    logging.info(cli_args.func)
     tasks = [
         loop.create_task(cli_args.func(cli_args)),
     ]
