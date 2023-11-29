@@ -52,7 +52,7 @@ def add_scoring_cli(subparser: argparse._SubParsersAction):
         help="Name for the new column containing the distance scores",
     )
 
-    def rescore_func(cli_args):
+    async def rescore_func(cli_args):
         if len(cli_args.sep) > 1:
             print("Separator must be a single character")
             return 1
