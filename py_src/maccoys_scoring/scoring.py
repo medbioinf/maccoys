@@ -63,7 +63,7 @@ def calculate_distance_score(
     return np.abs(dist_score)
 
 
-def rescore_psm_file(
+async def rescore_psm_file(
     psms_file_path: Path,
     sep: str,
     header_row: int,

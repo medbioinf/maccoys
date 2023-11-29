@@ -53,10 +53,11 @@ def add_scoring_cli(subparser: argparse._SubParsersAction):
     )
 
     async def rescore_func(cli_args):
+        logging.info("Rescoring")
         if len(cli_args.sep) > 1:
             print("Separator must be a single character")
             return 1
-        rescore_psm_file(
+        await rescore_psm_file(
             Path(cli_args.psms_file).absolute(),
             cli_args.sep,
             cli_args.header_row,
