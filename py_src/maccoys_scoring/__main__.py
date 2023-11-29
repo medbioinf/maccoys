@@ -116,6 +116,7 @@ def main():
     # Call function for CLI args
     cli_args = cli.parse_args()
     loop = asyncio.get_event_loop()
+    logging.info("hi")
     logging.info(cli_args.func)
     tasks = [
         loop.create_task(cli_args.func(cli_args)),
