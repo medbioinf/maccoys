@@ -34,7 +34,7 @@ impl DatabaseBuild {
         let mut client = Client::new(&self.database_url).await?;
 
         // Run migrations
-        run_migrations(&client).await;
+        run_migrations(&client).await?;
 
         match ConfigurationTable::select(&mut client).await {
             Ok(_) => {
