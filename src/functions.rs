@@ -332,6 +332,7 @@ pub fn mark_target_and_decoys(psms: DataFrame) -> Result<DataFrame> {
         col("protein")
             .str()
             .starts_with(lit(FASTA_DECOY_ENTRY_PREFIX))
+            .not()
             .alias("is_target"),
     );
     Ok(psms.collect()?)
@@ -346,6 +347,14 @@ pub fn mark_target_and_decoys(psms: DataFrame) -> Result<DataFrame> {
 pub fn false_discovery_rate(psms: DataFrame) -> Result<DataFrame> {
     let num_psms = psms.height();
     let mut psms = psms.lazy();
+
+    let sort_option = SortOptions {
+        descending: true,
+        nulls_last: true,
+        multithreaded: false,
+        maintain_order: false,
+    };
+    psms = psms.sort(COMET_EXP_BASE_SCORE, sort_option);
     psms = psms.with_column(col("is_target").not().cum_sum(false).alias("fdr"));
     psms = psms.with_column(cast(col("fdr"), DataType::Float64).alias("fdr"));
     let index: Series = (1..=num_psms).map(|idx| idx as f64).collect();
