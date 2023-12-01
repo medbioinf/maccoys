@@ -259,7 +259,7 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
     psms = false_discovery_rate(psms)?;
     overwrite_comet_tsv(psms, psm_file_path)?;
     // goodness of fit
-    let comet_arguments: Vec<&str> = vec![
+    let python_args: Vec<&str> = vec![
         "-m",
         "maccoys_scoring",
         "comet",
@@ -269,7 +269,7 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
         goodness_file_path.to_str().unwrap(),
     ];
     let output = Command::new("python")
-        .args(comet_arguments)
+        .args(python_args)
         .output()
         .await
         .context(
@@ -284,7 +284,7 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
     }
 
     // rescoring
-    let comet_arguments: Vec<&str> = vec![
+    let python_args: Vec<&str> = vec![
         "-m",
         "maccoys_scoring",
         "comet",
@@ -296,7 +296,7 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
         DIST_SCORE_NAME,
     ];
     let output = Command::new("python")
-        .args(comet_arguments)
+        .args(python_args)
         .output()
         .await
         .context("Error when calling Python module `maccoys_scoring` for scoring")?;
