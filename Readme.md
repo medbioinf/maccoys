@@ -46,9 +46,16 @@ Example:
 nextflow run -w ./tmp/work maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./tmp/mzmls --results-dir ./tmp/results --target-url scylla://localhost:9042/macpepdb_mouse --fragment-tolerance 0.02 --fragment-bin-offset 0.0
 ```
 
+#### This has some additional requirements
+* jq (Ubuntu: `apt install jq`, MacOS: `brew install jq`, Conda: `conda install jq`)
+* [Comet](https://github.com/UWPR/Comet/releases)
+    * Add it to your `PATH` environment variable or add a folder called `bin` next to `maccoys.nf`
+* [Nextflow](https://www.nextflow.io/)
+
+#### Arguments
 Arguments are mostly equal to the MaCcoyS binary.
 
-#### Required arguments
+##### Required arguments
 | Argument | Description |
 | --- | --- |
 | `--maccoys-bin` | MaCcoyS binary (need to be compiled previously) |
@@ -63,7 +70,7 @@ Arguments are mostly equal to the MaCcoyS binary.
 | `--target-url` | Web or database URL for fetching target from MaCPepDB |
 | `--results-root-dir` | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
 
-#### Optional arguments
+##### Optional arguments
 | Argument | Description |
 | --- | --- |
 | `--ptm-file` | Files defining PTMs |
@@ -89,7 +96,7 @@ TL;DR The used docker images for file conversion are not provided for ARM 64 CPU
 
 ### Dependencies
 * Rust nightly >= 2023-07-12
-* Nextflow
+* [Nextflow](https://www.nextflow.io/)
 * Conda | Mamba | Micromamba
 
 ### Preparation
