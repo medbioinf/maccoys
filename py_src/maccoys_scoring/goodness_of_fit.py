@@ -103,7 +103,7 @@ GOODNESS_OF_FIT_TESTS: Tuple[
     ("Anderson-Darling", ["norm", "expon"], anderson_darling),
     ("Kolmogorov-Smirnov", list(DISTRIBUTIONS.keys()), kolmogorov_smirnov),
     ("Cramer-von Mises", list(DISTRIBUTIONS.keys()), cramer_von_mises),
-    ("Lilliefirs", ["norm", "exp"], lilliefors),
+    ("Lilliefors", ["norm", "exp"], lilliefors),
 )
 """Name of goodness of fit test, list of supported distributions to test against, and test function
 """
