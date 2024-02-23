@@ -68,7 +68,7 @@ Arguments are mostly equal to the MaCcoyS binary.
 | `--fragment-bin-offset` | Fragment bin offset (for Comet) |
 | `--max-charge` | Max. charge tried for spectra where precurser charge was not reported. |
 | `--target-url` | Web or database URL for fetching target from MaCPepDB |
-| `--results-root-dir` | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
+| `--results-dir` | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
 
 ##### Optional arguments
 | Argument | Description |
