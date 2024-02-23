@@ -22,7 +22,7 @@ path = "src/bin.rs"
 [dependencies]
 anyhow = { version = "1.0.75", features = ["backtrace"] }
 async-stream = "0.3.5"
-axum = "0.6.20"
+axum = "0.7.4"
 clap = { version = "4.4.6", features = ["derive"] }
 dihardts_omicstools = "1.7.0"
 fallible-iterator = "0.3.0"

@@ -12,12 +12,12 @@ use dihardts_omicstools::proteomics::post_translational_modifications::{
 };
 use fancy_regex::Regex;
 use futures::{pin_mut, StreamExt};
+use macpepdb::database::generic_client::GenericClient;
 use macpepdb::{
     database::{
         configuration_table::ConfigurationTable as ConfigurationTableTrait,
         scylla::{
-            client::{Client as DbClient, GenericClient},
-            configuration_table::ConfigurationTable,
+            client::Client as DbClient, configuration_table::ConfigurationTable,
             peptide_table::PeptideTable,
         },
     },

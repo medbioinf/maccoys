@@ -1,11 +1,12 @@
 // 3rd party imports
 use anyhow::{bail, Result};
 use macpepdb::{
-    chemistry::amino_acid::calc_sequence_mass,
-    database::scylla::client::{Client as DbClient, GenericClient},
+    chemistry::amino_acid::calc_sequence_mass_int,
     database::{
         configuration_table::ConfigurationTable as ConfigurationTableTrait,
+        generic_client::GenericClient,
         scylla::{
+            client::Client as DbClient,
             configuration_table::ConfigurationTable,
             peptide_table::{PeptideTable, UPDATE_SET_PLACEHOLDER},
         },
@@ -58,7 +59,7 @@ impl DecoyCache {
                 let decoys: Vec<Peptide> = decoys
                     .into_iter()
                     .map(|(seq, missed_cleavages)| {
-                        let mass = calc_sequence_mass(seq.as_str())?;
+                        let mass = calc_sequence_mass_int(seq.as_str())?;
                         let partition =
                             get_mass_partition(configuration.get_partition_limits(), mass)?;
                         Peptide::new(
@@ -84,7 +85,7 @@ impl DecoyCache {
                     UPDATE_SET_PLACEHOLDER.as_str()
                 );
 
-                let prepared = client.get_session().prepare(statement).await?;
+                let prepared = client.prepare(statement).await?;
                 PeptideTable::bulk_insert(client, decoys.iter(), &prepared).await?;
             }
             Client::Http(client) => {

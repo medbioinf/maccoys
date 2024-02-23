@@ -1,5 +1,4 @@
 // std imports
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 // 3rd party imports
@@ -7,7 +6,8 @@ use anyhow::Result;
 use axum::routing::post;
 use axum::Router;
 use macpepdb::database::configuration_table::ConfigurationTable as ConfigurationTableTrait;
-use macpepdb::database::scylla::client::{Client, GenericClient};
+use macpepdb::database::generic_client::GenericClient;
+use macpepdb::database::scylla::client::Client;
 use macpepdb::database::scylla::configuration_table::ConfigurationTable;
 use macpepdb::entities::configuration::Configuration;
 
@@ -41,12 +41,9 @@ pub async fn start(database_url: &str, interface: String, port: u16) -> Result<(
         .with_state((db_client.clone(), configuration.clone()));
 
     // Run our app with hyper
-    // `axum::Server` is a re-export of `hyper::Server`
-    let addr: SocketAddr = format!("{}:{}", interface, port).parse()?;
-    tracing::info!("ready for connections, listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", interface, port)).await?;
+    tracing::info!("ready for connections, listening on {}", interface);
+    axum::serve(listener, app).await.unwrap();
 
     Ok(())
 }

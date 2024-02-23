@@ -9,7 +9,7 @@ use dihardts_omicstools::proteomics::post_translational_modifications::Modificat
 use dihardts_omicstools::proteomics::post_translational_modifications::Position as ModificationPosition;
 use fancy_regex::Regex;
 use futures::Stream;
-use macpepdb::chemistry::molecule::WATER;
+use macpepdb::chemistry::molecule::WATER_MONO_MASS;
 use rand::{thread_rng, Rng};
 
 // internal imports
@@ -130,7 +130,7 @@ impl DecoyGenerator {
         let max_number_of_missed_cleavages_u = max_number_of_missed_cleavages as usize;
         let mut rng = thread_rng();
         while start.elapsed().as_secs_f64() < timeout {
-            let mut mass = WATER.get_mono_mass()
+            let mut mass = *WATER_MONO_MASS
                 + self.static_n_terminus_modification
                 + self.static_c_terminus_modification;
             let mut sequence: Vec<&DecoyPart> = Vec::new();

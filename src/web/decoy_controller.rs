@@ -6,8 +6,9 @@ use anyhow::Result;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use macpepdb::chemistry::amino_acid::calc_sequence_mass;
-use macpepdb::database::scylla::client::{Client, GenericClient};
+use macpepdb::chemistry::amino_acid::calc_sequence_mass_int;
+use macpepdb::database::generic_client::GenericClient;
+use macpepdb::database::scylla::client::Client;
 use macpepdb::database::scylla::peptide_table::{PeptideTable, UPDATE_SET_PLACEHOLDER};
 use macpepdb::database::table::Table;
 use macpepdb::entities::{configuration::Configuration, peptide::Peptide as Decoy};
@@ -31,7 +32,7 @@ impl InsertDecoyRequest {
     pub fn get_decoys(&self, configuration: &Configuration) -> Result<Vec<Decoy>> {
         let mut decoys: Vec<Decoy> = Vec::with_capacity(self.decoys.len());
         for (sequence, missed_cleavages) in self.decoys.iter() {
-            let mass = calc_sequence_mass(sequence)?;
+            let mass = calc_sequence_mass_int(sequence)?;
             let partition = get_mass_partition(configuration.get_partition_limits(), mass)?;
             decoys.push(Decoy::new(
                 partition as i64,
@@ -93,7 +94,7 @@ pub async fn insert_decoys(
     );
     let db_client = db_client.as_ref();
 
-    let prepared = match db_client.get_session().prepare(statement).await {
+    let prepared = match db_client.prepare(statement).await {
         Ok(prepared) => prepared,
         Err(err) => {
             return Err(WebError::new(

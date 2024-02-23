@@ -1,10 +1,13 @@
 // 3rd party imports
 use anyhow::{anyhow, bail, Result};
 use macpepdb::{
-    database::scylla::client::{Client as DbClient, GenericClient},
     database::{
         configuration_table::ConfigurationTable as ConfigurationTableTrait,
-        scylla::{configuration_table::ConfigurationTable, peptide_table::PeptideTable},
+        generic_client::GenericClient,
+        scylla::{
+            client::Client as DbClient, configuration_table::ConfigurationTable,
+            peptide_table::PeptideTable,
+        },
     },
     entities::configuration::Configuration,
 };

@@ -1,10 +1,9 @@
 // 3rd party imports
 use anyhow::Result;
 use macpepdb::database::configuration_table::ConfigurationTable as ConfigurationTableTrait;
+use macpepdb::database::generic_client::GenericClient;
 use macpepdb::database::scylla::{
-    client::{Client, GenericClient},
-    configuration_table::ConfigurationTable,
-    migrations::run_migrations,
+    client::Client, configuration_table::ConfigurationTable, migrations::run_migrations,
 };
 use macpepdb::entities::configuration::Configuration;
 use reqwest;
