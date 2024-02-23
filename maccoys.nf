@@ -108,7 +108,7 @@ process search {
         ${params.ptmFile ? '-p ' + params.ptmFile + ' \\': '\\'}
         ${params.decoyUrl ? '-d ' + params.decoyUrl + ' \\' : '\\'}
         ${params.decoyCacheUrl ? '-c ' + params.decoyCacheUrl + ' \\' : '\\'}
-        ${params.targetLookupUrl ? '-p ' + params.targetLookupUrl + ' \\' : '\\'}
+        ${params.targetLookupUrl ? '-t ' + params.targetLookupUrl + ' \\' : '\\'}
 
     # delete extracted mzML file as they can be saftly restored from the orignal mzML file
     rm extracted.mzML
