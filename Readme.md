@@ -78,6 +78,8 @@ Arguments are mostly equal to the MaCcoyS binary.
 | `--decoy-cache-url` | `http` or `scylla` URL for storing decoys |
 | `--target-lookup-url` | `http`, `bloom+http` or `scylla` URL for target lookup |
 | `--keep-search-files` | Set this to non-zero to keep the search files (search engine config, FASTA files) |  
+| `--comet-threads` | Set this to something larger zero to limit the number of threads Comet is using |
+| `--comet-max-fork` | If `--comet-threads` is set, the workflow will spawn `cores / --comet-threads` forks. If you can afford more, you can override it here. This is only set if `--comet-threads` is set.  |
 
 #### Non-mzML files
 The workflow is able to convert non-mzML file. This is done using Docker images, therefore the run command is a bit different: `nextflow run -profile conversion maccoys.nf ...`

@@ -22,8 +22,17 @@ params.decoyCacheUrl = ""
 params.targetLookupUrl = ""
 params.keepSearchFiles = "0"    // If non-0, the search engine config and FASTA files will be deleted after the search
 
+// runtime arguments
+params.cometThreads = 0
+params.cometMaxForkOverride = 0
+
 // debugging arguments
 params.limitMs2 = ""
+
+
+NUM_CORES = Runtime.runtime.availableProcessors()
+comet_max_forks = params.cometThreads > 0 ? Math.round(NUM_CORES / params.cometThreads) : 1
+comet_max_forks = params.cometMaxForkOverride > 0 ? params.cometMaxForkOverride : comet_max_forks
 
 process convert_thermo_raw_files {
     maxForks 2
@@ -76,7 +85,11 @@ process indexing {
 }
 
 process search {
-    maxForks 4
+    // Try to maximize the number of forks for the comet search process
+    if (params.cometThreads > 0) {
+        cpus params.cometThreads
+        maxForks comet_max_forks
+    }
 
     input:
     tuple path(mzml), path(mzml_index), val(spectrum_id)
@@ -91,12 +104,14 @@ process search {
     spec_id_result_dir=${params.resultsDir}/${mzml.getBaseName()}/\$(${params.maccoysBin} sanitize-spectrum-id '${spectrum_id}')
     mkdir -p \$spec_id_result_dir
 
+    cat ${default_comet_params} | sed 's/^num_threads = .*\$/num_threads = ${task.cpus}/g' > this.comet.params
+
     ${params.maccoysBin} search \\
         ${mzml} \\
         ${mzml_index} \\
         '${spectrum_id}' \\
         ./ \\
-        ${default_comet_params} \\
+        ./this.comet.params \\
         ${params.lowerMassTol} \\
         ${params.upperMassTol} \\
         ${params.maxVarPtm} \\
