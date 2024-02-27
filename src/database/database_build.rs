@@ -6,8 +6,6 @@ use macpepdb::database::scylla::{
     client::Client, configuration_table::ConfigurationTable, migrations::run_migrations,
 };
 use macpepdb::entities::configuration::Configuration;
-use reqwest;
-use serde_json;
 
 pub struct DatabaseBuild {
     database_url: String,

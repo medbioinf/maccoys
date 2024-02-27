@@ -127,6 +127,11 @@ impl SearchSpaceGenerator {
         ptms: &Vec<PTM>,
         limit: Option<usize>,
     ) -> Result<usize> {
+        let proteome_ids = match proteome_id {
+            Some(proteome_id) => Some(vec![proteome_id]),
+            None => None,
+        };
+
         // Determine the client
         let client = if is_target {
             &self.target_client
@@ -169,7 +174,7 @@ impl SearchSpaceGenerator {
                     upper_mass_tolerance_ppm,
                     max_variable_modifications,
                     taxonomy_ids,
-                    proteome_id,
+                    proteome_ids,
                     is_reviewed,
                     ptms.clone(),
                 )

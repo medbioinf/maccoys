@@ -1,12 +1,11 @@
 // std imports
 use std::fs::OpenOptions;
 use std::io::prelude::*;
-use std::io::{BufRead, BufReader, SeekFrom};
+use std::io::{BufReader, SeekFrom};
 use std::path::Path;
 
 // 3rd party imports
 use anyhow::{Context, Result};
-use polars::frame::DataFrame;
 use polars::prelude::*;
 
 // internal imports
