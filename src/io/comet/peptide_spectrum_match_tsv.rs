@@ -5,7 +5,7 @@ use std::io::{BufReader, SeekFrom};
 use std::path::Path;
 
 // 3rd party imports
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use polars::prelude::*;
 
 // internal imports
@@ -16,14 +16,26 @@ use crate::constants::{COMET_HEADER_ROW, COMET_SEPARATOR};
 /// # Arguments
 /// * `psm_file_path` - Path to the Comet PSM file
 ///
-pub fn read(psm_file_path: &Path) -> Result<DataFrame> {
-    Ok(CsvReader::from_path(psm_file_path)
+pub fn read(psm_file_path: &Path) -> Result<Option<DataFrame>> {
+    match CsvReader::from_path(psm_file_path)
         .context("Error when opening Comet PSM file for reading")?
         .has_header(true)
         .with_separator(COMET_SEPARATOR.as_bytes()[0])
         .with_skip_rows(COMET_HEADER_ROW as usize)
         .finish()
-        .context("Error when parsing Comet PSM file to dataframe")?)
+    {
+        Ok(df) => Ok(Some(df)),
+        Err(err) => {
+            handle_polars_error(err).context("Error when parsing Comet PSM file to dataframe")
+        }
+    }
+}
+
+fn handle_polars_error(error: PolarsError) -> Result<Option<DataFrame>> {
+    match error {
+        PolarsError::NoData(_) => Ok(None),
+        _ => bail!(error),
+    }
 }
 
 /// Overwrite a Comet PSM file with the given dataframe

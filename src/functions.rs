@@ -254,7 +254,10 @@ pub async fn search(
 ///
 pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Result<()> {
     // fdr calculation
-    let mut psms = read_comet_tsv(psm_file_path)?;
+    let mut psms = match read_comet_tsv(psm_file_path)? {
+        Some(psms) => psms,
+        None => return Ok(()),
+    };
     psms = mark_target_and_decoys(psms)?;
     psms = false_discovery_rate(psms)?;
     overwrite_comet_tsv(psms, psm_file_path)?;
