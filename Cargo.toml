@@ -1,43 +1,5 @@
-[package]
-name = "maccoys"
-version = "0.1.0"
-authors = ["Dirk Winkelhardt <dirk.winkelhardt@rub.de>"] 
-edition = "2021"
-description = "Mass spectrometry search engine using MaCPepDB as search space."
-repository = "https://github.com/medbioinf/maccoys"
-homepage = "https://github.com/medbioinf/maccoys"
-documentation = "https://github.com/medbioinf/maccoys"
-license-file = "LICENSE"
+[workspace]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[lib]
-name = "maccoys"
-path = "src/lib.rs"
-
-[[bin]]
-name = "maccoys"
-path = "src/bin.rs"
-
-[dependencies]
-anyhow = { version = "1.0.75", features = ["backtrace"] }
-async-stream = "0.3.5"
-axum = "0.7.4"
-clap = { version = "4.4.6", features = ["derive"] }
-dihardts_omicstools = "1.7.0"
-fallible-iterator = "0.3.0"
-fancy-regex = "0.11.0"
-futures = "0.3.28"
-indicatif = "0.17.7"
-lazy_static = "1.4.0"
-macpepdb = { path = "../macpepdb-rs" }
-polars = { version = "0.35.4", features = ["csv", "cum_agg", "lazy", "strings"] }
-rand = "0.8.5"
-reqwest = { version = "0.11.22", features = ["blocking", "json", "stream"] }
-scylla = "0.8.1"
-serde = "1.0.189"
-serde_json = "1.0.107"
-tokio = "1.33.0"
-tracing = "0.1.39"
-tracing-indicatif = "0.3.5"
-tracing-subscriber = "0.3.17"
+members = [
+    "maccoys"
+]
