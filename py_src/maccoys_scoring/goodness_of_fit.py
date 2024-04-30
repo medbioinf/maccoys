@@ -68,6 +68,8 @@ def cramer_von_mises(x: pd.Series, dist: str) -> Tuple[float, float]:
     Returns:
         Tuple[float, float]: Test statistic and p-value
     """
+    if len(x) < 2:
+        return (np.nan, np.nan)
     dist_mod = DISTRIBUTIONS[dist]
     fitting_args = dist_mod.fit(x)
     test_res = scipy.stats.cramervonmises(x, dist_mod.cdf, args=fitting_args)
@@ -84,6 +86,8 @@ def lilliefors(x: pd.Series, dist: str) -> Tuple[float, float]:
     Returns:
         Tuple[float, float]: Test statistic and p-value
     """
+    if len(x) < 4 and dist == "norm" or len(x) < 3 and dist == "exp":
+        return (np.nan, np.nan)
     return statsmodels_lilliefors(x, dist=dist)
 
 
