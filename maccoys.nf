@@ -165,7 +165,7 @@ process post_processing {
 
 
 workflow() {
-    raws = Channel.fromPath(params.specDir + "/*.{raw}")
+    raws = Channel.fromPath(params.specDir + "/*.raw")
     mzmls = Channel.fromPath(params.specDir + "/*.{mzML,mzml}")
 
     converted_raws = convert_thermo_raw_files(raws)
