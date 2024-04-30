@@ -37,8 +37,6 @@ comet_max_forks = params.cometMaxForkOverride > 0 ? params.cometMaxForkOverride 
 process convert_thermo_raw_files {
     maxForks 2
     container 'chambm/pwiz-skyline-i-agree-to-the-vendor-licenses'
-    // by mounting the parent directory we can use a symlink to the raw file in the workdir
-    containerOptions { "-v ${raw_file.getParent()}:/data" }
 
     input:
     path raw_file
