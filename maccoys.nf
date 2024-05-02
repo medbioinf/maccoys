@@ -28,6 +28,7 @@ params.cometMaxForkOverride = 0
 
 // debugging arguments
 params.limitMs2 = ""
+params.result_copy_sanity_check = false     // set this to true to write an empy file with the basename of the mzml file to the result directory to make sure it is copied into the correct directory
 
 
 NUM_CORES = Runtime.runtime.availableProcessors()
@@ -82,34 +83,28 @@ process indexing {
     """
 }
 
-process search {
-    // Try to maximize the number of forks for the comet search process
-    if (params.cometThreads > 0) {
-        cpus params.cometThreads
-        maxForks comet_max_forks
-    }
-
+/**
+ * Extract the MS2 spectrum and builds a search space for each charge state
+ */
+process search_preparation {
     input:
     tuple path(mzml), path(mzml_index), val(spectrum_id)
     path default_comet_params
 
     output:
-    stdout
-    path "*.tsv"
+    tuple path("*", type: "dir"), stdout
 
     """
     # Create the result directory for this spectrum ID
-    spec_id_result_dir=${params.resultsDir}/${mzml.getBaseName()}/\$(${params.maccoysBin} sanitize-spectrum-id '${spectrum_id}')
-    mkdir -p \$spec_id_result_dir
+    sanitized_spec_id=\$(${params.maccoysBin} sanitize-spectrum-id '${spectrum_id}')
+    mkdir \$sanitized_spec_id
 
-    cat ${default_comet_params} | sed 's/^num_threads = .*\$/num_threads = ${task.cpus}/g' > this.comet.params
-
-    ${params.maccoysBin} search \\
+    ${params.maccoysBin} search-preparation \\
         ${mzml} \\
         ${mzml_index} \\
         '${spectrum_id}' \\
-        ./ \\
-        ./this.comet.params \\
+        ./\$sanitized_spec_id \\
+        ./comet.params.new \\
         ${params.lowerMassTol} \\
         ${params.upperMassTol} \\
         ${params.maxVarPtm} \\
@@ -123,37 +118,79 @@ process search {
         ${params.decoyCacheUrl ? '-c ' + params.decoyCacheUrl + ' \\' : '\\'}
         ${params.targetLookupUrl ? '-t ' + params.targetLookupUrl + ' \\' : '\\'}
 
-    # delete extracted mzML file as they can be saftly restored from the orignal mzML file
-    rm extracted.mzML
-
-    if [ "${params.keepSearchFiles}" -eq "0" ]; then
-        rm *.fasta
-        rm *.comet.params
+    if [ "${params.result_copy_sanity_check}" -eq "true" ]; then
+        echo -n "" > \$sanitized_spec_id/${mzml.getBaseName()}
     fi
+    
+    # Construct and print the result folder for this mzML to make it accessible for the next processes
+    echo -n ${params.resultsDir}/${mzml.getBaseName()}
+    """
+}
 
+/**
+ * Search the MS2 spectra against the search space
+ */
+process search {
+    // Try to maximize the number of forks for the comet search process
+    if (params.cometThreads > 0) {
+        cpus params.cometThreads
+        maxForks comet_max_forks
+    }
+
+    input:
+    tuple path(search_dir), val(result_dir)
+
+    output:
+    tuple path("$search_dir", includeInputs: true), val(result_dir)
+
+    """
+    cd $search_dir
+
+    # Iterate through 
+    for comet_params_file in *.comet.params
+    do
+        # Basename == charge and basename of fasta file
+        charge=\$(basename \$comet_params_file .comet.params)
+
+        # cat + sed + > avoids differences in `-i` usage on BSD and Linux.
+        # Reading first into varaibles avoids empty files which appear from time to time
+        comet_params=\$(cat \$comet_params_file)
+        echo "\$comet_params" | sed 's;^num_threads = .*\$;num_threads = ${task.cpus};g' > \$comet_params_file
+
+        # Run the search
+        comet -P\${comet_params_file} -D\${charge}.fasta -N\${charge} extracted.mzML
+    done
+
+    # Rename the PSM files to have the correct extension
     for file in *.txt; do
         mv -- "\$file" "\$(basename \$file .txt).psms.tsv"
     done
 
-    # Return the result directory for this spectrum ID as stdout, so it is available as `val` in the next process
-    echo -n \$spec_id_result_dir
-    """
+    # Delete extracted mzML file as they can be saftly restored from the orignal mzML file
+    rm extracted.mzML
 
+    # Remove the search engine config and FASTA files if requested
+    if [ "${params.keepSearchFiles}" -eq "0" ]; then
+        rm *.fasta
+        rm *.comet.params
+    fi
+    """
 }
 
 process post_processing {
-    publishDir "${spectrum_result_dir}", mode: 'copy'
+    publishDir "${result_dir}", mode: 'copy'
 
     input:
-    val spectrum_result_dir
-    path "*"
+    tuple path(search_dir), val(result_dir)
 
     output:
-    path "*.tsv", includeInputs: true
+    path "$search_dir", includeInputs: true
 
     """
-    psm_file=(*.tsv)
-    ${params.maccoysBin} post-process \$psm_file \$(basename \$psm_file .tsv).goodness.tsv
+    for psm_file in $search_dir/*.psms.tsv
+    do
+        ${params.maccoysBin} post-process \$psm_file \$(basename \$psm_file .tsv).goodness.tsv
+    done
     """
 }
 
@@ -182,7 +219,8 @@ workflow() {
             tuple(mzml, mzml_index, spectrum_id)
         }
     }.flatten().collate(3)
-    search(spectra_table, create_default_comet_params.out)
-    post_processing(search.out)
+    search_dirs = search_preparation(spectra_table, create_default_comet_params.out)
+    search_dirs = search(search_dirs)
+    post_processing(search_dirs)
     // filter()
 }

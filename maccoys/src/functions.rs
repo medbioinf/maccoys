@@ -123,16 +123,13 @@ pub async fn create_search_space(
         .await?)
 }
 
-/// Does a identification for the given spectrum. The spectrum will be extracted from the original spectrum file
-/// and is written into a separate mzML. For each precursor with m/z and charge state a separate search space (FASTA) is created
-/// The targets are fetched from MaCPepDB. Depending on the settings the search spaces extended by decoys.
-/// The search is done with Comet. The results are written into a separate file.
+/// Prepares the search by extracting the spectrum from the original spectrum file and creates a search space and comet params file for each charge state.
 ///
 /// # Arguments
 /// * `original_spectrum_file_path` - Path to the original spectrum file
 /// * `index_file_path` - Path to the index file
 /// * `spectrum_id` - Spectrum ID
-/// * `work_dir` - Working directory
+/// * `work_dir` - Working directory to store all files
 /// * `default_comet_file_path` - Path to the default Comet configuration file
 /// * `ptms` - PTMs
 /// * `lower_mass_tolerance_ppm` - Lower mass tolerance in PPM
@@ -144,7 +141,7 @@ pub async fn create_search_space(
 /// * `target_lookup_url` - Optional URL for checking generated decoy against targets.
 /// * `decoy_cache_url` - URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
 ///
-pub async fn search(
+pub async fn search_preparation(
     original_spectrum_file_path: &Path,
     index_file_path: &Path,
     spectrum_id: &str,
@@ -222,20 +219,6 @@ pub async fn search(
                     decoy_cache_url.clone(),
                 )
                 .await?;
-                let comet_arguments = vec![
-                    format!("-P{}", comet_config_path.to_str().unwrap()),
-                    format!("-D{}", fasta_file_path.to_str().unwrap()),
-                    format!("-N{}", file_base_name),
-                    extracted_spectrum_file_path.to_str().unwrap().to_string(),
-                ];
-                let output = Command::new("comet").args(comet_arguments).output().await?;
-
-                info!("{}", String::from_utf8_lossy(&output.stdout));
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                    error!("{}", &stderr);
-                    bail!(stderr)
-                }
             }
         }
     }

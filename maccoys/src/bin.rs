@@ -20,7 +20,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::functions::search;
+use maccoys::functions::search_preparation;
 use maccoys::functions::{create_search_space, post_process, sanitize_spectrum_id};
 use maccoys::web::server::start as start_web_server;
 
@@ -94,9 +94,9 @@ enum Commands {
         /// Path to output file
         output_file_path: String,
     },
-    /// Creates extracts the given spectrum from the spectra file, creates a search space for the spectrum
-    /// and creates the search engine config.
-    Search {
+    /// Extracts the MS2 spectrum from the given mzML file and prepares the search for the given spectrum by
+    /// creating the Comet configuration and FASTA files for each charge state.
+    SearchPreparation {
         /// Path to original spectrum file
         original_spectrum_file_path: String,
         /// Path to index file for the original spectrum file
@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
                 extractor.extract_spectrum(&spectrum_id)?,
             )?;
         }
-        Commands::Search {
+        Commands::SearchPreparation {
             original_spectrum_file_path,
             index_file_path,
             spectrum_id,
@@ -328,7 +328,7 @@ async fn main() -> Result<()> {
                 None => Vec::new(),
             };
 
-            search(
+            search_preparation(
                 &original_spectrum_file_path,
                 &index_file_path,
                 &spectrum_id,
