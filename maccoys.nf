@@ -90,7 +90,6 @@ process indexing {
  */
 process search_preparation {
     container 'medbioinf/maccoys:latest'
-    containerOptions '--network host'
 
     input:
     tuple path(mzml), path(mzml_index), val(spectrum_id)
