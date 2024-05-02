@@ -44,8 +44,8 @@ process convert_thermo_raw_files {
     output:
     path "${raw_file.getBaseName()}.mzML"
 
-    // can only run when profile conversion is enabled
-    when: workflow.profile == 'conversion'
+    // can only run when profile docker is enabled
+    when: workflow.profile == 'docker'
 
     """
     if [ ! -f ${raw_file.getBaseName()}.mzML ]; then
