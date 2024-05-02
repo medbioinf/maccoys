@@ -10,13 +10,13 @@ from pathlib import Path
 import pandas as pd
 
 # internal import
-from maccoys_scoring.goodness_of_fit import calc_goodnesses
-from maccoys_scoring.io.comet_tsv import (
+from maccoys.goodness_of_fit import calc_goodnesses
+from maccoys.io.comet_tsv import (
     read as read_comet_tsv,
     overwrite as overwrite_comet_tsv,
 )
-from maccoys_scoring.scoring import calculate_distance_score, calculate_exp_score
-from maccoys_scoring.search_engine_type import SearchEngineType
+from maccoys.scoring import calculate_distance_score, calculate_exp_score
+from maccoys.search_engine_type import SearchEngineType
 
 
 def add_scoring_cli(subparser: argparse._SubParsersAction):

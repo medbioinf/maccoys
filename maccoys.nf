@@ -3,7 +3,6 @@ nextflow.enable.dsl = 2
 // The pre-set parameters are for high res mass spectrometry data, adjust them to your needs
 
 // required arguments
-params.maccoysBin = ""
 params.specDir = ""
 params.lowerMassTol = 10
 params.upperMassTol = 10
@@ -58,6 +57,8 @@ process convert_thermo_raw_files {
 }
 
 process create_default_comet_params {
+    container 'medbioinf/maccoys-comet:latest'
+
     output:
     path "comet.params.new"
 
@@ -68,6 +69,7 @@ process create_default_comet_params {
 
 process indexing {
     publishDir path: "${params.resultsDir}/${mzml.getBaseName()}", mode: 'copy', pattern: '*.json'
+    container 'medbioinf/maccoys:latest'
 
     input:
     path mzml
@@ -78,7 +80,7 @@ process indexing {
     script:
     """
     mkdir -p ${params.resultsDir}/${mzml.getBaseName()}
-    ${params.maccoysBin} index-spectrum-file ${mzml} index.json
+    maccoys index-spectrum-file ${mzml} index.json
     jq '.spectra | keys[]' index.json | sed 's;";;g' ${params.limitMs2 ? ' | tail -n ' + params.limitMs2 : '' }
     """
 }
@@ -87,6 +89,9 @@ process indexing {
  * Extract the MS2 spectrum and builds a search space for each charge state
  */
 process search_preparation {
+    container 'medbioinf/maccoys:latest'
+    containerOptions '--network host'
+
     input:
     tuple path(mzml), path(mzml_index), val(spectrum_id)
     path default_comet_params
@@ -96,10 +101,10 @@ process search_preparation {
 
     """
     # Create the result directory for this spectrum ID
-    sanitized_spec_id=\$(${params.maccoysBin} sanitize-spectrum-id '${spectrum_id}')
+    sanitized_spec_id=\$(maccoys sanitize-spectrum-id '${spectrum_id}')
     mkdir \$sanitized_spec_id
 
-    ${params.maccoysBin} search-preparation \\
+    maccoys search-preparation \\
         ${mzml} \\
         ${mzml_index} \\
         '${spectrum_id}' \\
@@ -131,6 +136,8 @@ process search_preparation {
  * Search the MS2 spectra against the search space
  */
 process search {
+    container 'medbioinf/maccoys-comet:latest'
+
     // Try to maximize the number of forks for the comet search process
     if (params.cometThreads > 0) {
         cpus params.cometThreads
@@ -177,7 +184,31 @@ process search {
     """
 }
 
-process post_processing {
+/**
+ * Marks target and decoys and calculates the FDR
+ */
+process fdr {
+    container 'medbioinf/maccoys:latest'
+
+    input:
+    tuple path(search_dir), val(result_dir)
+
+    output:
+    tuple path("$search_dir", includeInputs: true), val(result_dir)
+
+    """
+    for psm_file in $search_dir/*.psms.tsv
+    do
+        maccoys post-process \$psm_file
+    done
+    """
+}
+
+/**
+ * Calculate goodness of fit and rescore the PSMs using the Python module
+ */
+process goodness_of_fit_and_rescoring {
+    container 'medbioinf/maccoys-py:latest'
     publishDir "${result_dir}", mode: 'copy'
 
     input:
@@ -189,7 +220,8 @@ process post_processing {
     """
     for psm_file in $search_dir/*.psms.tsv
     do
-        ${params.maccoysBin} post-process \$psm_file \$(basename \$psm_file .tsv).goodness.tsv
+        python -m maccoys comet goodness \$psm_file xcorr \$(basename \$psm_file .tsv).goodness.tsv 
+        python -m maccoys comet scoring \$psm_file xcorr exp_score xcorr dist_score
     done
     """
 }
@@ -221,6 +253,7 @@ workflow() {
     }.flatten().collate(3)
     search_dirs = search_preparation(spectra_table, create_default_comet_params.out)
     search_dirs = search(search_dirs)
-    post_processing(search_dirs)
+    search_dirs = fdr(search_dirs)
+    goodness_of_fit_and_rescoring(search_dirs)
     // filter()
 }

@@ -229,13 +229,10 @@ pub async fn search_preparation(
 /// Calculates the goodness of fit and scores for the given PSM file,
 /// using the python module `maccoys_scoring`.
 ///
-/// (This will actually call the module via CLI as there are some issues compiling Python directly into Rust)
-///
 /// # Arguments
 /// * `psm_file_path` - Path to PSM file
-/// * `goodness_file_path` - Path to output file for goodness of fit
 ///
-pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Result<()> {
+pub async fn post_process(psm_file_path: &Path) -> Result<()> {
     // fdr calculation
     let mut psms = match read_comet_tsv(psm_file_path)? {
         Some(psms) => psms,
@@ -244,55 +241,57 @@ pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Re
     psms = mark_target_and_decoys(psms)?;
     psms = false_discovery_rate(psms)?;
     overwrite_comet_tsv(psms, psm_file_path)?;
-    // goodness of fit
-    let python_args: Vec<&str> = vec![
-        "-m",
-        "maccoys_scoring",
-        "comet",
-        "goodness",
-        psm_file_path.to_str().unwrap(),
-        COMET_EXP_BASE_SCORE,
-        goodness_file_path.to_str().unwrap(),
-    ];
-    let output = Command::new("python")
-        .args(python_args)
-        .output()
-        .await
-        .context(
-            "Error when calling Python module `maccoys_scoring` for calculating goodness of fit",
-        )?;
 
-    info!("{}", String::from_utf8_lossy(&output.stdout));
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        error!("{:?}", &stderr);
-        bail!(stderr)
-    }
+    // TODO: Find crates to substitute the Python module or compile it into the binary
+    // // goodness of fit
+    // let python_args: Vec<&str> = vec![
+    //     "-m",
+    //     "maccoys_scoring",
+    //     "comet",
+    //     "goodness",
+    //     psm_file_path.to_str().unwrap(),
+    //     COMET_EXP_BASE_SCORE,
+    //     goodness_file_path.to_str().unwrap(),
+    // ];
+    // let output = Command::new("python")
+    //     .args(python_args)
+    //     .output()
+    //     .await
+    //     .context(
+    //         "Error when calling Python module `maccoys_scoring` for calculating goodness of fit",
+    //     )?;
 
-    // rescoring
-    let python_args: Vec<&str> = vec![
-        "-m",
-        "maccoys_scoring",
-        "comet",
-        "scoring",
-        psm_file_path.to_str().unwrap(),
-        COMET_EXP_BASE_SCORE,
-        EXP_SCORE_NAME,
-        COMET_DIST_BASE_SCORE,
-        DIST_SCORE_NAME,
-    ];
-    let output = Command::new("python")
-        .args(python_args)
-        .output()
-        .await
-        .context("Error when calling Python module `maccoys_scoring` for scoring")?;
+    // info!("{}", String::from_utf8_lossy(&output.stdout));
+    // if !output.status.success() {
+    //     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    //     error!("{:?}", &stderr);
+    //     bail!(stderr)
+    // }
 
-    info!("{}", String::from_utf8_lossy(&output.stdout));
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        error!("{:?}", &stderr);
-        bail!(stderr)
-    }
+    // // rescoring
+    // let python_args: Vec<&str> = vec![
+    //     "-m",
+    //     "maccoys_scoring",
+    //     "comet",
+    //     "scoring",
+    //     psm_file_path.to_str().unwrap(),
+    //     COMET_EXP_BASE_SCORE,
+    //     EXP_SCORE_NAME,
+    //     COMET_DIST_BASE_SCORE,
+    //     DIST_SCORE_NAME,
+    // ];
+    // let output = Command::new("python")
+    //     .args(python_args)
+    //     .output()
+    //     .await
+    //     .context("Error when calling Python module `maccoys_scoring` for scoring")?;
+
+    // info!("{}", String::from_utf8_lossy(&output.stdout));
+    // if !output.status.success() {
+    //     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    //     error!("{:?}", &stderr);
+    //     bail!(stderr)
+    // }
     Ok(())
 }
 

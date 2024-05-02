@@ -143,8 +143,6 @@ enum Commands {
     PostProcess {
         /// Path to PSM file
         psm_file_path: String,
-        /// Path to file were goodness values will be stored
-        goodness_file_path: String,
     },
     /// Sanitize spectrum ID (get rid of any special characters)
     SanitizeSpectrumId {
@@ -349,10 +347,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::PostProcess {
-            psm_file_path,
-            goodness_file_path,
-        } => post_process(&Path::new(&psm_file_path), &Path::new(&goodness_file_path)).await?,
+        Commands::PostProcess { psm_file_path } => post_process(&Path::new(&psm_file_path)).await?,
         Commands::SanitizeSpectrumId { spectrum_id, trim } => {
             if !trim {
                 println!("{}", sanitize_spectrum_id(&spectrum_id));
