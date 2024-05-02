@@ -197,7 +197,9 @@ process fdr {
     tuple path("$search_dir", includeInputs: true), val(result_dir)
 
     """
-    for psm_file in $search_dir/*.psms.tsv
+    cd $search_dir
+    
+    for psm_file in *.psms.tsv
     do
         maccoys post-process \$psm_file
     done
@@ -218,7 +220,9 @@ process goodness_of_fit_and_rescoring {
     path "$search_dir", includeInputs: true
 
     """
-    for psm_file in $search_dir/*.psms.tsv
+    cd $search_dir
+
+    for psm_file in *.psms.tsv
     do
         python -m maccoys comet goodness \$psm_file xcorr \$(basename \$psm_file .tsv).goodness.tsv 
         python -m maccoys comet scoring \$psm_file xcorr exp_score xcorr dist_score
