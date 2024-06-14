@@ -20,8 +20,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::functions::search_preparation;
-use maccoys::functions::{create_search_space, post_process, sanitize_spectrum_id};
+use maccoys::functions::{create_search_space, post_process};
+use maccoys::functions::{sanatize_string, search_preparation};
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -350,9 +350,9 @@ async fn main() -> Result<()> {
         Commands::PostProcess { psm_file_path } => post_process(&Path::new(&psm_file_path)).await?,
         Commands::SanitizeSpectrumId { spectrum_id, trim } => {
             if !trim {
-                println!("{}", sanitize_spectrum_id(&spectrum_id));
+                println!("{}", sanatize_string(&spectrum_id));
             } else {
-                print!("{}", sanitize_spectrum_id(&spectrum_id));
+                print!("{}", sanatize_string(&spectrum_id));
             }
         }
     };

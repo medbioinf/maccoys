@@ -295,15 +295,13 @@ pub async fn post_process(psm_file_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sanitizes the given spectrum ID by replacing all non word characters with `_`.
+/// Sanitizes the given string by replacing all non word characters with `_`.
 ///
 /// # Arguments
-/// * `spectrum_id` - Spectrum ID
+/// * `some_str` - string
 ///
-pub fn sanitize_spectrum_id(spectrum_id: &str) -> String {
-    NON_WORD_CHAR_REGEX
-        .replace_all(spectrum_id, "_")
-        .to_string()
+pub fn sanatize_string(some_str: &str) -> String {
+    NON_WORD_CHAR_REGEX.replace_all(some_str, "_").to_string()
 }
 
 /// Add a column `is_target` to the given PSMs DataFrame.
