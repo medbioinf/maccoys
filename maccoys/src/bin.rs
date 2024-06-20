@@ -1,17 +1,19 @@
 // std imports
 use std::collections::HashMap;
 use std::fs::{read_to_string, write as write_file};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // 3rd party imports
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dihardts_omicstools::mass_spectrometry::spectrum::Spectrum as SpectrumTrait;
 use dihardts_omicstools::proteomics::io::mzml::reader::Spectrum;
 use dihardts_omicstools::proteomics::io::mzml::{
     index::Index, indexed_reader::IndexedReader, indexer::Indexer, reader::Reader as MzmlReader,
 };
+use glob::glob;
 use indicatif::ProgressStyle;
+use maccoys::pipeline::{Pipeline, PipelineConfiguration};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -23,6 +25,27 @@ use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::{create_search_space, post_process};
 use maccoys::functions::{sanatize_string, search_preparation};
 use maccoys::web::server::start as start_web_server;
+
+#[derive(Debug, Subcommand)]
+enum PipelineCommand {
+    /// Creates a new configuration file
+    NewConfig {},
+    /// Runs the MaCcoyS pipeline
+    LocalRun {
+        /// Path to the configuration file
+        config: PathBuf,
+        /// Paths to mzML files
+        /// Glob patterns are allowed. e.g. /path/to/**/*.mzML, put them in quotes if your shell expands them.
+        #[arg(value_delimiter = ' ', num_args = 0..)]
+        mzml_file_paths: Vec<String>,
+    },
+}
+
+#[derive(Debug, Parser)]
+struct PipelineCLI {
+    #[command(subcommand)]
+    command: PipelineCommand,
+}
 
 #[derive(Debug, Subcommand)]
 enum Commands {
@@ -152,6 +175,7 @@ enum Commands {
         #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
         trim: bool,
     },
+    Pipeline(PipelineCLI),
 }
 
 #[derive(Debug, Parser)]
@@ -184,14 +208,16 @@ async fn main() -> Result<()> {
     let filter = EnvFilter::from_default_env()
         .add_directive(verbosity.into())
         .add_directive("scylla=info".parse().unwrap())
-        .add_directive("tokio_postgres=info".parse().unwrap());
+        .add_directive("tokio_postgres=info".parse().unwrap())
+        .add_directive("hyper=info".parse().unwrap())
+        .add_directive("reqwest=info".parse().unwrap());
 
     let indicatif_layer = IndicatifLayer::new().with_progress_style(
         ProgressStyle::with_template(
             "{spinner:.cyan} {span_child_prefix}{span_name}{{{span_fields}}} {wide_msg} {elapsed}",
         )
         .unwrap()
-    ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent(" ");
+    ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent(" ").with_max_progress_bars(10, None);
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
@@ -355,7 +381,50 @@ async fn main() -> Result<()> {
                 print!("{}", sanatize_string(&spectrum_id));
             }
         }
+        Commands::Pipeline(pipeline_command) => match pipeline_command.command {
+            PipelineCommand::NewConfig {} => {
+                let new_config = PipelineConfiguration::new();
+                println!("{}", toml::to_string_pretty(&new_config)?);
+            }
+            PipelineCommand::LocalRun {
+                config,
+                mzml_file_paths,
+            } => {
+                let config: PipelineConfiguration =
+                    toml::from_str(&read_to_string(&config).context("Reading config file")?)
+                        .context("Deserialize config")?;
+                let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
+
+                let pipline = Pipeline::new(config).await?;
+                pipline.run(mzml_file_paths).await?;
+            }
+        },
     };
 
     Ok(())
+}
+
+/// Converts a vector of strings to a vector of paths and resolves glob patterns.
+///
+/// # Arguments
+/// * `paths` - Vector of paths as strings
+///
+fn convert_str_paths_and_resolve_globs(paths: Vec<String>) -> Result<Vec<PathBuf>> {
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            if !path.contains("*") {
+                // Return plain path in vecotor if no glob pattern is found
+                Ok(vec![Path::new(&path).to_path_buf()])
+            } else {
+                // Resolve glob pattern and return array of paths
+                Ok(glob(&path)?
+                    .map(|x| Ok(x?))
+                    .collect::<Result<Vec<PathBuf>>>()?)
+            }
+        })
+        .collect::<Result<Vec<_>>>()? // Collect and resolve errors from parsing/resolving
+        .into_iter()
+        .flatten() // flatten the vectors which
+        .collect())
 }

@@ -1,7 +1,7 @@
 // std imports
 use std::cmp::{max, min};
 use std::fs::{read_to_string, write as write_file};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // 3rd party imports
 use anyhow::{bail, Context, Result};
@@ -22,8 +22,7 @@ use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use polars::prelude::*;
-use tokio::process::Command;
-use tracing::{error, info};
+use tracing::debug;
 
 use crate::constants::{
     COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_MAX_PSMS, DIST_SCORE_NAME, EXP_SCORE_NAME,
@@ -43,6 +42,72 @@ lazy_static! {
     /// Regex for finding non word characters
     ///
     static ref NON_WORD_CHAR_REGEX: Regex = fancy_regex::Regex::new(r"\W").unwrap();
+}
+
+/// Creates the work directory if it does not exist.
+///
+/// # Arguments
+/// * `work_dir` - Work directory
+///
+pub async fn create_work_dir(work_dir: &Path) -> Result<()> {
+    if !work_dir.exists() {
+        tokio::fs::create_dir_all(&work_dir)
+            .await
+            .context("Could not create work directory.")?;
+    }
+    Ok(())
+}
+
+/// Creates a spectrum work directory if it does not exist.s
+///
+/// # Arguments
+/// * `work_dir` - Work directory
+/// * `spectrum_id` - Spectrum ID
+///
+pub async fn create_spectrum_workdir(work_dir: &Path, spectrum_id: &str) -> Result<PathBuf> {
+    let spectrum_workdir = work_dir.join(sanatize_string(spectrum_id));
+    if !spectrum_workdir.exists() {
+        tokio::fs::create_dir_all(&spectrum_workdir)
+            .await
+            .context("Could not create spectrum work directory.")?;
+    }
+    Ok(spectrum_workdir)
+}
+
+/// Runs Comet search with the given parameters.
+///
+/// # Arguments
+/// * `comet_exe` - Path to Comet executable
+/// * `comet_params_path` - Path to Comet parameter file
+/// * `fasta_path` - Path to FASTA file
+/// * `prefix_of_psm_file` - Path to the resulting PSM file without file extension
+/// * `mzml_path` - Path to mzML file
+pub async fn run_comet_search(
+    comet_exe: &PathBuf,
+    comet_params_path: &PathBuf,
+    fasta_path: &PathBuf,
+    prefix_of_psm_file: &PathBuf,
+    mzml_path: &PathBuf,
+) -> Result<()> {
+    let comet_args = vec![
+        format!("-P{}", comet_params_path.to_str().unwrap()),
+        format!("-D{}", fasta_path.to_str().unwrap()),
+        format!("-N{}", prefix_of_psm_file.to_str().unwrap()),
+        mzml_path.to_str().unwrap().to_string(),
+    ];
+
+    debug!(
+        "Running comet: `{} {}`",
+        comet_exe.to_str().unwrap(),
+        comet_args.join(" ")
+    );
+
+    tokio::process::Command::new(comet_exe)
+        .args(comet_args)
+        .output()
+        .await?;
+
+    Ok(())
 }
 
 /// Creates a FASTA entry for the given sequence.

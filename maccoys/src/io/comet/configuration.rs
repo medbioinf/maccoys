@@ -17,6 +17,7 @@ use crate::constants::FASTA_DECOY_ENTRY_PREFIX;
 
 /// Crate for handling comet configuration files.
 ///
+#[derive(Clone)]
 pub struct Configuration {
     content: String,
     num_variable_modifications: u8,
@@ -272,6 +273,16 @@ impl Configuration {
     ///
     pub fn to_file(&self, path: &Path) -> Result<()> {
         write_to_file(path, &self.content)?;
+        Ok(())
+    }
+
+    /// Writes the configuration to the given path asynchrounously.
+    ///
+    /// # Arguments
+    /// * `path` - Path to write the configuration to.
+    ///
+    pub async fn async_to_file(&self, path: &Path) -> Result<()> {
+        tokio::fs::write(path, &self.content).await?;
         Ok(())
     }
 }
