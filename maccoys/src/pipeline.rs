@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
-use crossbeam_queue::ArrayQueue;
+use deadqueue::limited::Queue;
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
@@ -187,24 +187,29 @@ pub trait PipelineQueue: Send + Sync + Sized {
 /// very beefy servers
 ///
 pub struct LocalPipelineQueue {
-    queue: ArrayQueue<SearchManifest>,
+    queue: Queue<SearchManifest>,
 }
 
 impl PipelineQueue for LocalPipelineQueue {
     fn new(size: usize) -> Self {
         Self {
-            queue: ArrayQueue::new(size),
+            queue: Queue::new(size),
         }
     }
 
     fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
-        async { self.queue.pop() }
+        async { self.queue.try_pop() }
     }
 
-    async fn push(&self, manifest: SearchManifest) -> Result<(), SearchManifest> {
-        match self.queue.push(manifest) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
+    fn push(
+        &self,
+        manifest: SearchManifest,
+    ) -> impl std::future::Future<Output = Result<(), SearchManifest>> + Send {
+        async {
+            match self.queue.try_push(manifest) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            }
         }
     }
 
