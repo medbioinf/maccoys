@@ -27,6 +27,7 @@ use reqwest::Client as HttpClient;
 use serde_json::json;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tracing::error;
 
 // internal imports
 use super::decoy_generator::DecoyGenerator;
@@ -437,55 +438,95 @@ impl SearchSpaceGenerator {
         decoys_per_peptide: usize,
     ) -> Result<(usize, usize)> {
         let mut fasta_file = File::create(fasta_path).await?;
-        let target_ctr = self
-            .add_peptides(
-                true,
-                &mut fasta_file,
-                mass,
-                lower_mass_tolerance,
-                upper_mass_tolerance,
-                max_variable_modifications as i16,
-                None,
-                None,
-                None,
-                &ptms,
-                None,
-            )
-            .await?;
+        let mut target_ctr = 0;
+        let mut decoy_ctr = 0;
 
-        let needed_decoys = decoys_per_peptide * target_ctr;
-
-        // Fetch decoys from cache if possible
-        //
-        let mut decoy_ctr = self
-            .add_peptides(
-                false,
-                &mut fasta_file,
-                mass,
-                lower_mass_tolerance,
-                upper_mass_tolerance,
-                max_variable_modifications as i16,
-                None, // Not applicable for decoys
-                None, // Not applicable for decoys
-                None, // Not applicable for decoys
-                &ptms,
-                Some(needed_decoys),
-            )
-            .await?;
-
-        if decoy_ctr < needed_decoys {
-            decoy_ctr = self
-                .generate_missing_decoys(
+        loop {
+            let target_result = self
+                .add_peptides(
+                    true,
                     &mut fasta_file,
-                    needed_decoys,
-                    decoy_ctr,
                     mass,
                     lower_mass_tolerance,
                     upper_mass_tolerance,
-                    max_variable_modifications,
-                    ptms,
+                    max_variable_modifications as i16,
+                    None,
+                    None,
+                    None,
+                    &ptms,
+                    None,
                 )
-                .await?;
+                .await;
+            match target_result {
+                Ok(ctr) => {
+                    target_ctr = ctr;
+                    break;
+                }
+                Err(err) => {
+                    error!("Error adding target peptides: `{}, retry... ", err);
+                    continue;
+                }
+            }
+        }
+
+        let needed_decoys = decoys_per_peptide * target_ctr;
+
+        if needed_decoys > 0 {
+            loop {
+                // Fetch decoys from cache if possible
+                //
+                let cached_decoy_result = self
+                    .add_peptides(
+                        false,
+                        &mut fasta_file,
+                        mass,
+                        lower_mass_tolerance,
+                        upper_mass_tolerance,
+                        max_variable_modifications as i16,
+                        None, // Not applicable for decoys
+                        None, // Not applicable for decoys
+                        None, // Not applicable for decoys
+                        &ptms,
+                        Some(needed_decoys),
+                    )
+                    .await;
+
+                match cached_decoy_result {
+                    Ok(ctr) => {
+                        decoy_ctr += ctr;
+                    }
+                    Err(err) => {
+                        error!("Error adding cached decoy peptides: `{}, retry... ", err);
+                        continue;
+                    }
+                }
+
+                if decoy_ctr < needed_decoys {
+                    let decoy_result = self
+                        .generate_missing_decoys(
+                            &mut fasta_file,
+                            needed_decoys,
+                            needed_decoys - decoy_ctr,
+                            mass,
+                            lower_mass_tolerance,
+                            upper_mass_tolerance,
+                            max_variable_modifications,
+                            ptms.clone(),
+                        )
+                        .await;
+
+                    match decoy_result {
+                        Ok(ctr) => {
+                            decoy_ctr += ctr;
+                            break;
+                        }
+                        Err(err) => {
+                            error!("Error adding missing decoy peptides: `{}, retry... ", err);
+                            continue;
+                        }
+                    }
+                }
+            }
         }
 
         fasta_file.flush().await?;
