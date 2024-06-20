@@ -19,10 +19,14 @@ use dihardts_omicstools::{
         reader::{Reader as MzMlReader, Spectrum},
     },
 };
+use futures::Future;
 use macpepdb::{
     io::post_translational_modification_csv::reader::Reader as PtmReader,
     mass::convert::to_int as mass_to_int,
-    tools::{progress_monitor::ProgressMonitor, queue_monitor::ArrayQueueMonitor},
+    tools::{
+        progress_monitor::ProgressMonitor,
+        queue_monitor::{MonitorableQueue, QueueMonitor},
+    },
 };
 use tracing::{debug, error};
 
@@ -109,7 +113,7 @@ impl PipelineConfiguration {
 }
 
 #[derive(Clone)]
-struct SearchManifest {
+pub struct SearchManifest {
     /// Workdir for the search
     pub work_dir: PathBuf,
     /// Path to the original mzML file containing the MS run
@@ -148,15 +152,105 @@ impl SearchManifest {
     }
 }
 
-pub struct Pipeline {
+/// Trait defining the methods for a pipeline queue
+///
+pub trait PipelineQueue: Send + Sync + Sized {
+    /// Create a new queue
+    ///
+    /// # Arguments
+    /// * `size` - The size of the queue
+    ///
+    fn new(size: usize) -> Self;
+
+    /// Pop a manifest from the queue
+    /// Returns None if the queue is empty
+    ///
+    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> + Send;
+
+    /// Push a manifest to the queue
+    /// Returns the manifest if the queue is full
+    ///
+    /// # Arguments
+    /// * `manifest` - The manifest to push to the queue
+    ///
+    fn push(
+        &self,
+        manifest: SearchManifest,
+    ) -> impl std::future::Future<Output = Result<(), SearchManifest>> + Send;
+
+    /// Get the length of the queue
+    ///
+    fn len(&self) -> impl Future<Output = usize> + Send;
+}
+
+/// Implementation of a local pipeline queue. useful to debug, testing, reviewing or
+/// very beefy servers
+///
+pub struct LocalPipelineQueue {
+    queue: ArrayQueue<SearchManifest>,
+}
+
+impl PipelineQueue for LocalPipelineQueue {
+    fn new(size: usize) -> Self {
+        Self {
+            queue: ArrayQueue::new(size),
+        }
+    }
+
+    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
+        async { self.queue.pop() }
+    }
+
+    async fn push(&self, manifest: SearchManifest) -> Result<(), SearchManifest> {
+        match self.queue.push(manifest) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn len(&self) -> impl Future<Output = usize> + Send {
+        async { self.queue.len() }
+    }
+}
+
+/// New Arc type to implement the MonitorableQueue trait
+///
+struct PipelineQueueArc<T>(Arc<T>)
+where
+    T: PipelineQueue;
+
+impl<T> MonitorableQueue for PipelineQueueArc<T>
+where
+    T: PipelineQueue + 'static,
+{
+    async fn len(&self) -> usize {
+        self.0.len().await
+    }
+}
+
+impl<Q> From<Arc<Q>> for PipelineQueueArc<Q>
+where
+    Q: PipelineQueue,
+{
+    fn from(queue: Arc<Q>) -> Self {
+        Self(queue)
+    }
+}
+
+/// Pipelines to run the MaCcoyS identification pipeline
+///
+pub struct Pipeline<Q>
+where
+    Q: PipelineQueue + 'static,
+{
     config: Arc<PipelineConfiguration>,
-    index_queue: Arc<ArrayQueue<SearchManifest>>,
-    preparation_queue: Arc<ArrayQueue<SearchManifest>>,
-    search_space_generation_queue: Arc<ArrayQueue<SearchManifest>>,
-    comet_search_queue: Arc<ArrayQueue<SearchManifest>>,
-    // fdr_queue: Arc<ArrayQueue<SearchManifest>>,
-    // goodness_and_rescoreing_queue: Arc<ArrayQueue<SearchManifest>>,
-    cleanup_queue: Arc<ArrayQueue<SearchManifest>>,
+    index_queue: Arc<Q>,
+    preparation_queue: Arc<Q>,
+    search_space_generation_queue: Arc<Q>,
+    comet_search_queue: Arc<Q>,
+    // fdr_queue: Arc<Q>,
+    // goodness_and_rescoreing_queue: Arc<Q>,
+    cleanup_queue: Arc<Q>,
     index_stop_flag: Arc<AtomicBool>,
     preparation_stop_flag: Arc<AtomicBool>,
     search_space_generation_stop_flag: Arc<AtomicBool>,
@@ -167,18 +261,18 @@ pub struct Pipeline {
     finshed_searches: Arc<AtomicUsize>,
 }
 
-impl Pipeline {
+impl<Q: PipelineQueue> Pipeline<Q> {
     pub async fn new(config: PipelineConfiguration) -> Result<Self> {
         create_work_dir(&config.general.work_dir).await?;
         let config = Arc::new(config);
 
-        let index_queue = Arc::new(ArrayQueue::new(100));
-        let preparation_queue = Arc::new(ArrayQueue::new(100));
-        let search_space_generation_queue = Arc::new(ArrayQueue::new(100));
-        let comet_search_queue = Arc::new(ArrayQueue::new(100));
-        // let fdr_queue = Arc::new(ArrayQueue::new(100));
-        // let goodness_and_rescoreing_queue = Arc::new(ArrayQueue::new(100));
-        let cleanup_queue = Arc::new(ArrayQueue::new(100));
+        let index_queue = Arc::new(Q::new(100));
+        let preparation_queue = Arc::new(Q::new(100));
+        let search_space_generation_queue = Arc::new(Q::new(100));
+        let comet_search_queue = Arc::new(Q::new(100));
+        // let fdr_queue = Arc::new(Q::new(100));
+        // let goodness_and_rescoreing_queue = Arc::new(Q::new(100));
+        let cleanup_queue = Arc::new(Q::new(100));
 
         Ok(Self {
             config,
@@ -201,16 +295,16 @@ impl Pipeline {
     }
 
     pub async fn run(&self, mzml_file_paths: Vec<PathBuf>) -> Result<()> {
-        let mut queue_monitor = ArrayQueueMonitor::new(
+        let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
             "",
             vec![
-                self.cleanup_queue.clone(),
-                // self.goodness_and_rescoreing_queue.clone(),
-                // self.fdr_queue.clone(),
-                self.comet_search_queue.clone(),
-                self.search_space_generation_queue.clone(),
-                self.preparation_queue.clone(),
-                self.index_queue.clone(),
+                self.cleanup_queue.clone().into(),
+                // self.goodness_and_rescoreing_queue.clone().into(),
+                // self.fdr_queue.clone().into(),
+                self.comet_search_queue.clone().into(),
+                self.search_space_generation_queue.clone().into(),
+                self.preparation_queue.clone().into(),
+                self.index_queue.clone().into(),
             ],
             vec![100, 100, 100, 100, 100],
             vec![
@@ -233,13 +327,15 @@ impl Pipeline {
             None,
         )?;
 
-        let index_handler: std::thread::JoinHandle<()> = {
+        let index_handler: tokio::task::JoinHandle<()> = {
             let index_queue = self.index_queue.clone();
             let preparation_queue = self.preparation_queue.clone();
             let stop_flag = self.index_stop_flag.clone();
-            std::thread::spawn(move || {
-                Self::indexing_thread(index_queue.clone(), preparation_queue, stop_flag);
-            })
+            tokio::spawn(Self::indexing_task(
+                index_queue.clone(),
+                preparation_queue,
+                stop_flag,
+            ))
         };
 
         let preparation_handlers: Vec<tokio::task::JoinHandle<()>> =
@@ -336,7 +432,7 @@ impl Pipeline {
         for mzml_file_path in mzml_file_paths {
             let manifest =
                 SearchManifest::new(self.config.general.work_dir.clone(), mzml_file_path);
-            match self.index_queue.push(manifest) {
+            match self.index_queue.push(manifest).await {
                 Ok(_) => (),
                 Err(e) => {
                     error!(
@@ -350,7 +446,7 @@ impl Pipeline {
 
         self.index_stop_flag.store(true, Ordering::Relaxed);
 
-        match index_handler.join() {
+        match index_handler.await {
             Ok(_) => (),
             Err(e) => {
                 error!("Error joining index thread: {:?}", e);
@@ -410,13 +506,13 @@ impl Pipeline {
         Ok(())
     }
 
-    fn indexing_thread(
-        index_queue: Arc<ArrayQueue<SearchManifest>>,
-        preparation_queue: Arc<ArrayQueue<SearchManifest>>,
+    async fn indexing_task(
+        index_queue: Arc<Q>,
+        preparation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
     ) {
         loop {
-            while let Some(manifest) = index_queue.pop() {
+            while let Some(manifest) = index_queue.pop().await {
                 match fs::create_dir_all(manifest.work_dir.clone()) {
                     Ok(_) => (),
                     Err(e) => {
@@ -456,10 +552,10 @@ impl Pipeline {
                     new_manifest.ms_run_index = Some(index.clone());
                     new_manifest.spectrum_id = Some(spec_id.clone());
                     loop {
-                        new_manifest = match preparation_queue.push(new_manifest) {
+                        new_manifest = match preparation_queue.push(new_manifest).await {
                             Ok(_) => break,
                             Err(e) => {
-                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 e
                             }
                         }
@@ -470,18 +566,18 @@ impl Pipeline {
                 break;
             }
             // wait before checking the queue again
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 
     fn preparation_task(
-        preparation_queue: Arc<ArrayQueue<SearchManifest>>,
-        search_space_generation_queue: Arc<ArrayQueue<SearchManifest>>,
+        preparation_queue: Arc<Q>,
+        search_space_generation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             loop {
-                while let Some(mut manifest) = preparation_queue.pop() {
+                while let Some(mut manifest) = preparation_queue.pop().await {
                     debug!("Preparing {}", manifest.spectrum_id.as_ref().unwrap());
                     if manifest.ms_run_index.is_none() {
                         error!("Index is None in search_preparation_thread");
@@ -597,7 +693,7 @@ impl Pipeline {
                     manifest.precursors = Some(precursors);
 
                     loop {
-                        manifest = match search_space_generation_queue.push(manifest) {
+                        manifest = match search_space_generation_queue.push(manifest).await {
                             Ok(_) => break,
                             Err(e) => {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -616,8 +712,8 @@ impl Pipeline {
     }
 
     fn search_space_generation_task(
-        search_space_generation_queue: Arc<ArrayQueue<SearchManifest>>,
-        comet_search_queue: Arc<ArrayQueue<SearchManifest>>,
+        search_space_generation_queue: Arc<Q>,
+        comet_search_queue: Arc<Q>,
         config: Arc<PipelineConfiguration>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
@@ -675,7 +771,7 @@ impl Pipeline {
             }
 
             loop {
-                while let Some(manifest) = search_space_generation_queue.pop() {
+                while let Some(manifest) = search_space_generation_queue.pop().await {
                     debug!(
                         "Generating search space for {}",
                         manifest.spectrum_id.as_ref().unwrap()
@@ -755,7 +851,7 @@ impl Pipeline {
                             new_manifest.comet_params_file_path =
                                 Some(comet_params_file_path.clone());
                             loop {
-                                new_manifest = match comet_search_queue.push(new_manifest) {
+                                new_manifest = match comet_search_queue.push(new_manifest).await {
                                     Ok(_) => break,
                                     Err(e) => {
                                         tokio::time::sleep(tokio::time::Duration::from_millis(100))
@@ -777,14 +873,14 @@ impl Pipeline {
     }
 
     fn comet_search_task(
-        comet_search_queue: Arc<ArrayQueue<SearchManifest>>,
-        fdr_queue: Arc<ArrayQueue<SearchManifest>>,
+        comet_search_queue: Arc<Q>,
+        fdr_queue: Arc<Q>,
         comet_exe: PathBuf,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             loop {
-                while let Some(mut manifest) = comet_search_queue.pop() {
+                while let Some(mut manifest) = comet_search_queue.pop().await {
                     debug!(
                         "Running Comet search for {}",
                         manifest.spectrum_id.as_ref().unwrap()
@@ -832,7 +928,7 @@ impl Pipeline {
                         manifest.psm_file_path.as_ref().unwrap().display()
                     );
 
-                    match fdr_queue.push(manifest) {
+                    match fdr_queue.push(manifest).await {
                         Ok(_) => (),
                         Err(e) => {
                             error!(
@@ -857,14 +953,14 @@ impl Pipeline {
     // fn goodness_and_rescoring_task()
 
     fn cleanup_task(
-        cleanup_queue: Arc<ArrayQueue<SearchManifest>>,
+        cleanup_queue: Arc<Q>,
         finsihed_searches: Arc<AtomicUsize>,
         config: Arc<PipelineConfiguration>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             loop {
-                while let Some(manifest) = cleanup_queue.pop() {
+                while let Some(manifest) = cleanup_queue.pop().await {
                     debug!(
                         "Running cleanup for {}",
                         manifest.spectrum_id.as_ref().unwrap()

@@ -13,7 +13,7 @@ use dihardts_omicstools::proteomics::io::mzml::{
 };
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::{Pipeline, PipelineConfiguration};
+use maccoys::pipeline::{LocalPipelineQueue, Pipeline, PipelineConfiguration};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -395,7 +395,7 @@ async fn main() -> Result<()> {
                         .context("Deserialize config")?;
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
 
-                let pipline = Pipeline::new(config).await?;
+                let pipline: Pipeline<LocalPipelineQueue> = Pipeline::new(config).await?;
                 pipline.run(mzml_file_paths).await?;
             }
         },
