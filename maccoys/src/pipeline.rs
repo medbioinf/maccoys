@@ -64,6 +64,8 @@ const QUEUE_KEYS: [&str; 5] = [
     INDEX_QUEUE_KEY,
 ];
 
+/// Comet configuration
+///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineCometConfiguration {
     comet_exe_path: PathBuf,
@@ -71,49 +73,107 @@ pub struct PipelineCometConfiguration {
     default_comet_params_file_path: PathBuf,
 }
 
+/// General pipeline configuration
+///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineGeneralConfiguration {
+    /// Work directory where on folder per MS run is created
     pub work_dir: PathBuf,
+
+    /// Number of concurrent preparation tasks
     pub num_preparation_tasks: usize,
+
+    /// Number of concurrent search space generation tasks
     pub num_search_space_generation_tasks: usize,
+
+    /// Number of concurrent Comet search tasks
     pub num_comet_search_tasks: usize,
+
+    /// Number of concurrent FDR tasks
     pub num_fdr_tasks: usize,
+
+    /// Number of concurrent goodness and rescoring tasks
     pub num_goodness_and_rescoring_tasks: usize,
+
+    /// Number of concurrent cleanup tasks
     pub num_cleanup_tasks: usize,
+
+    /// Keep fasta files after search
     pub keep_fasta_files: bool,
 }
 
+/// Configuration for the search
+///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineSearchConfiguration {
+    /// Maximum charge state to search if charge is not provided by the precursor
     pub max_charge: u8,
+
+    /// Lower mass tolerance in ppm
     pub lower_mass_tolerance_ppm: i64,
+
+    /// Upper mass tolerance in ppm
     pub upper_mass_tolerance_ppm: i64,
+
+    /// Maximum number of variable modifications
     pub max_variable_modifications: i8,
+
+    /// Number of decoys per peptide
     pub decoys_per_peptide: usize,
+
+    /// Optional Path to the PTM file
     pub ptm_file_path: Option<PathBuf>,
+
+    /// URL to the target database
     pub target_url: String,
+
+    /// Optional URL to the decoy database
     pub decoy_url: Option<String>,
+
+    /// Optional URL to the target lookup database
     pub target_lookup_url: Option<String>,
+
+    /// Optional URL to the decoy cache database
     pub decoy_cache_url: Option<String>,
 }
 
+/// Configuration for the queues
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct PipelinePipelinesConfiguration {
+pub struct PipelineQueueConfiguration {
+    /// Default capacity for the queues
     pub default_capacity: usize,
+
+    /// Capacities for the different queues
     pub capacities: HashMap<String, usize>,
+
+    /// Optional URL to the Redis server
     pub redis_url: Option<String>,
+
+    /// Optional names for the Redis queues to be used.
+    /// If not set, the queues are named afte the [QUEUE_KEYS]
     pub redis_queue_names: HashMap<String, String>,
 }
 
+/// Configuration for the pipeline
+///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineConfiguration {
+    /// General pipeline configuration
     pub general: PipelineGeneralConfiguration,
+
+    /// Search configuration
     pub search: PipelineSearchConfiguration,
+
+    /// Comet configuration
     pub comet: PipelineCometConfiguration,
-    pub pipelines: PipelinePipelinesConfiguration,
+
+    /// Queue configuration
+    pub pipelines: PipelineQueueConfiguration,
 }
 
 impl PipelineConfiguration {
+    /// Create a new default configuration
+    ///
     pub fn new() -> Self {
         Self {
             general: PipelineGeneralConfiguration {
@@ -143,7 +203,7 @@ impl PipelineConfiguration {
                 comet_exe_path: PathBuf::from("/usr/local/bin/comet"),
                 default_comet_params_file_path: PathBuf::from("./comet.params"),
             },
-            pipelines: PipelinePipelinesConfiguration {
+            pipelines: PipelineQueueConfiguration {
                 default_capacity: 100,
                 capacities: QUEUE_KEYS
                     .iter()
@@ -159,25 +219,48 @@ impl PipelineConfiguration {
     }
 }
 
+/// Manifest for a search, storing the current state of the search
+/// and serving as the message between the different tasks
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchManifest {
-    /// Workdir for the search
+    /// Work directory where on folder per MS run is created
     pub work_dir: PathBuf,
+
     /// Path to the original mzML file containing the MS run
     pub ms_run_mzml_path: PathBuf,
+
     /// Spectrum ID of the spectrum to be searched
     pub spectrum_id: Option<String>,
+
+    /// mzML with the spectrum to be searched
     pub spectrum_mzml: Option<Vec<u8>>,
+
+    /// Workdir for the spectrum
     pub spectrum_work_dir: Option<PathBuf>,
+
+    /// Path to the spectrum mzML
     pub spectrum_mzml_path: Option<PathBuf>,
+
     /// Precursors for the spectrum (mz, charge)
     pub precursors: Option<Vec<(f64, Vec<u8>)>>,
+
+    /// Path to the fasta file
     pub fasta_file_path: Option<PathBuf>,
+
+    /// Path to the Comet params file
     pub comet_params_file_path: Option<PathBuf>,
+
+    /// Path to the PSM file
     pub psm_file_path: Option<PathBuf>,
 }
 
 impl SearchManifest {
+    /// Create a new search manifest
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where on folder per MS run is created
+    /// * `ms_run_mzml_path` - Path to the original mzML file containing the MS run
+    ///
     pub fn new(work_dir: PathBuf, ms_run_mzml_path: PathBuf) -> Self {
         let sanitized_mzml_stem =
             sanatize_string(ms_run_mzml_path.file_stem().unwrap().to_str().unwrap());
@@ -201,8 +284,9 @@ impl SearchManifest {
 /// Trait defining the methods for a pipeline queue
 ///
 pub trait PipelineQueue: Send + Sync + Sized {
+    /// Create a new pipeline queue
     fn new(
-        config: &PipelinePipelinesConfiguration,
+        config: &PipelineQueueConfiguration,
         queue_key: &str,
     ) -> impl Future<Output = Result<Self>> + Send;
 
@@ -233,13 +317,16 @@ pub trait PipelineQueue: Send + Sync + Sized {
 /// very beefy servers
 ///
 pub struct LocalPipelineQueue {
+    /// Queue for search manifests to be processed
     queue: Queue<SearchManifest>,
+
+    /// Capacity of the queue
     size: usize,
 }
 
 impl PipelineQueue for LocalPipelineQueue {
     fn new(
-        config: &PipelinePipelinesConfiguration,
+        config: &PipelineQueueConfiguration,
         queue_key: &str,
     ) -> impl Future<Output = Result<Self>> + Send {
         async {
@@ -283,14 +370,19 @@ impl PipelineQueue for LocalPipelineQueue {
 /// Redis implementation of the pipeline queue for distributed systems
 ///
 pub struct RedisPipelineQueue {
+    /// Redis client
     client: rustis::client::Client,
+
+    /// Name of the queue
     queue_name: String,
+
+    /// Capacity of the queue
     capacity: usize,
 }
 
 impl PipelineQueue for RedisPipelineQueue {
     fn new(
-        config: &PipelinePipelinesConfiguration,
+        config: &PipelineQueueConfiguration,
         queue_key: &str,
     ) -> impl Future<Output = Result<Self>> + Send {
         async move {
@@ -415,7 +507,7 @@ impl PipelineQueue for RedisPipelineQueue {
     }
 }
 
-/// New Arc type to implement the MonitorableQueue trait
+/// New Arc type to implement the MonitorableQueue trait from `macpepdb`
 ///
 struct PipelineQueueArc<T>(Arc<T>)
 where
@@ -441,29 +533,66 @@ where
 
 /// Pipelines to run the MaCcoyS identification pipeline
 ///
+/// # Generics
+/// * `Q` - Type of the queue to use
+///
 pub struct Pipeline<Q>
 where
     Q: PipelineQueue + 'static,
 {
+    /// Configuration for the pipeline
     config: Arc<PipelineConfiguration>,
+
+    /// Index queue
     index_queue: Arc<Q>,
+
+    /// Preparation queue
     preparation_queue: Arc<Q>,
+
+    /// Search space generation queue
     search_space_generation_queue: Arc<Q>,
+
+    /// Comet search queue
     comet_search_queue: Arc<Q>,
+
+    // /// FDR queue
     // fdr_queue: Arc<Q>,
+
+    // /// Goodness and rescoring queue
     // goodness_and_rescoreing_queue: Arc<Q>,
+    /// Cleanup queue
     cleanup_queue: Arc<Q>,
+
+    /// Flag to stop the indexing task
     index_stop_flag: Arc<AtomicBool>,
+
+    /// Flag to stop the preparation task
     preparation_stop_flag: Arc<AtomicBool>,
+
+    /// Flag to stop the search space generation task
     search_space_generation_stop_flag: Arc<AtomicBool>,
+
+    /// Flag to stop the Comet search task
     comet_search_stop_flag: Arc<AtomicBool>,
+
+    // /// Flag to stop the FDR task
     // fdr_stop_flag: Arc<AtomicBool>,
+
+    // /// Flag to stop the goodness and rescoring task
     // goodness_and_rescoreing_stop_flag: Arc<AtomicBool>,
+    /// Flag to stop the cleanup task
     cleanup_stop_flag: Arc<AtomicBool>,
+
+    /// Number of finished searches
     finshed_searches: Arc<AtomicUsize>,
 }
 
 impl<Q: PipelineQueue> Pipeline<Q> {
+    /// Create a new pipeline
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for the pipeline
+    ///
     pub async fn new(config: PipelineConfiguration) -> Result<Self> {
         create_work_dir(&config.general.work_dir).await?;
         let config = Arc::new(config);
@@ -504,6 +633,10 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         })
     }
 
+    /// Run the pipeline for each mzML file
+    ///
+    /// # Arguments
+    /// * `mzml_file_paths` - Paths to the mzML files to search
     pub async fn run(&self, mzml_file_paths: Vec<PathBuf>) -> Result<()> {
         let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
             "",
@@ -716,6 +849,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         Ok(())
     }
 
+    /// Task to index and split up the mzML file
+    ///
+    /// # Arguments
+    /// * `index_queue` - Queue for the indexing task
+    /// * `preparation_queue` - Queue for the preparation task
+    /// * `stop_flag` - Flag to indicate to stop once the index queue is empty
+    ///
     async fn indexing_task(
         index_queue: Arc<Q>,
         preparation_queue: Arc<Q>,
@@ -796,6 +936,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         }
     }
 
+    /// Task to prepare the spectra work directories for the search space generation and search.
+    ///
+    /// # Arguments
+    /// * `preparation_queue` - Queue for the preparation task
+    /// * `search_space_generation_queue` - Queue for the search space generation task
+    /// * `stop_flag` - Flag to indicate to stop once the preparation queue is empty
+    ///
     fn preparation_task(
         preparation_queue: Arc<Q>,
         search_space_generation_queue: Arc<Q>,
@@ -948,6 +1095,14 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         }
     }
 
+    /// Task to generate the search space for the Comet search
+    ///
+    /// # Arguments
+    /// * `search_space_generation_queue` - Queue for the search space generation task
+    /// * `comet_search_queue` - Queue for the Comet search task
+    /// * `config` - Configuration for the pipeline
+    /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
+    ///
     fn search_space_generation_task(
         search_space_generation_queue: Arc<Q>,
         comet_search_queue: Arc<Q>,
@@ -1109,6 +1264,14 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         }
     }
 
+    /// Task to run the Comet search
+    ///
+    /// # Arguments
+    /// * `comet_search_queue` - Queue for the Comet search task
+    /// * `fdr_queue` - Queue for the FDR task
+    /// * `comet_exe` - Path to the Comet executable
+    /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
+    ///
     fn comet_search_task(
         comet_search_queue: Arc<Q>,
         fdr_queue: Arc<Q>,
@@ -1189,6 +1352,14 @@ impl<Q: PipelineQueue> Pipeline<Q> {
 
     // fn goodness_and_rescoring_task()
 
+    /// Task to cleanup the search
+    ///
+    /// # Arguments
+    /// * `cleanup_queue` - Queue for the cleanup task
+    /// * `finsihed_searches` - Number of finished searches
+    /// * `config` - Configuration for the pipeline
+    /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
+    ///
     fn cleanup_task(
         cleanup_queue: Arc<Q>,
         finsihed_searches: Arc<AtomicUsize>,
