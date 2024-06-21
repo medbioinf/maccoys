@@ -34,8 +34,8 @@ use tracing::{debug, error, info};
 
 use crate::{
     functions::{
-        create_search_space, create_spectrum_workdir, create_work_dir, run_comet_search,
-        sanatize_string,
+        create_search_space, create_spectrum_workdir, create_work_dir, post_process,
+        run_comet_search, sanatize_string,
     },
     io::comet::configuration::Configuration as CometConfiguration,
 };
@@ -47,17 +47,15 @@ const SPECTRUM_START_TAG: &'static [u8; 10] = b"<spectrum ";
 const SPECTRUM_STOP_TAG: &'static [u8; 11] = b"</spectrum>";
 
 const CLEANUP_QUEUE_KEY: &str = "cleanup";
-// const GOODNESS_AND_RESCORING_QUEUE_KEY: &str = "goodness_and_rescoring";
-// const FDR_QUEUE_KEY: &str = "fdr";
+const GOODNESS_AND_RESCORING_QUEUE_KEY: &str = "goodness_and_rescoring";
 const COMET_SEARCH_QUEUE_KEY: &str = "comet_search";
 const SEARCH_SPACE_GENERATION_QUEUE_KEY: &str = "search_space_generation";
 const PREPARATION_QUEUE_KEY: &str = "preparation";
 const INDEX_QUEUE_KEY: &str = "index";
 
-const QUEUE_KEYS: [&str; 5] = [
+const QUEUE_KEYS: [&str; 6] = [
     CLEANUP_QUEUE_KEY,
-    // "goodness and rescoring",
-    // "fdr",
+    GOODNESS_AND_RESCORING_QUEUE_KEY,
     COMET_SEARCH_QUEUE_KEY,
     SEARCH_SPACE_GENERATION_QUEUE_KEY,
     PREPARATION_QUEUE_KEY,
@@ -88,9 +86,6 @@ pub struct PipelineGeneralConfiguration {
 
     /// Number of concurrent Comet search tasks
     pub num_comet_search_tasks: usize,
-
-    /// Number of concurrent FDR tasks
-    pub num_fdr_tasks: usize,
 
     /// Number of concurrent goodness and rescoring tasks
     pub num_goodness_and_rescoring_tasks: usize,
@@ -181,7 +176,6 @@ impl PipelineConfiguration {
                 num_preparation_tasks: 1,
                 num_search_space_generation_tasks: 1,
                 num_comet_search_tasks: 1,
-                num_fdr_tasks: 1,
                 num_goodness_and_rescoring_tasks: 1,
                 num_cleanup_tasks: 1,
                 keep_fasta_files: true,
@@ -252,6 +246,9 @@ pub struct SearchManifest {
 
     /// Path to the PSM file
     pub psm_file_path: Option<PathBuf>,
+
+    /// Godness file path
+    pub goodness_file_path: Option<PathBuf>,
 }
 
 impl SearchManifest {
@@ -277,6 +274,7 @@ impl SearchManifest {
             fasta_file_path: None,
             comet_params_file_path: None,
             psm_file_path: None,
+            goodness_file_path: None,
         }
     }
 }
@@ -555,11 +553,9 @@ where
     /// Comet search queue
     comet_search_queue: Arc<Q>,
 
-    // /// FDR queue
-    // fdr_queue: Arc<Q>,
+    /// Goodness and rescoring queue
+    goodness_and_rescoreing_queue: Arc<Q>,
 
-    // /// Goodness and rescoring queue
-    // goodness_and_rescoreing_queue: Arc<Q>,
     /// Cleanup queue
     cleanup_queue: Arc<Q>,
 
@@ -575,11 +571,9 @@ where
     /// Flag to stop the Comet search task
     comet_search_stop_flag: Arc<AtomicBool>,
 
-    // /// Flag to stop the FDR task
-    // fdr_stop_flag: Arc<AtomicBool>,
+    /// Flag to stop the goodness and rescoring task
+    goodness_and_rescoreing_stop_flag: Arc<AtomicBool>,
 
-    // /// Flag to stop the goodness and rescoring task
-    // goodness_and_rescoreing_stop_flag: Arc<AtomicBool>,
     /// Flag to stop the cleanup task
     cleanup_stop_flag: Arc<AtomicBool>,
 
@@ -609,8 +603,8 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         );
         let comet_search_queue =
             Arc::new(Q::new(&config.as_ref().pipelines, COMET_SEARCH_QUEUE_KEY).await?);
-        // let fdr_queue = Arc::new(Q::new(100));
-        // let goodness_and_rescoreing_queue = Arc::new(Q::new(100));
+        let goodness_and_rescoreing_queue =
+            Arc::new(Q::new(&config.as_ref().pipelines, GOODNESS_AND_RESCORING_QUEUE_KEY).await?);
         let cleanup_queue = Arc::new(Q::new(&config.as_ref().pipelines, CLEANUP_QUEUE_KEY).await?);
 
         Ok(Self {
@@ -619,15 +613,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
             preparation_queue,
             search_space_generation_queue,
             comet_search_queue,
-            // fdr_queue,
-            // goodness_and_rescoreing_queue,
+            goodness_and_rescoreing_queue,
             cleanup_queue,
             index_stop_flag: Arc::new(AtomicBool::new(false)),
             preparation_stop_flag: Arc::new(AtomicBool::new(false)),
             search_space_generation_stop_flag: Arc::new(AtomicBool::new(false)),
             comet_search_stop_flag: Arc::new(AtomicBool::new(false)),
-            // fdr_stop_flag: Arc::new(AtomicBool::new(false)),
-            // goodness_and_rescoreing_stop_flag: Arc::new(AtomicBool::new(false)),
+            goodness_and_rescoreing_stop_flag: Arc::new(AtomicBool::new(false)),
             cleanup_stop_flag: Arc::new(AtomicBool::new(false)),
             finshed_searches: Arc::new(AtomicUsize::new(0)),
         })
@@ -642,8 +634,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
             "",
             vec![
                 self.cleanup_queue.clone().into(),
-                // self.goodness_and_rescoreing_queue.clone().into(),
-                // self.fdr_queue.clone().into(),
+                self.goodness_and_rescoreing_queue.clone().into(),
                 self.comet_search_queue.clone().into(),
                 self.search_space_generation_queue.clone().into(),
                 self.preparation_queue.clone().into(),
@@ -652,8 +643,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
             vec![100, 100, 100, 100, 100],
             vec![
                 "Cleanup".to_owned(),
-                // "Goodness and Rescoring".to_owned(),
-                // "FDR".to_owned(),
+                "Goodness and Rescoring".to_owned(),
                 "Comet Search".to_owned(),
                 "Search Space Generation".to_owned(),
                 "Preparation".to_owned(),
@@ -717,13 +707,28 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 .into_iter()
                 .map(|_| {
                     let comet_search_queue = self.comet_search_queue.clone();
-                    let fdr_queue = self.cleanup_queue.clone(); // TODO: Change this to FDR queue once implemented
+                    let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
                     let comet_exe = self.config.comet.comet_exe_path.clone();
                     let stop_flag = self.comet_search_stop_flag.clone();
                     tokio::spawn(Self::comet_search_task(
                         comet_search_queue,
-                        fdr_queue,
+                        goodness_and_rescoreing_queue,
                         comet_exe,
+                        stop_flag,
+                    ))
+                })
+                .collect();
+
+        let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> =
+            (0..self.config.general.num_goodness_and_rescoring_tasks)
+                .into_iter()
+                .map(|_| {
+                    let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
+                    let cleanup_queue = self.cleanup_queue.clone();
+                    let stop_flag = self.goodness_and_rescoreing_stop_flag.clone();
+                    tokio::spawn(Self::goodness_and_rescoring_task(
+                        goodness_and_rescoreing_queue,
+                        cleanup_queue,
                         stop_flag,
                     ))
                 })
@@ -744,33 +749,6 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     ))
                 })
                 .collect();
-
-        // let fdr_handlers: Vec<tokio::task::JoinHandle<()>> = (0..self.config.general.num_fdr_tasks)
-        //     .into_iter()
-        //     .map(|_| {
-        //         let fdr_queue = self.fdr_queue.clone();
-        //         let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
-        //         let stop_flag = fdr_stop_flag.clone();
-        //         tokio::spawn(Self::fdr_task(
-        //             fdr_queue,
-        //             goodness_and_rescoreing_queue,
-        //             stop_flag,
-        //         ))
-        //     })
-        //     .collect();
-
-        // let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> =
-        //     (0..self.config.general.num_goodness_and_rescoring_tasks)
-        //         .into_iter()
-        //         .map(|_| {
-        //             let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
-        //             let stop_flag = goodness_and_resconfing_stop_flag.clone();
-        //             tokio::spawn(Self::goodness_and_rescoring_task(
-        //                 goodness_and_rescoreing_queue,
-        //                 stop_flag,
-        //             ))
-        //         })
-        //         .collect();
 
         for mzml_file_path in mzml_file_paths {
             let manifest =
@@ -830,7 +808,17 @@ impl<Q: PipelineQueue> Pipeline<Q> {
             }
         }
 
-        // self.fdr_stop_flag.store(true, Ordering::Relaxed);
+        self.goodness_and_rescoreing_stop_flag
+            .store(true, Ordering::Relaxed);
+
+        for goodness_and_resconfing_handler in goodness_and_resconfing_handlers {
+            match goodness_and_resconfing_handler.await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Error joining goodness and rescoring thread: {:?}", e);
+                }
+            }
+        }
 
         self.cleanup_stop_flag.store(true, Ordering::Relaxed);
 
@@ -1268,13 +1256,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     ///
     /// # Arguments
     /// * `comet_search_queue` - Queue for the Comet search task
-    /// * `fdr_queue` - Queue for the FDR task
+    /// * `goodness_and_rescoreing_queue` - Goodness and rescoreing queue
     /// * `comet_exe` - Path to the Comet executable
     /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
     ///
     fn comet_search_task(
         comet_search_queue: Arc<Q>,
-        fdr_queue: Arc<Q>,
+        goodness_and_rescoreing_queue: Arc<Q>,
         comet_exe: PathBuf,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
@@ -1328,7 +1316,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                         manifest.psm_file_path.as_ref().unwrap().display()
                     );
 
-                    match fdr_queue.push(manifest).await {
+                    match goodness_and_rescoreing_queue.push(manifest).await {
                         Ok(_) => (),
                         Err(e) => {
                             error!(
@@ -1350,7 +1338,64 @@ impl<Q: PipelineQueue> Pipeline<Q> {
 
     // fn fdr_task()
 
-    // fn goodness_and_rescoring_task()
+    fn goodness_and_rescoring_task(
+        goodness_and_rescoreing_queue: Arc<Q>,
+        cleanup_queue: Arc<Q>,
+        stop_flag: Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            loop {
+                while let Some(mut manifest) = goodness_and_rescoreing_queue.pop().await {
+                    debug!(
+                        "Goodness and rescoring {}",
+                        manifest.spectrum_id.as_ref().unwrap()
+                    );
+
+                    if manifest.psm_file_path.is_none() {
+                        error!("PSM file path is None in goodness_and_rescoring_thread");
+                        continue;
+                    }
+
+                    let goodness_file_path = manifest
+                        .psm_file_path
+                        .as_ref()
+                        .unwrap()
+                        .with_extension("goodness");
+
+                    match post_process(
+                        manifest.psm_file_path.as_ref().unwrap(),
+                        &goodness_file_path,
+                    )
+                    .await
+                    {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!("Error post processing: {:?}", e);
+                            continue;
+                        }
+                    }
+
+                    manifest.goodness_file_path = Some(goodness_file_path);
+
+                    match cleanup_queue.push(manifest).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "Error pushing manifest to FDR queue: {}",
+                                e.spectrum_id.as_ref().unwrap()
+                            );
+                            continue;
+                        }
+                    }
+                }
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                // wait before checking the queue again
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
 
     /// Task to cleanup the search
     ///
