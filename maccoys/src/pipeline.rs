@@ -1434,11 +1434,15 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                             }
                         }
                     }
+                    tokio::fs::remove_file(manifest.comet_params_file_path.as_ref().unwrap())
+                        .await
+                        .unwrap();
+
                     finsihed_searches.fetch_add(1, Ordering::Relaxed);
 
                     debug!(
                         "Cleanup done for {}",
-                        manifest.psm_file_path.as_ref().unwrap().display()
+                        manifest.spectrum_work_dir.as_ref().unwrap().display()
                     );
                 }
                 if stop_flag.load(Ordering::Relaxed) {
