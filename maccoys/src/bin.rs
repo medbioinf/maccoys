@@ -23,7 +23,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::{create_search_space, post_process};
-use maccoys::functions::{sanatize_string, search_preparation};
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
@@ -118,63 +117,10 @@ enum Commands {
         /// Path to output file
         output_file_path: String,
     },
-    /// Extracts the MS2 spectrum from the given mzML file and prepares the search for the given spectrum by
-    /// creating the Comet configuration and FASTA files for each charge state.
-    SearchPreparation {
-        /// Path to original spectrum file
-        original_spectrum_file_path: String,
-        /// Path to index file for the original spectrum file
-        index_file_path: String,
-        /// Spectrum ID
-        spectrum_id: String,
-        /// Work directory
-        work_dir: String,
-        /// Path to default comet config file
-        default_comet_file_path: String,
-        /// Lower mass tolerance in PPM
-        lower_mass_tolerance_ppm: i64,
-        /// Upper mass tolerance in PPM
-        upper_mass_tolerance_ppm: i64,
-        /// Maximal number of variable modifications
-        max_variable_modifications: i8,
-        /// Fragment tolerance (for Comet fragment_bin_tol)
-        fragment_tolerance: f64,
-        /// Fragment bin tolerance offset (for Comet)
-        fragment_bin_offset: f64,
-        /// Charge limit used when spectrum has not charges assigned. Every charge from 1 to max_charge will be tried.
-        max_charge: u8,
-        /// Amount of decoys to generate
-        decoys_per_peptide: usize,
-        /// URL for fetching targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
-        target_url: String,
-        /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
-        #[arg(short)]
-        decoy_url: Option<String>,
-        /// Optional URL for checking generated decoy against targets.
-        /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
-        /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
-        /// If not given, decoys will not be checked against the target database and considered as "correct".
-        #[arg(short)]
-        target_lookup_url: Option<String>,
-        /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
-        #[arg(short = 'c')]
-        decoy_cache_url: Option<String>,
-        /// Path to PTM file
-        #[arg(short)]
-        ptm_file_path: Option<String>,
-    },
     /// Calculates the goodness of fit and the the exponential and distances scores for the given PSM file.
     PostProcess {
         /// Path to PSM file
         psm_file_path: String,
-    },
-    /// Sanitize spectrum ID (get rid of any special characters)
-    SanitizeSpectrumId {
-        /// Spectrum ID
-        spectrum_id: String,
-        /// If set, output does not contain a newline at the end
-        #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
-        trim: bool,
     },
     /// MaCcoyS search pipeline
     Pipeline(PipelineCLI),
@@ -327,63 +273,7 @@ async fn main() -> Result<()> {
                 extractor.extract_spectrum(&spectrum_id)?,
             )?;
         }
-        Commands::SearchPreparation {
-            original_spectrum_file_path,
-            index_file_path,
-            spectrum_id,
-            work_dir,
-            default_comet_file_path,
-            lower_mass_tolerance_ppm,
-            upper_mass_tolerance_ppm,
-            max_variable_modifications,
-            fragment_tolerance,
-            fragment_bin_offset,
-            max_charge,
-            decoys_per_peptide,
-            target_url,
-            decoy_url,
-            target_lookup_url,
-            decoy_cache_url,
-            ptm_file_path,
-        } => {
-            let original_spectrum_file_path = Path::new(&original_spectrum_file_path);
-            let index_file_path = Path::new(&index_file_path);
-            let work_dir = Path::new(&work_dir);
-            let default_comet_file_path = Path::new(&default_comet_file_path);
-            let ptms = match ptm_file_path {
-                Some(ptm_file_path) => PtmReader::read(Path::new(&ptm_file_path))?,
-                None => Vec::new(),
-            };
-
-            search_preparation(
-                &original_spectrum_file_path,
-                &index_file_path,
-                &spectrum_id,
-                &work_dir,
-                &default_comet_file_path,
-                &ptms,
-                lower_mass_tolerance_ppm,
-                upper_mass_tolerance_ppm,
-                max_variable_modifications,
-                fragment_tolerance,
-                fragment_bin_offset,
-                max_charge,
-                decoys_per_peptide,
-                &target_url,
-                decoy_url,
-                target_lookup_url,
-                decoy_cache_url,
-            )
-            .await?;
-        }
         Commands::PostProcess { psm_file_path } => post_process(&Path::new(&psm_file_path)).await?,
-        Commands::SanitizeSpectrumId { spectrum_id, trim } => {
-            if !trim {
-                println!("{}", sanatize_string(&spectrum_id));
-            } else {
-                print!("{}", sanatize_string(&spectrum_id));
-            }
-        }
         Commands::Pipeline(pipeline_command) => match pipeline_command.command {
             PipelineCommand::NewConfig {} => {
                 let new_config = PipelineConfiguration::new();
