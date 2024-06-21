@@ -1,19 +1,20 @@
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use deadqueue::limited::Queue;
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::{
-        index::Index,
         indexed_reader::IndexedReader,
         indexer::Indexer,
         reader::{Reader as MzMlReader, Spectrum},
@@ -28,7 +29,8 @@ use macpepdb::{
         queue_monitor::{MonitorableQueue, QueueMonitor},
     },
 };
-use tracing::{debug, error};
+use rustis::commands::{ListCommands, ServerCommands};
+use tracing::{debug, error, info};
 
 use crate::{
     functions::{
@@ -37,6 +39,30 @@ use crate::{
     },
     io::comet::configuration::Configuration as CometConfiguration,
 };
+
+/// Default start tag for a spectrum in mzML
+const SPECTRUM_START_TAG: &'static [u8; 10] = b"<spectrum ";
+
+/// Default stop tag for a spectrum in mzML
+const SPECTRUM_STOP_TAG: &'static [u8; 11] = b"</spectrum>";
+
+const CLEANUP_QUEUE_KEY: &str = "cleanup";
+// const GOODNESS_AND_RESCORING_QUEUE_KEY: &str = "goodness_and_rescoring";
+// const FDR_QUEUE_KEY: &str = "fdr";
+const COMET_SEARCH_QUEUE_KEY: &str = "comet_search";
+const SEARCH_SPACE_GENERATION_QUEUE_KEY: &str = "search_space_generation";
+const PREPARATION_QUEUE_KEY: &str = "preparation";
+const INDEX_QUEUE_KEY: &str = "index";
+
+const QUEUE_KEYS: [&str; 5] = [
+    CLEANUP_QUEUE_KEY,
+    // "goodness and rescoring",
+    // "fdr",
+    COMET_SEARCH_QUEUE_KEY,
+    SEARCH_SPACE_GENERATION_QUEUE_KEY,
+    PREPARATION_QUEUE_KEY,
+    INDEX_QUEUE_KEY,
+];
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineCometConfiguration {
@@ -47,35 +73,44 @@ pub struct PipelineCometConfiguration {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineGeneralConfiguration {
-    work_dir: PathBuf,
-    num_preparation_tasks: usize,
-    num_search_space_generation_tasks: usize,
-    num_comet_search_tasks: usize,
-    num_fdr_tasks: usize,
-    num_goodness_and_rescoring_tasks: usize,
-    num_cleanup_tasks: usize,
-    keep_fasta_files: bool,
+    pub work_dir: PathBuf,
+    pub num_preparation_tasks: usize,
+    pub num_search_space_generation_tasks: usize,
+    pub num_comet_search_tasks: usize,
+    pub num_fdr_tasks: usize,
+    pub num_goodness_and_rescoring_tasks: usize,
+    pub num_cleanup_tasks: usize,
+    pub keep_fasta_files: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineSearchConfiguration {
-    max_charge: u8,
-    lower_mass_tolerance_ppm: i64,
-    upper_mass_tolerance_ppm: i64,
-    max_variable_modifications: i8,
-    decoys_per_peptide: usize,
-    ptm_file_path: Option<PathBuf>,
-    target_url: String,
-    decoy_url: Option<String>,
-    target_lookup_url: Option<String>,
-    decoy_cache_url: Option<String>,
+    pub max_charge: u8,
+    pub lower_mass_tolerance_ppm: i64,
+    pub upper_mass_tolerance_ppm: i64,
+    pub max_variable_modifications: i8,
+    pub decoys_per_peptide: usize,
+    pub ptm_file_path: Option<PathBuf>,
+    pub target_url: String,
+    pub decoy_url: Option<String>,
+    pub target_lookup_url: Option<String>,
+    pub decoy_cache_url: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct PipelinePipelinesConfiguration {
+    pub default_capacity: usize,
+    pub capacities: HashMap<String, usize>,
+    pub redis_url: Option<String>,
+    pub redis_queue_names: HashMap<String, String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineConfiguration {
-    general: PipelineGeneralConfiguration,
-    search: PipelineSearchConfiguration,
-    comet: PipelineCometConfiguration,
+    pub general: PipelineGeneralConfiguration,
+    pub search: PipelineSearchConfiguration,
+    pub comet: PipelineCometConfiguration,
+    pub pipelines: PipelinePipelinesConfiguration,
 }
 
 impl PipelineConfiguration {
@@ -108,20 +143,31 @@ impl PipelineConfiguration {
                 comet_exe_path: PathBuf::from("/usr/local/bin/comet"),
                 default_comet_params_file_path: PathBuf::from("./comet.params"),
             },
+            pipelines: PipelinePipelinesConfiguration {
+                default_capacity: 100,
+                capacities: QUEUE_KEYS
+                    .iter()
+                    .map(|key| (key.to_string(), 100))
+                    .collect(),
+                redis_url: None,
+                redis_queue_names: QUEUE_KEYS
+                    .iter()
+                    .map(|key| (key.to_string(), key.to_string()))
+                    .collect(),
+            },
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchManifest {
     /// Workdir for the search
     pub work_dir: PathBuf,
     /// Path to the original mzML file containing the MS run
     pub ms_run_mzml_path: PathBuf,
-    /// Index of the spectra in the mzML file
-    pub ms_run_index: Option<Arc<Index>>,
     /// Spectrum ID of the spectrum to be searched
     pub spectrum_id: Option<String>,
+    pub spectrum_mzml: Option<Vec<u8>>,
     pub spectrum_work_dir: Option<PathBuf>,
     pub spectrum_mzml_path: Option<PathBuf>,
     /// Precursors for the spectrum (mz, charge)
@@ -140,8 +186,8 @@ impl SearchManifest {
         Self {
             work_dir,
             ms_run_mzml_path,
-            ms_run_index: None,
             spectrum_id: None,
+            spectrum_mzml: None,
             spectrum_work_dir: None,
             spectrum_mzml_path: None,
             precursors: None,
@@ -155,12 +201,12 @@ impl SearchManifest {
 /// Trait defining the methods for a pipeline queue
 ///
 pub trait PipelineQueue: Send + Sync + Sized {
-    /// Create a new queue
-    ///
-    /// # Arguments
-    /// * `size` - The size of the queue
-    ///
-    fn new(size: usize) -> Self;
+    fn new(
+        config: &PipelinePipelinesConfiguration,
+        queue_key: &str,
+    ) -> impl Future<Output = Result<Self>> + Send;
+
+    fn get_capacity(&self) -> usize;
 
     /// Pop a manifest from the queue
     /// Returns None if the queue is empty
@@ -188,13 +234,29 @@ pub trait PipelineQueue: Send + Sync + Sized {
 ///
 pub struct LocalPipelineQueue {
     queue: Queue<SearchManifest>,
+    size: usize,
 }
 
 impl PipelineQueue for LocalPipelineQueue {
-    fn new(size: usize) -> Self {
-        Self {
-            queue: Queue::new(size),
+    fn new(
+        config: &PipelinePipelinesConfiguration,
+        queue_key: &str,
+    ) -> impl Future<Output = Result<Self>> + Send {
+        async {
+            let capacity = match config.capacities.get(queue_key) {
+                Some(capacity) => *capacity,
+                None => config.default_capacity,
+            };
+
+            Ok(Self {
+                queue: Queue::new(capacity),
+                size: capacity,
+            })
         }
+    }
+
+    fn get_capacity(&self) -> usize {
+        self.size
     }
 
     fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
@@ -215,6 +277,141 @@ impl PipelineQueue for LocalPipelineQueue {
 
     fn len(&self) -> impl Future<Output = usize> + Send {
         async { self.queue.len() }
+    }
+}
+
+/// Redis implementation of the pipeline queue for distributed systems
+///
+pub struct RedisPipelineQueue {
+    client: rustis::client::Client,
+    queue_name: String,
+    capacity: usize,
+}
+
+impl PipelineQueue for RedisPipelineQueue {
+    fn new(
+        config: &PipelinePipelinesConfiguration,
+        queue_key: &str,
+    ) -> impl Future<Output = Result<Self>> + Send {
+        async move {
+            if config.redis_url.is_none() {
+                bail!("Redis URL is None")
+            }
+            let capacity = match config.capacities.get(queue_key) {
+                Some(capacity) => *capacity,
+                None => config.default_capacity,
+            };
+            let queue_name = match config.redis_queue_names.get(queue_key) {
+                Some(queue_name) => queue_name.to_string(),
+                None => queue_key.to_string(),
+            };
+
+            let mut redis_client_config =
+                rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())?;
+            redis_client_config.retry_on_error = true;
+            redis_client_config.reconnection =
+                rustis::client::ReconnectionConfig::new_constant(0, 5);
+
+            let client = rustis::client::Client::connect(redis_client_config)
+                .await
+                .context("Error opening connection to Redis")?;
+            client.flushdb(rustis::commands::FlushingMode::Sync).await?;
+            Ok(Self {
+                client,
+                queue_name,
+                capacity,
+            })
+        }
+    }
+
+    fn get_capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
+        async {
+            let serialized_manifest: String = match self
+                .client
+                .lpop::<_, _, Vec<String>>(&self.queue_name, 1)
+                .await
+            {
+                Ok(response) => {
+                    if !response.is_empty() {
+                        response[0].clone()
+                    } else {
+                        String::new()
+                    }
+                }
+                Err(e) => {
+                    error!("Error popping manifest from queue: {:?}", e);
+                    return None;
+                }
+            };
+
+            if serialized_manifest.is_empty() {
+                return None;
+            }
+
+            match serde_json::from_str(&serialized_manifest) {
+                Ok(manifest) => manifest,
+                Err(e) => {
+                    error!(
+                        "[{}] Error deserializing manifest: {:?}",
+                        self.queue_name, e
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    fn push(
+        &self,
+        manifest: SearchManifest,
+    ) -> impl std::future::Future<Output = Result<(), SearchManifest>> + Send {
+        async {
+            // Simple mechanism to prevent overcommitment of queue
+            loop {
+                if self.len().await < self.get_capacity() {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+            let serialized_manifest = match serde_json::to_string(&manifest) {
+                Ok(serialized_manifest) => serialized_manifest,
+                Err(e) => {
+                    error!("[{}] Error serializing manifest: {:?}", self.queue_name, e);
+                    return Err(manifest);
+                }
+            };
+
+            match self
+                .client
+                .rpush(&self.queue_name, serialized_manifest)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!(
+                        "[{}] Error pushing manifest to queue: {:?}",
+                        self.queue_name, e
+                    );
+                    Err(manifest)
+                }
+            }
+        }
+    }
+
+    fn len(&self) -> impl Future<Output = usize> + Send {
+        async {
+            match self.client.llen(&self.queue_name).await {
+                Ok(size) => size,
+                Err(e) => {
+                    error!("[{}] Error gettinsg queue size: {:?}", self.queue_name, e);
+                    self.capacity + 111
+                }
+            }
+        }
     }
 }
 
@@ -271,13 +468,21 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         create_work_dir(&config.general.work_dir).await?;
         let config = Arc::new(config);
 
-        let index_queue = Arc::new(Q::new(100));
-        let preparation_queue = Arc::new(Q::new(100));
-        let search_space_generation_queue = Arc::new(Q::new(100));
-        let comet_search_queue = Arc::new(Q::new(100));
+        let index_queue = Arc::new(Q::new(&config.as_ref().pipelines, INDEX_QUEUE_KEY).await?);
+        let preparation_queue =
+            Arc::new(Q::new(&config.as_ref().pipelines, PREPARATION_QUEUE_KEY).await?);
+        let search_space_generation_queue = Arc::new(
+            Q::new(
+                &config.as_ref().pipelines,
+                SEARCH_SPACE_GENERATION_QUEUE_KEY,
+            )
+            .await?,
+        );
+        let comet_search_queue =
+            Arc::new(Q::new(&config.as_ref().pipelines, COMET_SEARCH_QUEUE_KEY).await?);
         // let fdr_queue = Arc::new(Q::new(100));
         // let goodness_and_rescoreing_queue = Arc::new(Q::new(100));
-        let cleanup_queue = Arc::new(Q::new(100));
+        let cleanup_queue = Arc::new(Q::new(&config.as_ref().pipelines, CLEANUP_QUEUE_KEY).await?);
 
         Ok(Self {
             config,
@@ -549,13 +754,29 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                         error!("Error writing index: {:?}", e);
                         continue;
                     }
-                }
+                };
 
-                let index = Arc::new(index);
+                let mut reader = match IndexedReader::new(&manifest.ms_run_mzml_path, &index) {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        error!("Error creating reader: {:?}", e);
+                        continue;
+                    }
+                };
+
                 for (spec_id, _) in index.get_spectra() {
+                    let mzml = match reader.extract_spectrum(&spec_id) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            error!("Error extracting spectrum: {:?}", e);
+                            continue;
+                        }
+                    };
+
                     let mut new_manifest = manifest.clone();
-                    new_manifest.ms_run_index = Some(index.clone());
                     new_manifest.spectrum_id = Some(spec_id.clone());
+                    new_manifest.spectrum_mzml = Some(mzml);
+
                     loop {
                         new_manifest = match preparation_queue.push(new_manifest).await {
                             Ok(_) => break,
@@ -584,75 +805,72 @@ impl<Q: PipelineQueue> Pipeline<Q> {
             loop {
                 while let Some(mut manifest) = preparation_queue.pop().await {
                     debug!("Preparing {}", manifest.spectrum_id.as_ref().unwrap());
-                    if manifest.ms_run_index.is_none() {
-                        error!("Index is None in search_preparation_thread");
-                        continue;
-                    }
                     if manifest.spectrum_id.is_none() {
                         error!("Spectrum ID is None in spectra_dir_creation_thread");
                         continue;
                     }
-
-                    let spectrum_work_dir = match create_spectrum_workdir(
-                        &manifest.work_dir,
-                        manifest.spectrum_id.as_ref().unwrap(),
-                    )
-                    .await
-                    {
-                        Ok(path) => path,
-                        Err(e) => {
-                            error!("Error creating spectrum work directory: {}", e);
-                            continue;
-                        }
-                    };
-
-                    match tokio::fs::create_dir_all(&spectrum_work_dir).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Error creating spectrum work directory: {}", e);
-                            continue;
-                        }
+                    if manifest.spectrum_mzml.is_none() {
+                        error!("Spectrum mzML is None in spectra_dir_creation_thread");
+                        continue;
                     }
 
-                    let mut reader = match IndexedReader::new(
-                        &manifest.ms_run_mzml_path,
-                        manifest.ms_run_index.as_ref().unwrap(),
-                    ) {
-                        Ok(reader) => reader,
-                        Err(e) => {
-                            error!("Error creating reader: {:?}", e);
+                    let start = match manifest
+                        .spectrum_mzml
+                        .as_ref()
+                        .unwrap()
+                        .windows(SPECTRUM_START_TAG.len())
+                        .position(|window| window == SPECTRUM_START_TAG)
+                    {
+                        Some(start) => start,
+                        None => {
+                            error!(
+                                "No spectrum start in {}",
+                                manifest.spectrum_id.as_ref().unwrap()
+                            );
+                            continue;
+                        }
+                    };
+                    let stop = match manifest
+                        .spectrum_mzml
+                        .as_ref()
+                        .unwrap()
+                        .windows(SPECTRUM_STOP_TAG.len())
+                        .position(|window| window == SPECTRUM_STOP_TAG)
+                    {
+                        Some(start) => start,
+                        None => {
+                            error!(
+                                "No spectrum stop in {}",
+                                manifest.spectrum_id.as_ref().unwrap()
+                            );
                             continue;
                         }
                     };
 
-                    let spectrum_xml =
-                        match reader.get_raw_spectrum(manifest.spectrum_id.as_ref().unwrap()) {
-                            Ok(spectrum) => spectrum,
-                            Err(e) => {
-                                error!("Error reading spectrum: {:?}", e);
-                                continue;
-                            }
-                        };
+                    let spectrum_xml = &manifest.spectrum_mzml.as_ref().unwrap()[start..stop];
 
-                    let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_xml.as_slice()) {
+                    // As this mzML is already reduced to the spectrum of interest, we can parse it directly
+                    // using MzMlReader::parse_spectrum_xml
+                    let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_xml) {
                         Ok(spectrum) => spectrum,
                         Err(e) => {
                             error!("Error parsing spectrum: {:?}", e);
                             continue;
                         }
                     };
-                    drop(spectrum_xml);
 
                     let spectrum = match spectrum {
                         Spectrum::MsNSpectrum(spectrum) => spectrum,
                         _ => {
                             // Ignore MS1
+                            info!("Ignoring MS1 spectrum");
                             continue;
                         }
                     };
 
                     // Ignore MS3 and higher
                     if spectrum.get_ms_level() != 2 {
+                        info!("Ignoring MS{} spectrum", spectrum.get_ms_level());
                         continue;
                     }
 
@@ -672,34 +890,48 @@ impl<Q: PipelineQueue> Pipeline<Q> {
 
                     drop(spectrum);
 
-                    let mzml_conent =
-                        match reader.extract_spectrum(manifest.spectrum_id.as_ref().unwrap()) {
-                            Ok(content) => content,
-                            Err(e) => {
-                                error!("Error extracting spectrum: {:?}", e);
-                                continue;
-                            }
-                        };
-
-                    drop(reader);
+                    let spectrum_work_dir = match create_spectrum_workdir(
+                        &manifest.work_dir,
+                        manifest.spectrum_id.as_ref().unwrap(),
+                    )
+                    .await
+                    {
+                        Ok(path) => path,
+                        Err(e) => {
+                            error!("Error creating spectrum work directory: {}", e);
+                            continue;
+                        }
+                    };
 
                     let spectrum_mzml_path = spectrum_work_dir.join("spectrum.mzML");
 
-                    match tokio::fs::write(&spectrum_mzml_path, mzml_conent).await {
+                    match tokio::fs::write(
+                        &spectrum_mzml_path,
+                        manifest.spectrum_mzml.as_ref().unwrap(),
+                    )
+                    .await
+                    {
                         Ok(_) => (),
                         Err(e) => {
-                            error!("Error writing spectrum.mzML: {}", e);
+                            error!(
+                                "Error writing spectrum.mzML for {}: {}",
+                                manifest.spectrum_id.as_ref().unwrap(),
+                                e
+                            );
                             continue;
                         }
                     }
 
                     manifest.spectrum_work_dir = Some(spectrum_work_dir);
-                    manifest.spectrum_mzml_path = Some(spectrum_mzml_path);
+                    manifest.spectrum_mzml = None; // Free up some memory
                     manifest.precursors = Some(precursors);
+                    manifest.spectrum_mzml_path = Some(spectrum_mzml_path);
 
                     loop {
                         manifest = match search_space_generation_queue.push(manifest).await {
-                            Ok(_) => break,
+                            Ok(_) => {
+                                break;
+                            }
                             Err(e) => {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                                 e

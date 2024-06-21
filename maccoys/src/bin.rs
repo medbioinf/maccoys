@@ -13,7 +13,7 @@ use dihardts_omicstools::proteomics::io::mzml::{
 };
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::{LocalPipelineQueue, Pipeline, PipelineConfiguration};
+use maccoys::pipeline::{LocalPipelineQueue, Pipeline, PipelineConfiguration, RedisPipelineQueue};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -28,9 +28,10 @@ use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
 enum PipelineCommand {
-    /// Creates a new configuration file
+    /// Prints a new condition to stdout
     NewConfig {},
-    /// Runs the MaCcoyS pipeline
+    /// Runs the full pipline locally. Queuing is done in memory, unless the `piplines.redis_url` is set in the configuration (Redis + local run should only be used for testing).
+    ///
     LocalRun {
         /// Path to the configuration file
         config: PathBuf,
@@ -175,6 +176,7 @@ enum Commands {
         #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
         trim: bool,
     },
+    /// MaCcoyS search pipeline
     Pipeline(PipelineCLI),
 }
 
@@ -210,7 +212,8 @@ async fn main() -> Result<()> {
         .add_directive("scylla=info".parse().unwrap())
         .add_directive("tokio_postgres=info".parse().unwrap())
         .add_directive("hyper=info".parse().unwrap())
-        .add_directive("reqwest=info".parse().unwrap());
+        .add_directive("reqwest=info".parse().unwrap())
+        .add_directive("rustis=info".parse().unwrap());
 
     let indicatif_layer = IndicatifLayer::new().with_progress_style(
         ProgressStyle::with_template(
@@ -394,9 +397,15 @@ async fn main() -> Result<()> {
                     toml::from_str(&read_to_string(&config).context("Reading config file")?)
                         .context("Deserialize config")?;
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
-
-                let pipline: Pipeline<LocalPipelineQueue> = Pipeline::new(config).await?;
-                pipline.run(mzml_file_paths).await?;
+                if config.pipelines.redis_url.is_none() {
+                    info!("Running redis pipeline");
+                    let pipline: Pipeline<LocalPipelineQueue> = Pipeline::new(config).await?;
+                    pipline.run(mzml_file_paths).await?;
+                } else {
+                    info!("Running redis pipeline");
+                    let pipline: Pipeline<RedisPipelineQueue> = Pipeline::new(config).await?;
+                    pipline.run(mzml_file_paths).await?;
+                }
             }
         },
     };
