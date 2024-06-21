@@ -121,6 +121,8 @@ enum Commands {
     PostProcess {
         /// Path to PSM file
         psm_file_path: String,
+        /// Path to goodness of fit output file
+        goodness_of_fit_file_path: String,
     },
     /// MaCcoyS search pipeline
     Pipeline(PipelineCLI),
@@ -273,7 +275,16 @@ async fn main() -> Result<()> {
                 extractor.extract_spectrum(&spectrum_id)?,
             )?;
         }
-        Commands::PostProcess { psm_file_path } => post_process(&Path::new(&psm_file_path)).await?,
+        Commands::PostProcess {
+            psm_file_path,
+            goodness_of_fit_file_path,
+        } => {
+            post_process(
+                &Path::new(&psm_file_path),
+                &Path::new(&goodness_of_fit_file_path),
+            )
+            .await?
+        }
         Commands::Pipeline(pipeline_command) => match pipeline_command.command {
             PipelineCommand::NewConfig {} => {
                 let new_config = PipelineConfiguration::new();

@@ -22,16 +22,13 @@ use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use polars::prelude::*;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::constants::{
     COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_MAX_PSMS, DIST_SCORE_NAME, EXP_SCORE_NAME,
     FASTA_DECOY_ENTRY_PREFIX,
 };
 // internal imports
-use crate::io::comet::peptide_spectrum_match_tsv::{
-    overwrite as overwrite_comet_tsv, read as read_comet_tsv,
-};
 use crate::{
     constants::FASTA_SEQUENCE_LINE_LENGTH,
     io::comet::configuration::Configuration as CometConfiguration,
@@ -292,71 +289,57 @@ pub async fn search_preparation(
 }
 
 /// Calculates the goodness of fit and scores for the given PSM file,
-/// using the python module `maccoys_scoring`.
+/// using the python module `maccoys`.
 ///
 /// # Arguments
 /// * `psm_file_path` - Path to PSM file
 ///
-pub async fn post_process(psm_file_path: &Path) -> Result<()> {
-    // fdr calculation
-    let mut psms = match read_comet_tsv(psm_file_path)? {
-        Some(psms) => psms,
-        None => return Ok(()),
-    };
-    psms = mark_target_and_decoys(psms)?;
-    psms = false_discovery_rate(psms)?;
-    overwrite_comet_tsv(psms, psm_file_path)?;
+pub async fn post_process(psm_file_path: &Path, goodness_file_path: &Path) -> Result<()> {
+    // goodness of fit
+    let python_args: Vec<&str> = vec![
+        "-m",
+        "maccoys",
+        "comet",
+        "goodness",
+        psm_file_path.to_str().unwrap(),
+        COMET_EXP_BASE_SCORE,
+        goodness_file_path.to_str().unwrap(),
+    ];
+    let output = tokio::process::Command::new("python")
+        .args(python_args)
+        .output()
+        .await
+        .context("Error when calling Python module `maccoys` for calculating goodness of fit")?;
 
-    // TODO: Find crates to substitute the Python module or compile it into the binary
-    // // goodness of fit
-    // let python_args: Vec<&str> = vec![
-    //     "-m",
-    //     "maccoys_scoring",
-    //     "comet",
-    //     "goodness",
-    //     psm_file_path.to_str().unwrap(),
-    //     COMET_EXP_BASE_SCORE,
-    //     goodness_file_path.to_str().unwrap(),
-    // ];
-    // let output = Command::new("python")
-    //     .args(python_args)
-    //     .output()
-    //     .await
-    //     .context(
-    //         "Error when calling Python module `maccoys_scoring` for calculating goodness of fit",
-    //     )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        error!("{:?}", &stderr);
+        bail!(stderr)
+    }
 
-    // info!("{}", String::from_utf8_lossy(&output.stdout));
-    // if !output.status.success() {
-    //     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    //     error!("{:?}", &stderr);
-    //     bail!(stderr)
-    // }
+    // rescoring
+    let python_args: Vec<&str> = vec![
+        "-m",
+        "maccoys",
+        "comet",
+        "scoring",
+        psm_file_path.to_str().unwrap(),
+        COMET_EXP_BASE_SCORE,
+        EXP_SCORE_NAME,
+        COMET_DIST_BASE_SCORE,
+        DIST_SCORE_NAME,
+    ];
+    let output = tokio::process::Command::new("python")
+        .args(python_args)
+        .output()
+        .await
+        .context("Error when calling Python module `maccoys_scoring` for scoring")?;
 
-    // // rescoring
-    // let python_args: Vec<&str> = vec![
-    //     "-m",
-    //     "maccoys_scoring",
-    //     "comet",
-    //     "scoring",
-    //     psm_file_path.to_str().unwrap(),
-    //     COMET_EXP_BASE_SCORE,
-    //     EXP_SCORE_NAME,
-    //     COMET_DIST_BASE_SCORE,
-    //     DIST_SCORE_NAME,
-    // ];
-    // let output = Command::new("python")
-    //     .args(python_args)
-    //     .output()
-    //     .await
-    //     .context("Error when calling Python module `maccoys_scoring` for scoring")?;
-
-    // info!("{}", String::from_utf8_lossy(&output.stdout));
-    // if !output.status.success() {
-    //     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    //     error!("{:?}", &stderr);
-    //     bail!(stderr)
-    // }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        error!("{:?}", &stderr);
+        bail!(stderr)
+    }
     Ok(())
 }
 
