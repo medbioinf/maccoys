@@ -31,6 +31,7 @@ use macpepdb::{
 };
 use rustis::commands::{ListCommands, ServerCommands};
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
 use crate::{
     functions::{
@@ -217,6 +218,9 @@ impl PipelineConfiguration {
 /// and serving as the message between the different tasks
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchManifest {
+    /// Search UUID
+    pub uuid: String,
+
     /// Work directory where on folder per MS run is created
     pub work_dir: PathBuf,
 
@@ -258,12 +262,13 @@ impl SearchManifest {
     /// * `work_dir` - Work directory where on folder per MS run is created
     /// * `ms_run_mzml_path` - Path to the original mzML file containing the MS run
     ///
-    pub fn new(work_dir: PathBuf, ms_run_mzml_path: PathBuf) -> Self {
+    pub fn new(uuid: String, work_dir: PathBuf, ms_run_mzml_path: PathBuf) -> Self {
         let sanitized_mzml_stem =
             sanatize_string(ms_run_mzml_path.file_stem().unwrap().to_str().unwrap());
         let work_dir = work_dir.join(sanitized_mzml_stem);
 
         Self {
+            uuid,
             work_dir,
             ms_run_mzml_path,
             spectrum_id: None,
@@ -642,6 +647,8 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     /// # Arguments
     /// * `mzml_file_paths` - Paths to the mzML files to search
     pub async fn run(&self, mzml_file_paths: Vec<PathBuf>) -> Result<()> {
+        let search_uuid = Uuid::new_v4().to_string();
+
         let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
             "",
             vec![
@@ -780,8 +787,11 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 .collect();
 
         for mzml_file_path in mzml_file_paths {
-            let manifest =
-                SearchManifest::new(self.config.general.work_dir.clone(), mzml_file_path);
+            let manifest = SearchManifest::new(
+                search_uuid.clone(),
+                self.config.general.work_dir.clone(),
+                mzml_file_path,
+            );
             match self.index_queue.push(manifest).await {
                 Ok(_) => (),
                 Err(e) => {
@@ -909,6 +919,15 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     Ok(_) => (),
                     Err(e) => {
                         error!("Error writing index: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let uuid_path = manifest.work_dir.join("uuid.txt");
+                match std::fs::write(&uuid_path, manifest.uuid) {
+                    Ok(_) => (),
+                    Err(e) => {
+                        error!("Error writing uuid: {:?}", e);
                         continue;
                     }
                 };
