@@ -497,7 +497,7 @@ impl PipelineQueue for RedisPipelineQueue {
             match self.client.llen(&self.queue_name).await {
                 Ok(size) => size,
                 Err(e) => {
-                    error!("[{}] Error gettinsg queue size: {:?}", self.queue_name, e);
+                    error!("[{}] Error getting queue size: {:?}", self.queue_name, e);
                     self.capacity + 111
                 }
             }
@@ -577,8 +577,17 @@ where
     /// Flag to stop the cleanup task
     cleanup_stop_flag: Arc<AtomicBool>,
 
+    /// Number of finished search spaces
+    finished_search_spaces: Arc<AtomicUsize>,
+
     /// Number of finished searches
-    finshed_searches: Arc<AtomicUsize>,
+    finished_searches: Arc<AtomicUsize>,
+
+    /// Number of finished goodness and rescoring
+    finished_goodness_and_rescoring: Arc<AtomicUsize>,
+
+    /// Number of finished cleanups
+    finished_cleanups: Arc<AtomicUsize>,
 }
 
 impl<Q: PipelineQueue> Pipeline<Q> {
@@ -621,7 +630,10 @@ impl<Q: PipelineQueue> Pipeline<Q> {
             comet_search_stop_flag: Arc::new(AtomicBool::new(false)),
             goodness_and_rescoreing_stop_flag: Arc::new(AtomicBool::new(false)),
             cleanup_stop_flag: Arc::new(AtomicBool::new(false)),
-            finshed_searches: Arc::new(AtomicUsize::new(0)),
+            finished_search_spaces: Arc::new(AtomicUsize::new(0)),
+            finished_searches: Arc::new(AtomicUsize::new(0)),
+            finished_goodness_and_rescoring: Arc::new(AtomicUsize::new(0)),
+            finished_cleanups: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -640,7 +652,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 self.preparation_queue.clone().into(),
                 self.index_queue.clone().into(),
             ],
-            vec![100, 100, 100, 100, 100],
+            vec![100, 100, 100, 100, 100, 100],
             vec![
                 "Cleanup".to_owned(),
                 "Goodness and Rescoring".to_owned(),
@@ -654,9 +666,19 @@ impl<Q: PipelineQueue> Pipeline<Q> {
 
         let mut metrics_monitor = ProgressMonitor::new(
             "",
-            vec![self.finshed_searches.clone()],
-            vec![None],
-            vec!["Finished searches".to_owned()],
+            vec![
+                self.finished_cleanups.clone(),
+                self.finished_goodness_and_rescoring.clone(),
+                self.finished_searches.clone(),
+                self.finished_search_spaces.clone(),
+            ],
+            vec![None, None, None, None],
+            vec![
+                "Cleanups".to_owned(),
+                "Post processing".to_owned(),
+                "Searches".to_owned(),
+                "Build search spaces".to_owned(),
+            ],
             None,
         )?;
 
@@ -693,11 +715,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     let search_space_generation_queue = self.search_space_generation_queue.clone();
                     let comet_search_queue = self.comet_search_queue.clone();
                     let stop_flag = self.search_space_generation_stop_flag.clone();
+                    let finished_search_spaces = self.finished_search_spaces.clone();
                     tokio::spawn(Self::search_space_generation_task(
                         search_space_generation_queue,
                         comet_search_queue,
                         self.config.clone(),
                         stop_flag,
+                        finished_search_spaces,
                     ))
                 })
                 .collect();
@@ -710,11 +734,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
                     let comet_exe = self.config.comet.comet_exe_path.clone();
                     let stop_flag = self.comet_search_stop_flag.clone();
+                    let finished_searches = self.finished_searches.clone();
                     tokio::spawn(Self::comet_search_task(
                         comet_search_queue,
                         goodness_and_rescoreing_queue,
                         comet_exe,
                         stop_flag,
+                        finished_searches,
                     ))
                 })
                 .collect();
@@ -726,10 +752,13 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
                     let cleanup_queue = self.cleanup_queue.clone();
                     let stop_flag = self.goodness_and_rescoreing_stop_flag.clone();
+                    let finished_goodness_and_rescoring =
+                        self.finished_goodness_and_rescoring.clone();
                     tokio::spawn(Self::goodness_and_rescoring_task(
                         goodness_and_rescoreing_queue,
                         cleanup_queue,
                         stop_flag,
+                        finished_goodness_and_rescoring,
                     ))
                 })
                 .collect();
@@ -739,11 +768,11 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 .into_iter()
                 .map(|_| {
                     let cleanup_queue = self.cleanup_queue.clone();
-                    let finsihed_searches = self.finshed_searches.clone();
+                    let finished_cleanups = self.finished_cleanups.clone();
                     let stop_flag = self.cleanup_stop_flag.clone();
                     tokio::spawn(Self::cleanup_task(
                         cleanup_queue,
-                        finsihed_searches,
+                        finished_cleanups,
                         self.config.clone(),
                         stop_flag,
                     ))
@@ -1096,6 +1125,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         comet_search_queue: Arc<Q>,
         config: Arc<PipelineConfiguration>,
         stop_flag: Arc<AtomicBool>,
+        finishes_search_spaces: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut comet_config =
@@ -1240,6 +1270,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                                     }
                                 }
                             }
+                            finishes_search_spaces.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1265,6 +1296,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         goodness_and_rescoreing_queue: Arc<Q>,
         comet_exe: PathBuf,
         stop_flag: Arc<AtomicBool>,
+        finished_searches: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             loop {
@@ -1326,6 +1358,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                             continue;
                         }
                     }
+                    finished_searches.fetch_add(1, Ordering::Relaxed);
                 }
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
@@ -1342,6 +1375,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         goodness_and_rescoreing_queue: Arc<Q>,
         cleanup_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
+        finished_goodness_and_rescoring: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             loop {
@@ -1387,6 +1421,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                             continue;
                         }
                     }
+                    finished_goodness_and_rescoring.fetch_add(1, Ordering::Relaxed);
                 }
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
@@ -1407,7 +1442,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     ///
     fn cleanup_task(
         cleanup_queue: Arc<Q>,
-        finsihed_searches: Arc<AtomicUsize>,
+        finished_cleanups: Arc<AtomicUsize>,
         config: Arc<PipelineConfiguration>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
@@ -1438,7 +1473,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                         .await
                         .unwrap();
 
-                    finsihed_searches.fetch_add(1, Ordering::Relaxed);
+                    finished_cleanups.fetch_add(1, Ordering::Relaxed);
 
                     debug!(
                         "Cleanup done for {}",
