@@ -11,7 +11,6 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use deadqueue::limited::Queue;
-use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::{
@@ -19,6 +18,10 @@ use dihardts_omicstools::{
         indexer::Indexer,
         reader::{Reader as MzMlReader, Spectrum},
     },
+};
+use dihardts_omicstools::{
+    mass_spectrometry::unit_conversions::mass_to_charge_to_dalton,
+    proteomics::post_translational_modifications::PostTranslationalModification,
 };
 use futures::Future;
 use macpepdb::{
@@ -29,7 +32,7 @@ use macpepdb::{
         queue_monitor::{MonitorableQueue, QueueMonitor},
     },
 };
-use rustis::commands::{ListCommands, ServerCommands};
+use rustis::commands::{ListCommands, ServerCommands, StringCommands};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -211,6 +214,192 @@ impl PipelineConfiguration {
                     .collect(),
             },
         }
+    }
+}
+
+/// Central storage for configuration, PTM etc.
+///
+pub trait PipelineStorage: Send + Sync + Sized {
+    /// Create a new storage
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for the storage
+    ///
+    fn new(config: &PipelineConfiguration) -> impl Future<Output = Result<Self>> + Send;
+
+    /// Get the pipeline configuration
+    ///
+    fn get_configuration(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<Option<PipelineConfiguration>>> + Send;
+
+    /// Set the pipeline configuration
+    ///
+    fn set_configuration(
+        &mut self,
+        uuid: &str,
+        config: &PipelineConfiguration,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Get the PTM reader
+    ///
+    fn get_ptms(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<Option<Vec<PostTranslationalModification>>>> + Send;
+
+    /// Set the PTM reader
+    ///
+    fn set_ptms(
+        &mut self,
+        uuid: &str,
+        ptms: &Vec<PostTranslationalModification>,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    fn get_configuration_key(uuid: &str) -> String {
+        format!("config:{}", uuid)
+    }
+
+    fn get_ptms_key(uuid: &str) -> String {
+        format!("ptms:{}", uuid)
+    }
+}
+
+/// Local storage for the pipeline to
+///
+pub struct LocalPipelineStorage {
+    /// Pipeline configuration
+    configs: HashMap<String, PipelineConfiguration>,
+
+    /// Post translational modifications
+    ptms_collections: HashMap<String, Vec<PostTranslationalModification>>,
+}
+
+impl PipelineStorage for LocalPipelineStorage {
+    async fn new(_config: &PipelineConfiguration) -> Result<Self> {
+        Ok(Self {
+            configs: HashMap::new(),
+            ptms_collections: HashMap::new(),
+        })
+    }
+
+    async fn get_configuration(&self, uuid: &str) -> Result<Option<PipelineConfiguration>> {
+        Ok(self
+            .configs
+            .get(&Self::get_configuration_key(uuid))
+            .cloned())
+    }
+
+    async fn set_configuration(
+        &mut self,
+        uuid: &str,
+        config: &PipelineConfiguration,
+    ) -> Result<()> {
+        self.configs
+            .insert(Self::get_configuration_key(uuid), config.clone());
+        Ok(())
+    }
+
+    async fn get_ptms(&self, uuid: &str) -> Result<Option<Vec<PostTranslationalModification>>> {
+        Ok(self
+            .ptms_collections
+            .get(&Self::get_ptms_key(uuid))
+            .cloned())
+    }
+
+    async fn set_ptms(
+        &mut self,
+        uuid: &str,
+        ptms: &Vec<PostTranslationalModification>,
+    ) -> Result<()> {
+        self.ptms_collections
+            .insert(Self::get_ptms_key(uuid), ptms.clone());
+        Ok(())
+    }
+}
+
+pub struct RedisPipelineStorage {
+    client: rustis::client::Client,
+}
+
+impl PipelineStorage for RedisPipelineStorage {
+    async fn new(config: &PipelineConfiguration) -> Result<Self> {
+        if config.pipelines.redis_url.is_none() {
+            bail!("[STORAGE] Redis URL is None")
+        }
+
+        let mut redis_client_config =
+            rustis::client::Config::from_str(config.pipelines.redis_url.as_ref().unwrap())?;
+        redis_client_config.retry_on_error = true;
+        redis_client_config.reconnection = rustis::client::ReconnectionConfig::new_constant(0, 5);
+
+        let client = rustis::client::Client::connect(redis_client_config)
+            .await
+            .context("[STORAGE] Error opening connection to Redis")?;
+
+        Ok(Self { client })
+    }
+
+    async fn get_configuration(&self, uuid: &str) -> Result<Option<PipelineConfiguration>> {
+        let config_json: String = self
+            .client
+            .get(Self::get_configuration_key(uuid))
+            .await
+            .context("[STORAGE] Error getting configuration")?;
+
+        if config_json.is_empty() {
+            return Ok(None);
+        }
+
+        let config: PipelineConfiguration = serde_json::from_str(&config_json)
+            .context("[STORAGE] Error deserializing configuration")?;
+
+        Ok(Some(config))
+    }
+
+    async fn set_configuration(
+        &mut self,
+        uuid: &str,
+        config: &PipelineConfiguration,
+    ) -> Result<()> {
+        let config_json =
+            serde_json::to_string(config).context("[STORAGE] Error serializing config")?;
+
+        self.client
+            .set(Self::get_configuration_key(uuid), config_json)
+            .await
+            .context("[STORAGE] Error setting configuration")
+    }
+
+    async fn get_ptms(&self, uuid: &str) -> Result<Option<Vec<PostTranslationalModification>>> {
+        let ptms_json: String = self
+            .client
+            .get(Self::get_ptms_key(uuid))
+            .await
+            .context("[STORAGE] Error getting PTMs")?;
+
+        if ptms_json.is_empty() {
+            return Ok(None);
+        }
+
+        let ptms: Vec<PostTranslationalModification> =
+            serde_json::from_str(&ptms_json).context("[STORAGE] Error deserializing PTMs")?;
+
+        Ok(Some(ptms))
+    }
+
+    async fn set_ptms(
+        &mut self,
+        uuid: &str,
+        ptms: &Vec<PostTranslationalModification>,
+    ) -> Result<()> {
+        let ptms_json = serde_json::to_string(ptms).context("[STORAGE] Error serializing PTMs")?;
+
+        self.client
+            .set(Self::get_ptms_key(uuid), ptms_json)
+            .await
+            .context("[STORAGE] Error setting PTMs")
     }
 }
 
@@ -539,12 +728,16 @@ where
 /// # Generics
 /// * `Q` - Type of the queue to use
 ///
-pub struct Pipeline<Q>
+pub struct Pipeline<Q, S>
 where
     Q: PipelineQueue + 'static,
+    S: PipelineStorage + 'static,
 {
-    /// Configuration for the pipeline
-    config: Arc<PipelineConfiguration>,
+    /// UUID of the pipeline
+    uuid: String,
+
+    /// Storage
+    storage: Arc<S>,
 
     /// Index queue
     index_queue: Arc<Q>,
@@ -595,7 +788,7 @@ where
     finished_cleanups: Arc<AtomicUsize>,
 }
 
-impl<Q: PipelineQueue> Pipeline<Q> {
+impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// Create a new pipeline
     ///
     /// # Arguments
@@ -603,26 +796,31 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     ///
     pub async fn new(config: PipelineConfiguration) -> Result<Self> {
         create_work_dir(&config.general.work_dir).await?;
-        let config = Arc::new(config);
+        let uuid = Uuid::new_v4().to_string();
 
-        let index_queue = Arc::new(Q::new(&config.as_ref().pipelines, INDEX_QUEUE_KEY).await?);
-        let preparation_queue =
-            Arc::new(Q::new(&config.as_ref().pipelines, PREPARATION_QUEUE_KEY).await?);
-        let search_space_generation_queue = Arc::new(
-            Q::new(
-                &config.as_ref().pipelines,
-                SEARCH_SPACE_GENERATION_QUEUE_KEY,
-            )
-            .await?,
-        );
-        let comet_search_queue =
-            Arc::new(Q::new(&config.as_ref().pipelines, COMET_SEARCH_QUEUE_KEY).await?);
+        let mut ptms: Vec<PostTranslationalModification> = Vec::new();
+        if let Some(ptm_file_path) = &config.search.ptm_file_path {
+            ptms = PtmReader::read(Path::new(ptm_file_path))?;
+        }
+
+        let index_queue = Arc::new(Q::new(&config.pipelines, INDEX_QUEUE_KEY).await?);
+        let preparation_queue = Arc::new(Q::new(&config.pipelines, PREPARATION_QUEUE_KEY).await?);
+        let search_space_generation_queue =
+            Arc::new(Q::new(&config.pipelines, SEARCH_SPACE_GENERATION_QUEUE_KEY).await?);
+        let comet_search_queue = Arc::new(Q::new(&config.pipelines, COMET_SEARCH_QUEUE_KEY).await?);
         let goodness_and_rescoreing_queue =
-            Arc::new(Q::new(&config.as_ref().pipelines, GOODNESS_AND_RESCORING_QUEUE_KEY).await?);
-        let cleanup_queue = Arc::new(Q::new(&config.as_ref().pipelines, CLEANUP_QUEUE_KEY).await?);
+            Arc::new(Q::new(&config.pipelines, GOODNESS_AND_RESCORING_QUEUE_KEY).await?);
+        let cleanup_queue = Arc::new(Q::new(&config.pipelines, CLEANUP_QUEUE_KEY).await?);
+
+        let mut storage = S::new(&config).await?;
+        storage.set_configuration(&uuid, &config).await?;
+        storage.set_ptms(&uuid, &ptms).await?;
+
+        let storage = Arc::new(storage);
 
         Ok(Self {
-            config,
+            uuid,
+            storage,
             index_queue,
             preparation_queue,
             search_space_generation_queue,
@@ -647,7 +845,16 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     /// # Arguments
     /// * `mzml_file_paths` - Paths to the mzML files to search
     pub async fn run(&self, mzml_file_paths: Vec<PathBuf>) -> Result<()> {
-        let search_uuid = Uuid::new_v4().to_string();
+        let config: PipelineConfiguration = match self
+            .storage
+            .get_configuration(&self.uuid)
+            .await
+            .context(
+            "Error getting configuration when starting pipleine",
+        )? {
+            Some(config) => config,
+            None => bail!("[{}] Configuration not found", self.uuid),
+        };
 
         let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
             "",
@@ -701,7 +908,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
         };
 
         let preparation_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..self.config.general.num_preparation_tasks)
+            (0..config.general.num_preparation_tasks)
                 .into_iter()
                 .map(|_| {
                     let preparation_queue = self.preparation_queue.clone();
@@ -716,7 +923,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 .collect();
 
         let search_space_generation_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..self.config.general.num_search_space_generation_tasks)
+            (0..config.general.num_search_space_generation_tasks)
                 .into_iter()
                 .map(|_| {
                     let search_space_generation_queue = self.search_space_generation_queue.clone();
@@ -726,7 +933,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     tokio::spawn(Self::search_space_generation_task(
                         search_space_generation_queue,
                         comet_search_queue,
-                        self.config.clone(),
+                        self.storage.clone(),
                         stop_flag,
                         finished_search_spaces,
                     ))
@@ -734,12 +941,12 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 .collect();
 
         let comet_search_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..self.config.general.num_comet_search_tasks)
+            (0..config.general.num_comet_search_tasks)
                 .into_iter()
                 .map(|_| {
                     let comet_search_queue = self.comet_search_queue.clone();
                     let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
-                    let comet_exe = self.config.comet.comet_exe_path.clone();
+                    let comet_exe = config.comet.comet_exe_path.clone();
                     let stop_flag = self.comet_search_stop_flag.clone();
                     let finished_searches = self.finished_searches.clone();
                     tokio::spawn(Self::comet_search_task(
@@ -752,26 +959,26 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 })
                 .collect();
 
-        let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..self.config.general.num_goodness_and_rescoring_tasks)
-                .into_iter()
-                .map(|_| {
-                    let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
-                    let cleanup_queue = self.cleanup_queue.clone();
-                    let stop_flag = self.goodness_and_rescoreing_stop_flag.clone();
-                    let finished_goodness_and_rescoring =
-                        self.finished_goodness_and_rescoring.clone();
-                    tokio::spawn(Self::goodness_and_rescoring_task(
-                        goodness_and_rescoreing_queue,
-                        cleanup_queue,
-                        stop_flag,
-                        finished_goodness_and_rescoring,
-                    ))
-                })
-                .collect();
+        let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> = (0..config
+            .general
+            .num_goodness_and_rescoring_tasks)
+            .into_iter()
+            .map(|_| {
+                let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
+                let cleanup_queue = self.cleanup_queue.clone();
+                let stop_flag = self.goodness_and_rescoreing_stop_flag.clone();
+                let finished_goodness_and_rescoring = self.finished_goodness_and_rescoring.clone();
+                tokio::spawn(Self::goodness_and_rescoring_task(
+                    goodness_and_rescoreing_queue,
+                    cleanup_queue,
+                    stop_flag,
+                    finished_goodness_and_rescoring,
+                ))
+            })
+            .collect();
 
         let cleanup_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..self.config.general.num_cleanup_tasks)
+            (0..config.general.num_cleanup_tasks)
                 .into_iter()
                 .map(|_| {
                     let cleanup_queue = self.cleanup_queue.clone();
@@ -780,7 +987,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                     tokio::spawn(Self::cleanup_task(
                         cleanup_queue,
                         finished_cleanups,
-                        self.config.clone(),
+                        self.storage.clone(),
                         stop_flag,
                     ))
                 })
@@ -788,8 +995,8 @@ impl<Q: PipelineQueue> Pipeline<Q> {
 
         for mzml_file_path in mzml_file_paths {
             let manifest = SearchManifest::new(
-                search_uuid.clone(),
-                self.config.general.work_dir.clone(),
+                self.uuid.clone(),
+                config.general.work_dir.clone(),
                 mzml_file_path,
             );
             match self.index_queue.push(manifest).await {
@@ -924,7 +1131,7 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                 };
 
                 let uuid_path = manifest.work_dir.join("uuid.txt");
-                match std::fs::write(&uuid_path, manifest.uuid) {
+                match std::fs::write(&uuid_path, &manifest.uuid) {
                     Ok(_) => (),
                     Err(e) => {
                         error!("Error writing uuid: {:?}", e);
@@ -1136,68 +1343,21 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     /// # Arguments
     /// * `search_space_generation_queue` - Queue for the search space generation task
     /// * `comet_search_queue` - Queue for the Comet search task
-    /// * `config` - Configuration for the pipeline
+    /// * `storage` - Storage to access configuration and PTMs
     /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
     ///
     fn search_space_generation_task(
         search_space_generation_queue: Arc<Q>,
         comet_search_queue: Arc<Q>,
-        config: Arc<PipelineConfiguration>,
+        storage: Arc<S>,
         stop_flag: Arc<AtomicBool>,
         finishes_search_spaces: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
-            let mut comet_config =
-                match CometConfiguration::new(&config.comet.default_comet_params_file_path) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        error!("Error reading Comet configuration: {:?}", e);
-                        return;
-                    }
-                };
-
-            let ptms = match &config.search.ptm_file_path {
-                Some(ptm_file_path) => match PtmReader::read(Path::new(&ptm_file_path)) {
-                    Ok(ptms) => ptms,
-                    Err(e) => {
-                        error!("Error reading PTMs: {:?}", e);
-                        return;
-                    }
-                },
-                None => Vec::new(),
-            };
-
-            match comet_config.set_ptms(&ptms, config.search.max_variable_modifications) {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error setting PTMs: {:?}", e);
-                    return;
-                }
-            }
-
-            match comet_config.set_option("threads", &format!("{}", config.comet.threads)) {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error setting threads: {:?}", e);
-                    return;
-                }
-            }
-
-            match comet_config.set_num_results(10000) {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error setting number of results: {:?}", e);
-                    return;
-                }
-            }
-
-            match comet_config.set_max_variable_mods(config.search.max_variable_modifications) {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error setting max variable modifications: {:?}", e);
-                    return;
-                }
-            }
+            let mut last_search_uuid = String::new();
+            let mut current_config: Option<PipelineConfiguration> = None;
+            let mut current_ptms: Option<Vec<PostTranslationalModification>> = None;
+            let mut current_comet_config: Option<CometConfiguration> = None;
 
             loop {
                 while let Some(manifest) = search_space_generation_queue.pop().await {
@@ -1213,6 +1373,93 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                         error!("Precursors is None in search_space_generation_thread");
                         continue;
                     }
+
+                    if last_search_uuid != manifest.uuid {
+                        current_config = match storage.get_configuration(&manifest.uuid).await {
+                            Ok(config) => match config {
+                                Some(config) => Some(config),
+                                None => {
+                                    error!("Configuration not found for {}", manifest.uuid);
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                error!("Error reading configuration: {:?}", e);
+                                return;
+                            }
+                        };
+                        current_ptms = match storage.get_ptms(&manifest.uuid).await {
+                            Ok(ptms) => match ptms {
+                                Some(ptms) => Some(ptms),
+                                None => {
+                                    error!("PTMs not found for {}", manifest.uuid);
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                error!("Error reading PTMs: {:?}", e);
+                                return;
+                            }
+                        };
+                        last_search_uuid = manifest.uuid.clone();
+
+                        let config = current_config.as_ref().unwrap();
+                        let ptms = current_ptms.as_ref().unwrap();
+
+                        let mut comet_config = match CometConfiguration::new(
+                            &config.comet.default_comet_params_file_path,
+                        ) {
+                            Ok(config) => config,
+                            Err(e) => {
+                                error!("Error reading Comet configuration: {:?}", e);
+                                return;
+                            }
+                        };
+
+                        match comet_config.set_ptms(&ptms, config.search.max_variable_modifications)
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!("Error setting PTMs: {:?}", e);
+                                return;
+                            }
+                        }
+
+                        match comet_config
+                            .set_option("threads", &format!("{}", config.comet.threads))
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!("Error setting threads: {:?}", e);
+                                return;
+                            }
+                        }
+
+                        match comet_config.set_num_results(10000) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!("Error setting number of results: {:?}", e);
+                                return;
+                            }
+                        }
+
+                        match comet_config
+                            .set_max_variable_mods(config.search.max_variable_modifications)
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!("Error setting max variable modifications: {:?}", e);
+                                return;
+                            }
+                        }
+
+                        current_comet_config = Some(comet_config);
+                    }
+
+                    // Unwrap the current configuration
+                    let config = current_config.as_ref().unwrap();
+                    let ptms = current_ptms.as_ref().unwrap();
+                    let comet_config = current_comet_config.as_mut().unwrap();
 
                     for (precursor_mz, precursor_charges) in
                         manifest.precursors.as_ref().unwrap().iter()
@@ -1456,17 +1703,20 @@ impl<Q: PipelineQueue> Pipeline<Q> {
     /// # Arguments
     /// * `cleanup_queue` - Queue for the cleanup task
     /// * `finsihed_searches` - Number of finished searches
-    /// * `config` - Configuration for the pipeline
+    /// * `storage` - Storage to access configuration
     /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
     ///
     fn cleanup_task(
         cleanup_queue: Arc<Q>,
         finished_cleanups: Arc<AtomicUsize>,
-        config: Arc<PipelineConfiguration>,
+        storage: Arc<S>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             loop {
+                let mut last_search_uuid = String::new();
+                let mut current_config: Option<PipelineConfiguration> = None;
+
                 while let Some(manifest) = cleanup_queue.pop().await {
                     debug!(
                         "Running cleanup for {}",
@@ -1477,6 +1727,26 @@ impl<Q: PipelineQueue> Pipeline<Q> {
                         error!("Fasta file path is None in cleanup_task");
                         continue;
                     }
+
+                    if last_search_uuid != manifest.uuid {
+                        current_config = match storage.get_configuration(&manifest.uuid).await {
+                            Ok(config) => match config {
+                                Some(config) => Some(config),
+                                None => {
+                                    error!("Configuration not found for {}", manifest.uuid);
+                                    continue;
+                                }
+                            },
+                            Err(e) => {
+                                error!("Error reading configuration: {:?}", e);
+                                return;
+                            }
+                        };
+                        last_search_uuid = manifest.uuid.clone();
+                    }
+
+                    // Unwrap the current configuration
+                    let config = current_config.as_ref().unwrap();
 
                     if !config.general.keep_fasta_files {
                         match tokio::fs::remove_file(manifest.fasta_file_path.as_ref().unwrap())

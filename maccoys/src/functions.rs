@@ -164,7 +164,7 @@ pub async fn create_search_space(
     target_lookup_url: Option<String>,
     decoy_cache_url: Option<String>,
 ) -> Result<(usize, usize)> {
-    validate_ptm_vec(&ptms)?;
+    validate_ptm_vec(ptms)?;
     let search_space_generator = SearchSpaceGenerator::new(
         target_url.as_str(),
         decoy_url,

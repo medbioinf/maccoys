@@ -1,0 +1,42 @@
+[general]
+work_dir = "/mnt/data/results/maccoys_test"
+num_preparation_tasks = 4
+num_search_space_generation_tasks = 64
+num_comet_search_tasks = 4
+num_goodness_and_rescoring_tasks = 2
+num_cleanup_tasks = 1
+keep_fasta_files = true
+
+[search]
+max_charge = 6
+lower_mass_tolerance_ppm = 10
+upper_mass_tolerance_ppm = 10
+max_variable_modifications = 3
+decoys_per_peptide = 0
+ptm_file_path = "/mnt/data/modifications.csv"
+target_url = "http://10.150.203.15"
+
+[comet]
+comet_exe_path = "/home/fedora/.local/bin/comet"
+threads = 2
+default_comet_params_file_path = "/home/fedora/Code/maccoys/comet.params"
+
+[pipelines]
+default_capacity = 100
+redis_url = "redis://127.0.0.1:6379/0"
+
+[pipelines.capacities]
+cleanup = 100
+index = 100
+comet_search = 100
+search_space_generation = 100
+preparation = 100
+goodness_and_rescoring = 100
+
+[pipelines.redis_queue_names]
+cleanup = "cleanup"
+comet_search = "comet_search"
+search_space_generation = "search_space_generation"
+preparation = "preparation"
+index = "index"
+goodness_and_rescoring = "goodness_and_rescoring"

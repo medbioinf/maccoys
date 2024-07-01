@@ -13,7 +13,10 @@ use dihardts_omicstools::proteomics::io::mzml::{
 };
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::{LocalPipelineQueue, Pipeline, PipelineConfiguration, RedisPipelineQueue};
+use maccoys::pipeline::{
+    LocalPipelineQueue, LocalPipelineStorage, Pipeline, PipelineConfiguration, RedisPipelineQueue,
+    RedisPipelineStorage,
+};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -297,14 +300,17 @@ async fn main() -> Result<()> {
                 let config: PipelineConfiguration =
                     toml::from_str(&read_to_string(&config).context("Reading config file")?)
                         .context("Deserialize config")?;
+
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
                 if config.pipelines.redis_url.is_none() {
-                    info!("Running redis pipeline");
-                    let pipline: Pipeline<LocalPipelineQueue> = Pipeline::new(config).await?;
+                    info!("Running local pipeline");
+                    let pipline: Pipeline<LocalPipelineQueue, LocalPipelineStorage> =
+                        Pipeline::new(config).await?;
                     pipline.run(mzml_file_paths).await?;
                 } else {
                     info!("Running redis pipeline");
-                    let pipline: Pipeline<RedisPipelineQueue> = Pipeline::new(config).await?;
+                    let pipline: Pipeline<RedisPipelineQueue, RedisPipelineStorage> =
+                        Pipeline::new(config).await?;
                     pipline.run(mzml_file_paths).await?;
                 }
             }
