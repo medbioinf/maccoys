@@ -325,21 +325,26 @@ async fn main() -> Result<()> {
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
                 if config.pipelines.redis_url.is_none() {
                     info!("Running local pipeline");
-                    let pipline: Pipeline<LocalPipelineQueue, LocalPipelineStorage> =
-                        Pipeline::new(config, comet_config, ptms).await?;
-                    info!("UUID: {}", pipline.get_uuid());
-                    pipline.run(mzml_file_paths).await?;
+                    Pipeline::<LocalPipelineQueue, LocalPipelineStorage>::run_locally(
+                        config,
+                        comet_config,
+                        ptms,
+                        mzml_file_paths,
+                    )
+                    .await?;
                 } else {
                     info!("Running redis pipeline");
-                    let pipline: Pipeline<RedisPipelineQueue, RedisPipelineStorage> =
-                        Pipeline::new(config, comet_config, ptms).await?;
-                    info!("UUID: {}", pipline.get_uuid());
-                    pipline.run(mzml_file_paths).await?;
+                    Pipeline::<RedisPipelineQueue, RedisPipelineStorage>::run_locally(
+                        config,
+                        comet_config,
+                        ptms,
+                        mzml_file_paths,
+                    )
+                    .await?;
                 }
             }
         },
     };
-
     Ok(())
 }
 

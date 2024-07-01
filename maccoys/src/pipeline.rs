@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    marker::PhantomData,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -659,7 +660,6 @@ impl PipelineQueue for RedisPipelineQueue {
             let client = rustis::client::Client::connect(redis_client_config)
                 .await
                 .context("Error opening connection to Redis")?;
-            client.flushdb(rustis::commands::FlushingMode::Sync).await?;
             Ok(Self {
                 client,
                 queue_name,
@@ -793,78 +793,41 @@ where
     Q: PipelineQueue + 'static,
     S: PipelineStorage + 'static,
 {
-    /// UUID of the pipeline
-    uuid: String,
-
-    /// Storage
-    storage: Arc<S>,
-
-    /// Index queue
-    index_queue: Arc<Q>,
-
-    /// Preparation queue
-    preparation_queue: Arc<Q>,
-
-    /// Search space generation queue
-    search_space_generation_queue: Arc<Q>,
-
-    /// Comet search queue
-    comet_search_queue: Arc<Q>,
-
-    /// Goodness and rescoring queue
-    goodness_and_rescoreing_queue: Arc<Q>,
-
-    /// Cleanup queue
-    cleanup_queue: Arc<Q>,
-
-    /// Flag to stop the indexing task
-    index_stop_flag: Arc<AtomicBool>,
-
-    /// Flag to stop the preparation task
-    preparation_stop_flag: Arc<AtomicBool>,
-
-    /// Flag to stop the search space generation task
-    search_space_generation_stop_flag: Arc<AtomicBool>,
-
-    /// Flag to stop the Comet search task
-    comet_search_stop_flag: Arc<AtomicBool>,
-
-    /// Flag to stop the goodness and rescoring task
-    goodness_and_rescoreing_stop_flag: Arc<AtomicBool>,
-
-    /// Flag to stop the cleanup task
-    cleanup_stop_flag: Arc<AtomicBool>,
-
-    /// Number of finished search spaces
-    finished_search_spaces: Arc<AtomicUsize>,
-
-    /// Number of finished searches
-    finished_searches: Arc<AtomicUsize>,
-
-    /// Number of finished goodness and rescoring
-    finished_goodness_and_rescoring: Arc<AtomicUsize>,
-
-    /// Number of finished cleanups
-    finished_cleanups: Arc<AtomicUsize>,
+    _phantom_queue: PhantomData<Q>,
+    _storage: PhantomData<S>,
 }
 
 impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
-    /// Create a new pipeline
+    /// Run the pipeline locally for each mzML file
     ///
     /// # Arguments
     /// * `config` - Configuration for the pipeline
+    /// * `comet_config` - Configuration for Comet
+    /// * `ptms` - Post translational modifications
+    /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
-    pub async fn new(
+    pub async fn run_locally(
         config: PipelineConfiguration,
         mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
-    ) -> Result<Self> {
-        create_work_dir(&config.general.work_dir).await?;
+        mzml_file_paths: Vec<PathBuf>,
+    ) -> Result<()> {
         let uuid = Uuid::new_v4().to_string();
+        info!("UUID: {}", uuid);
+
+        create_work_dir(&config.general.work_dir).await?;
 
         comet_config.set_ptms(&ptms, config.search.max_variable_modifications)?;
         comet_config.set_num_results(10000)?;
 
+        let mut storage = S::new(&config).await?;
+        storage.set_configuration(&uuid, &config).await?;
+        storage.set_ptms(&uuid, &ptms).await?;
+        storage.set_comet_config(&uuid, &comet_config).await?;
+
+        let storage = Arc::new(storage);
+
+        // Create the queues
         let index_queue = Arc::new(Q::new(&config.pipelines, INDEX_QUEUE_KEY).await?);
         let preparation_queue = Arc::new(Q::new(&config.pipelines, PREPARATION_QUEUE_KEY).await?);
         let search_space_generation_queue =
@@ -874,64 +837,29 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             Arc::new(Q::new(&config.pipelines, GOODNESS_AND_RESCORING_QUEUE_KEY).await?);
         let cleanup_queue = Arc::new(Q::new(&config.pipelines, CLEANUP_QUEUE_KEY).await?);
 
-        let mut storage = S::new(&config).await?;
-        storage.set_configuration(&uuid, &config).await?;
-        storage.set_ptms(&uuid, &ptms).await?;
-        storage.set_comet_config(&uuid, &comet_config).await?;
+        // Create the stop flags
+        let index_stop_flag = Arc::new(AtomicBool::new(false));
+        let preparation_stop_flag = Arc::new(AtomicBool::new(false));
+        let search_space_generation_stop_flag = Arc::new(AtomicBool::new(false));
+        let comet_search_stop_flag = Arc::new(AtomicBool::new(false));
+        let goodness_and_rescoreing_stop_flag = Arc::new(AtomicBool::new(false));
+        let cleanup_stop_flag = Arc::new(AtomicBool::new(false));
 
-        let storage = Arc::new(storage);
-
-        Ok(Self {
-            uuid,
-            storage,
-            index_queue,
-            preparation_queue,
-            search_space_generation_queue,
-            comet_search_queue,
-            goodness_and_rescoreing_queue,
-            cleanup_queue,
-            index_stop_flag: Arc::new(AtomicBool::new(false)),
-            preparation_stop_flag: Arc::new(AtomicBool::new(false)),
-            search_space_generation_stop_flag: Arc::new(AtomicBool::new(false)),
-            comet_search_stop_flag: Arc::new(AtomicBool::new(false)),
-            goodness_and_rescoreing_stop_flag: Arc::new(AtomicBool::new(false)),
-            cleanup_stop_flag: Arc::new(AtomicBool::new(false)),
-            finished_search_spaces: Arc::new(AtomicUsize::new(0)),
-            finished_searches: Arc::new(AtomicUsize::new(0)),
-            finished_goodness_and_rescoring: Arc::new(AtomicUsize::new(0)),
-            finished_cleanups: Arc::new(AtomicUsize::new(0)),
-        })
-    }
-
-    pub fn get_uuid(&self) -> &str {
-        &self.uuid
-    }
-
-    /// Run the pipeline for each mzML file
-    ///
-    /// # Arguments
-    /// * `mzml_file_paths` - Paths to the mzML files to search
-    pub async fn run(&self, mzml_file_paths: Vec<PathBuf>) -> Result<()> {
-        let config: PipelineConfiguration = match self
-            .storage
-            .get_configuration(&self.uuid)
-            .await
-            .context(
-            "Error getting configuration when starting pipleine",
-        )? {
-            Some(config) => config,
-            None => bail!("[{}] Configuration not found", self.uuid),
-        };
+        // Metrics
+        let finished_search_spaces = Arc::new(AtomicUsize::new(0));
+        let finished_searches = Arc::new(AtomicUsize::new(0));
+        let finished_goodness_and_rescoring = Arc::new(AtomicUsize::new(0));
+        let finished_cleanups = Arc::new(AtomicUsize::new(0));
 
         let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
             "",
             vec![
-                self.cleanup_queue.clone().into(),
-                self.goodness_and_rescoreing_queue.clone().into(),
-                self.comet_search_queue.clone().into(),
-                self.search_space_generation_queue.clone().into(),
-                self.preparation_queue.clone().into(),
-                self.index_queue.clone().into(),
+                cleanup_queue.clone().into(),
+                goodness_and_rescoreing_queue.clone().into(),
+                comet_search_queue.clone().into(),
+                search_space_generation_queue.clone().into(),
+                preparation_queue.clone().into(),
+                index_queue.clone().into(),
             ],
             vec![100, 100, 100, 100, 100, 100],
             vec![
@@ -948,10 +876,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         let mut metrics_monitor = ProgressMonitor::new(
             "",
             vec![
-                self.finished_cleanups.clone(),
-                self.finished_goodness_and_rescoring.clone(),
-                self.finished_searches.clone(),
-                self.finished_search_spaces.clone(),
+                finished_cleanups.clone(),
+                finished_goodness_and_rescoring.clone(),
+                finished_searches.clone(),
+                finished_search_spaces.clone(),
             ],
             vec![None, None, None, None],
             vec![
@@ -964,9 +892,9 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         )?;
 
         let index_handler: tokio::task::JoinHandle<()> = {
-            let index_queue = self.index_queue.clone();
-            let preparation_queue = self.preparation_queue.clone();
-            let stop_flag = self.index_stop_flag.clone();
+            let index_queue = index_queue.clone();
+            let preparation_queue = preparation_queue.clone();
+            let stop_flag = index_stop_flag.clone();
             tokio::spawn(Self::indexing_task(
                 index_queue.clone(),
                 preparation_queue,
@@ -978,9 +906,9 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             (0..config.general.num_preparation_tasks)
                 .into_iter()
                 .map(|_| {
-                    let preparation_queue = self.preparation_queue.clone();
-                    let search_space_generation_queue = self.search_space_generation_queue.clone();
-                    let stop_flag = self.preparation_stop_flag.clone();
+                    let preparation_queue = preparation_queue.clone();
+                    let search_space_generation_queue = search_space_generation_queue.clone();
+                    let stop_flag = preparation_stop_flag.clone();
                     tokio::spawn(Self::preparation_task(
                         preparation_queue,
                         search_space_generation_queue,
@@ -993,14 +921,14 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             (0..config.general.num_search_space_generation_tasks)
                 .into_iter()
                 .map(|_| {
-                    let search_space_generation_queue = self.search_space_generation_queue.clone();
-                    let comet_search_queue = self.comet_search_queue.clone();
-                    let stop_flag = self.search_space_generation_stop_flag.clone();
-                    let finished_search_spaces = self.finished_search_spaces.clone();
+                    let search_space_generation_queue = search_space_generation_queue.clone();
+                    let comet_search_queue = comet_search_queue.clone();
+                    let stop_flag = search_space_generation_stop_flag.clone();
+                    let finished_search_spaces = finished_search_spaces.clone();
                     tokio::spawn(Self::search_space_generation_task(
                         search_space_generation_queue,
                         comet_search_queue,
-                        self.storage.clone(),
+                        storage.clone(),
                         stop_flag,
                         finished_search_spaces,
                     ))
@@ -1011,11 +939,11 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             (0..config.general.num_comet_search_tasks)
                 .into_iter()
                 .map(|_| {
-                    let comet_search_queue = self.comet_search_queue.clone();
-                    let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
+                    let comet_search_queue = comet_search_queue.clone();
+                    let goodness_and_rescoreing_queue = goodness_and_rescoreing_queue.clone();
                     let comet_exe = config.comet.comet_exe_path.clone();
-                    let stop_flag = self.comet_search_stop_flag.clone();
-                    let finished_searches = self.finished_searches.clone();
+                    let stop_flag = comet_search_stop_flag.clone();
+                    let finished_searches = finished_searches.clone();
                     tokio::spawn(Self::comet_search_task(
                         comet_search_queue,
                         goodness_and_rescoreing_queue,
@@ -1026,35 +954,34 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 })
                 .collect();
 
-        let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> = (0..config
-            .general
-            .num_goodness_and_rescoring_tasks)
-            .into_iter()
-            .map(|_| {
-                let goodness_and_rescoreing_queue = self.goodness_and_rescoreing_queue.clone();
-                let cleanup_queue = self.cleanup_queue.clone();
-                let stop_flag = self.goodness_and_rescoreing_stop_flag.clone();
-                let finished_goodness_and_rescoring = self.finished_goodness_and_rescoring.clone();
-                tokio::spawn(Self::goodness_and_rescoring_task(
-                    goodness_and_rescoreing_queue,
-                    cleanup_queue,
-                    stop_flag,
-                    finished_goodness_and_rescoring,
-                ))
-            })
-            .collect();
+        let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.general.num_goodness_and_rescoring_tasks)
+                .into_iter()
+                .map(|_| {
+                    let goodness_and_rescoreing_queue = goodness_and_rescoreing_queue.clone();
+                    let cleanup_queue = cleanup_queue.clone();
+                    let stop_flag = goodness_and_rescoreing_stop_flag.clone();
+                    let finished_goodness_and_rescoring = finished_goodness_and_rescoring.clone();
+                    tokio::spawn(Self::goodness_and_rescoring_task(
+                        goodness_and_rescoreing_queue,
+                        cleanup_queue,
+                        stop_flag,
+                        finished_goodness_and_rescoring,
+                    ))
+                })
+                .collect();
 
         let cleanup_handlers: Vec<tokio::task::JoinHandle<()>> =
             (0..config.general.num_cleanup_tasks)
                 .into_iter()
                 .map(|_| {
-                    let cleanup_queue = self.cleanup_queue.clone();
-                    let finished_cleanups = self.finished_cleanups.clone();
-                    let stop_flag = self.cleanup_stop_flag.clone();
+                    let cleanup_queue = cleanup_queue.clone();
+                    let finished_cleanups = finished_cleanups.clone();
+                    let stop_flag = cleanup_stop_flag.clone();
                     tokio::spawn(Self::cleanup_task(
                         cleanup_queue,
                         finished_cleanups,
-                        self.storage.clone(),
+                        storage.clone(),
                         stop_flag,
                     ))
                 })
@@ -1062,11 +989,11 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
 
         for mzml_file_path in mzml_file_paths {
             let manifest = SearchManifest::new(
-                self.uuid.clone(),
+                uuid.clone(),
                 config.general.work_dir.clone(),
                 mzml_file_path,
             );
-            match self.index_queue.push(manifest).await {
+            match index_queue.push(manifest).await {
                 Ok(_) => (),
                 Err(e) => {
                     error!(
@@ -1078,7 +1005,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
-        self.index_stop_flag.store(true, Ordering::Relaxed);
+        index_stop_flag.store(true, Ordering::Relaxed);
 
         match index_handler.await {
             Ok(_) => (),
@@ -1087,7 +1014,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
-        self.preparation_stop_flag.store(true, Ordering::Relaxed);
+        preparation_stop_flag.store(true, Ordering::Relaxed);
 
         for preparation_handler in preparation_handlers {
             match preparation_handler.await {
@@ -1098,8 +1025,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
-        self.search_space_generation_stop_flag
-            .store(true, Ordering::Relaxed);
+        search_space_generation_stop_flag.store(true, Ordering::Relaxed);
 
         for search_space_generation_handler in search_space_generation_handlers {
             match search_space_generation_handler.await {
@@ -1110,7 +1036,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
-        self.comet_search_stop_flag.store(true, Ordering::Relaxed);
+        comet_search_stop_flag.store(true, Ordering::Relaxed);
 
         for comet_search_handler in comet_search_handlers {
             match comet_search_handler.await {
@@ -1121,8 +1047,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
-        self.goodness_and_rescoreing_stop_flag
-            .store(true, Ordering::Relaxed);
+        goodness_and_rescoreing_stop_flag.store(true, Ordering::Relaxed);
 
         for goodness_and_resconfing_handler in goodness_and_resconfing_handlers {
             match goodness_and_resconfing_handler.await {
@@ -1133,7 +1058,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
-        self.cleanup_stop_flag.store(true, Ordering::Relaxed);
+        cleanup_stop_flag.store(true, Ordering::Relaxed);
 
         for cleanup_handler in cleanup_handlers {
             match cleanup_handler.await {
@@ -1157,7 +1082,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `preparation_queue` - Queue for the preparation task
     /// * `stop_flag` - Flag to indicate to stop once the index queue is empty
     ///
-    async fn indexing_task(
+    pub async fn indexing_task(
         index_queue: Arc<Q>,
         preparation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
