@@ -32,7 +32,7 @@ use macpepdb::{
         queue_monitor::{MonitorableQueue, QueueMonitor},
     },
 };
-use rustis::commands::{ListCommands, ServerCommands, StringCommands};
+use rustis::commands::{GenericCommands, ListCommands, ServerCommands, StringCommands};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -240,6 +240,10 @@ pub trait PipelineStorage: Send + Sync + Sized {
         config: &PipelineConfiguration,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Remove the pipeline configuration
+    ///
+    fn remove_configuration(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
+
     /// Get the PTM reader
     ///
     fn get_ptms(
@@ -255,6 +259,10 @@ pub trait PipelineStorage: Send + Sync + Sized {
         ptms: &Vec<PostTranslationalModification>,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Remove PTMs
+    ///
+    fn remove_ptms(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
+
     /// Get comet config
     ///
     fn get_comet_config(
@@ -269,6 +277,10 @@ pub trait PipelineStorage: Send + Sync + Sized {
         uuid: &str,
         config: &CometConfiguration,
     ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Remove comet config
+    ///
+    fn remove_comet_config(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
 
     fn get_configuration_key(uuid: &str) -> String {
         format!("config:{}", uuid)
@@ -322,6 +334,11 @@ impl PipelineStorage for LocalPipelineStorage {
         Ok(())
     }
 
+    async fn remove_configuration(&mut self, uuid: &str) -> Result<()> {
+        self.configs.remove(&Self::get_configuration_key(uuid));
+        Ok(())
+    }
+
     async fn get_ptms(&self, uuid: &str) -> Result<Option<Vec<PostTranslationalModification>>> {
         Ok(self
             .ptms_collections
@@ -339,6 +356,11 @@ impl PipelineStorage for LocalPipelineStorage {
         Ok(())
     }
 
+    async fn remove_ptms(&mut self, uuid: &str) -> Result<()> {
+        self.ptms_collections.remove(&Self::get_ptms_key(uuid));
+        Ok(())
+    }
+
     async fn get_comet_config(&self, uuid: &str) -> Result<Option<CometConfiguration>> {
         Ok(self
             .comet_configs
@@ -349,6 +371,11 @@ impl PipelineStorage for LocalPipelineStorage {
     async fn set_comet_config(&mut self, uuid: &str, config: &CometConfiguration) -> Result<()> {
         self.comet_configs
             .insert(Self::get_comet_config_key(uuid), config.clone());
+        Ok(())
+    }
+
+    async fn remove_comet_config(&mut self, uuid: &str) -> Result<()> {
+        self.comet_configs.remove(&Self::get_comet_config_key(uuid));
         Ok(())
     }
 }
@@ -406,6 +433,14 @@ impl PipelineStorage for RedisPipelineStorage {
             .context("[STORAGE] Error setting configuration")
     }
 
+    async fn remove_configuration(&mut self, uuid: &str) -> Result<()> {
+        self.client
+            .del(Self::get_configuration_key(uuid))
+            .await
+            .context("[STORAGE] Error removing configuration")?;
+        Ok(())
+    }
+
     async fn get_ptms(&self, uuid: &str) -> Result<Option<Vec<PostTranslationalModification>>> {
         let ptms_json: String = self
             .client
@@ -436,6 +471,14 @@ impl PipelineStorage for RedisPipelineStorage {
             .context("[STORAGE] Error setting PTMs")
     }
 
+    async fn remove_ptms(&mut self, uuid: &str) -> Result<()> {
+        self.client
+            .del(Self::get_ptms_key(uuid))
+            .await
+            .context("[STORAGE] Error removing PTMs")?;
+        Ok(())
+    }
+
     async fn get_comet_config(&self, uuid: &str) -> Result<Option<CometConfiguration>> {
         let comet_params_json: String = self
             .client
@@ -461,6 +504,14 @@ impl PipelineStorage for RedisPipelineStorage {
             .set(Self::get_comet_config_key(uuid), comet_params_json)
             .await
             .context("[STORAGE] Error setting Comet configuration")
+    }
+
+    async fn remove_comet_config(&mut self, uuid: &str) -> Result<()> {
+        self.client
+            .del(Self::get_comet_config_key(uuid))
+            .await
+            .context("[STORAGE] Error removing Comet configuration")?;
+        Ok(())
     }
 }
 
@@ -1071,6 +1122,16 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
 
         queue_monitor.stop().await?;
         metrics_monitor.stop().await?;
+
+        let mut storage = match Arc::try_unwrap(storage) {
+            Ok(storage) => storage,
+            Err(_) => {
+                bail!("Error unwrapping storage");
+            }
+        };
+        storage.remove_comet_config(&uuid).await?;
+        storage.remove_configuration(&uuid).await?;
+        storage.remove_ptms(&uuid).await?;
 
         Ok(())
     }
