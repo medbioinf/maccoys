@@ -32,7 +32,7 @@ use macpepdb::{
         queue_monitor::{MonitorableQueue, QueueMonitor},
     },
 };
-use rustis::commands::{GenericCommands, ListCommands, ServerCommands, StringCommands};
+use rustis::commands::{GenericCommands, ListCommands, StringCommands};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
