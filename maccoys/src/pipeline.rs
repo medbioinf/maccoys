@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -25,7 +25,6 @@ use dihardts_omicstools::{
 };
 use futures::Future;
 use macpepdb::{
-    io::post_translational_modification_csv::reader::Reader as PtmReader,
     mass::convert::to_int as mass_to_int,
     tools::{
         progress_monitor::ProgressMonitor,
@@ -72,7 +71,6 @@ const QUEUE_KEYS: [&str; 6] = [
 pub struct PipelineCometConfiguration {
     comet_exe_path: PathBuf,
     threads: usize,
-    default_comet_params_file_path: PathBuf,
 }
 
 /// General pipeline configuration
@@ -199,7 +197,6 @@ impl PipelineConfiguration {
             comet: PipelineCometConfiguration {
                 threads: 8,
                 comet_exe_path: PathBuf::from("/usr/local/bin/comet"),
-                default_comet_params_file_path: PathBuf::from("./comet.params"),
             },
             pipelines: PipelineQueueConfiguration {
                 default_capacity: 100,
@@ -257,12 +254,31 @@ pub trait PipelineStorage: Send + Sync + Sized {
         ptms: &Vec<PostTranslationalModification>,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Get comet config
+    ///
+    fn get_comet_config(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<Option<CometConfiguration>>> + Send;
+
+    /// Set comet config
+    ///
+    fn set_comet_config(
+        &mut self,
+        uuid: &str,
+        config: &CometConfiguration,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     fn get_configuration_key(uuid: &str) -> String {
         format!("config:{}", uuid)
     }
 
     fn get_ptms_key(uuid: &str) -> String {
         format!("ptms:{}", uuid)
+    }
+
+    fn get_comet_config_key(uuid: &str) -> String {
+        format!("comet_config:{}", uuid)
     }
 }
 
@@ -274,6 +290,9 @@ pub struct LocalPipelineStorage {
 
     /// Post translational modifications
     ptms_collections: HashMap<String, Vec<PostTranslationalModification>>,
+
+    /// Comet configurations
+    comet_configs: HashMap<String, CometConfiguration>,
 }
 
 impl PipelineStorage for LocalPipelineStorage {
@@ -281,6 +300,7 @@ impl PipelineStorage for LocalPipelineStorage {
         Ok(Self {
             configs: HashMap::new(),
             ptms_collections: HashMap::new(),
+            comet_configs: HashMap::new(),
         })
     }
 
@@ -315,6 +335,19 @@ impl PipelineStorage for LocalPipelineStorage {
     ) -> Result<()> {
         self.ptms_collections
             .insert(Self::get_ptms_key(uuid), ptms.clone());
+        Ok(())
+    }
+
+    async fn get_comet_config(&self, uuid: &str) -> Result<Option<CometConfiguration>> {
+        Ok(self
+            .comet_configs
+            .get(&Self::get_comet_config_key(uuid))
+            .cloned())
+    }
+
+    async fn set_comet_config(&mut self, uuid: &str, config: &CometConfiguration) -> Result<()> {
+        self.comet_configs
+            .insert(Self::get_comet_config_key(uuid), config.clone());
         Ok(())
     }
 }
@@ -400,6 +433,33 @@ impl PipelineStorage for RedisPipelineStorage {
             .set(Self::get_ptms_key(uuid), ptms_json)
             .await
             .context("[STORAGE] Error setting PTMs")
+    }
+
+    async fn get_comet_config(&self, uuid: &str) -> Result<Option<CometConfiguration>> {
+        let comet_params_json: String = self
+            .client
+            .get(Self::get_comet_config_key(uuid))
+            .await
+            .context("[STORAGE] Error getting PTMs")?;
+
+        if comet_params_json.is_empty() {
+            return Ok(None);
+        }
+
+        let config: CometConfiguration = serde_json::from_str(&comet_params_json)
+            .context("[STORAGE] Error deserializing Comet configuration")?;
+
+        Ok(Some(config))
+    }
+
+    async fn set_comet_config(&mut self, uuid: &str, config: &CometConfiguration) -> Result<()> {
+        let comet_params_json = serde_json::to_string(config)
+            .context("[STORAGE] Error serializing Comet configuration")?;
+
+        self.client
+            .set(Self::get_comet_config_key(uuid), comet_params_json)
+            .await
+            .context("[STORAGE] Error setting Comet configuration")
     }
 }
 
@@ -794,14 +854,16 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// # Arguments
     /// * `config` - Configuration for the pipeline
     ///
-    pub async fn new(config: PipelineConfiguration) -> Result<Self> {
+    pub async fn new(
+        config: PipelineConfiguration,
+        mut comet_config: CometConfiguration,
+        ptms: Vec<PostTranslationalModification>,
+    ) -> Result<Self> {
         create_work_dir(&config.general.work_dir).await?;
         let uuid = Uuid::new_v4().to_string();
 
-        let mut ptms: Vec<PostTranslationalModification> = Vec::new();
-        if let Some(ptm_file_path) = &config.search.ptm_file_path {
-            ptms = PtmReader::read(Path::new(ptm_file_path))?;
-        }
+        comet_config.set_ptms(&ptms, config.search.max_variable_modifications)?;
+        comet_config.set_num_results(10000)?;
 
         let index_queue = Arc::new(Q::new(&config.pipelines, INDEX_QUEUE_KEY).await?);
         let preparation_queue = Arc::new(Q::new(&config.pipelines, PREPARATION_QUEUE_KEY).await?);
@@ -815,6 +877,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         let mut storage = S::new(&config).await?;
         storage.set_configuration(&uuid, &config).await?;
         storage.set_ptms(&uuid, &ptms).await?;
+        storage.set_comet_config(&uuid, &comet_config).await?;
 
         let storage = Arc::new(storage);
 
@@ -838,6 +901,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             finished_goodness_and_rescoring: Arc::new(AtomicUsize::new(0)),
             finished_cleanups: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    pub fn get_uuid(&self) -> &str {
+        &self.uuid
     }
 
     /// Run the pipeline for each mzML file
@@ -1388,6 +1455,18 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 return;
                             }
                         };
+                        current_comet_config = match storage.get_comet_config(&manifest.uuid).await
+                        {
+                            Ok(Some(config)) => Some(config),
+                            Ok(None) => {
+                                error!("Comet configuration not found for {}", manifest.uuid);
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("Error reading Comet configuration: {:?}", e);
+                                continue;
+                            }
+                        };
                         current_ptms = match storage.get_ptms(&manifest.uuid).await {
                             Ok(ptms) => match ptms {
                                 Some(ptms) => Some(ptms),
@@ -1404,26 +1483,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         last_search_uuid = manifest.uuid.clone();
 
                         let config = current_config.as_ref().unwrap();
-                        let ptms = current_ptms.as_ref().unwrap();
-
-                        let mut comet_config = match CometConfiguration::new(
-                            &config.comet.default_comet_params_file_path,
-                        ) {
-                            Ok(config) => config,
-                            Err(e) => {
-                                error!("Error reading Comet configuration: {:?}", e);
-                                return;
-                            }
-                        };
-
-                        match comet_config.set_ptms(&ptms, config.search.max_variable_modifications)
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!("Error setting PTMs: {:?}", e);
-                                return;
-                            }
-                        }
+                        let comet_config = current_comet_config.as_mut().unwrap();
 
                         match comet_config
                             .set_option("threads", &format!("{}", config.comet.threads))
@@ -1434,26 +1494,6 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 return;
                             }
                         }
-
-                        match comet_config.set_num_results(10000) {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!("Error setting number of results: {:?}", e);
-                                return;
-                            }
-                        }
-
-                        match comet_config
-                            .set_max_variable_mods(config.search.max_variable_modifications)
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!("Error setting max variable modifications: {:?}", e);
-                                return;
-                            }
-                        }
-
-                        current_comet_config = Some(comet_config);
                     }
 
                     // Unwrap the current configuration

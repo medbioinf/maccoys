@@ -4,13 +4,14 @@ use std::fs::{read_to_string, write as write_file};
 use std::path::{Path, PathBuf};
 
 // 3rd party imports
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dihardts_omicstools::mass_spectrometry::spectrum::Spectrum as SpectrumTrait;
 use dihardts_omicstools::proteomics::io::mzml::reader::Spectrum;
 use dihardts_omicstools::proteomics::io::mzml::{
     index::Index, indexed_reader::IndexedReader, indexer::Indexer, reader::Reader as MzmlReader,
 };
+use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use indicatif::ProgressStyle;
 use maccoys::pipeline::{
@@ -26,17 +27,23 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::{create_search_space, post_process};
+use maccoys::io::comet::configuration::Configuration as CometConfiguration;
 use maccoys::web::server::start as start_web_server;
 
 #[derive(Debug, Subcommand)]
 enum PipelineCommand {
     /// Prints a new condition to stdout
     NewConfig {},
-    /// Runs the full pipline locally. Queuing is done in memory, unless the `piplines.redis_url` is set in the configuration (Redis + local run should only be used for testing).
+    /// Runs the full pipline locally.
     ///
     LocalRun {
+        /// PTM file path
+        #[arg(short, long)]
+        ptms_file: Option<PathBuf>,
         /// Path to the configuration file
         config: PathBuf,
+        /// Default comet params
+        default_comet_params_file: PathBuf,
         /// Paths to mzML files
         /// Glob patterns are allowed. e.g. /path/to/**/*.mzML, put them in quotes if your shell expands them.
         #[arg(value_delimiter = ' ', num_args = 0..)]
@@ -294,23 +301,39 @@ async fn main() -> Result<()> {
                 println!("{}", toml::to_string_pretty(&new_config)?);
             }
             PipelineCommand::LocalRun {
+                ptms_file,
                 config,
+                default_comet_params_file,
                 mzml_file_paths,
             } => {
                 let config: PipelineConfiguration =
                     toml::from_str(&read_to_string(&config).context("Reading config file")?)
                         .context("Deserialize config")?;
 
+                let mut ptms: Vec<PostTranslationalModification> = Vec::new();
+                if let Some(ptms_file) = &ptms_file {
+                    ptms = PtmReader::read(Path::new(ptms_file))?;
+                }
+
+                let comet_config = match CometConfiguration::try_from(&default_comet_params_file) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        bail!("Error reading Comet configuration: {:?}", e);
+                    }
+                };
+
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
                 if config.pipelines.redis_url.is_none() {
                     info!("Running local pipeline");
                     let pipline: Pipeline<LocalPipelineQueue, LocalPipelineStorage> =
-                        Pipeline::new(config).await?;
+                        Pipeline::new(config, comet_config, ptms).await?;
+                    info!("UUID: {}", pipline.get_uuid());
                     pipline.run(mzml_file_paths).await?;
                 } else {
                     info!("Running redis pipeline");
                     let pipline: Pipeline<RedisPipelineQueue, RedisPipelineStorage> =
-                        Pipeline::new(config).await?;
+                        Pipeline::new(config, comet_config, ptms).await?;
+                    info!("UUID: {}", pipline.get_uuid());
                     pipline.run(mzml_file_paths).await?;
                 }
             }

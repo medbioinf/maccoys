@@ -1,7 +1,7 @@
 // std import
 use std::collections::HashSet;
 use std::fs::{read_to_string, write as write_to_file};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // 3rd party imports
 use anyhow::{bail, Result};
@@ -17,7 +17,7 @@ use crate::constants::FASTA_DECOY_ENTRY_PREFIX;
 
 /// Crate for handling comet configuration files.
 ///
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct Configuration {
     content: String,
     num_variable_modifications: u8,
@@ -27,9 +27,9 @@ pub struct Configuration {
 }
 
 impl Configuration {
-    pub fn new(default_comet_file_path: &Path) -> Result<Self> {
+    pub fn new(content: String) -> Result<Self> {
         let mut conf = Self {
-            content: read_to_string(default_comet_file_path)?,
+            content,
             num_variable_modifications: 0,
             used_static_modifications: HashSet::with_capacity(
                 CANONICAL_AMINO_ACIDS.len() + NON_CANONICAL_AMINO_ACIDS.len(),
@@ -287,13 +287,23 @@ impl Configuration {
     }
 }
 
+impl TryFrom<&PathBuf> for Configuration {
+    type Error = anyhow::Error;
+
+    fn try_from(path: &PathBuf) -> Result<Self> {
+        let content = read_to_string(path)?;
+        Ok(Self::new(content)?)
+    }
+}
+
 #[cfg(test)]
 mod test {
     #[test]
     fn test_configuration() {
         use super::*;
 
-        let conf = Configuration::new(Path::new("test_files/comet.params")).unwrap();
+        let conf =
+            Configuration::try_from(&Path::new("test_files/comet.params").to_path_buf()).unwrap();
         let expected_content =
             read_to_string(Path::new("test_files/expected.comet.params")).unwrap();
         let conf_split = conf.content.split("\n").collect::<Vec<&str>>();

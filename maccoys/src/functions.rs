@@ -239,7 +239,8 @@ pub async fn search_preparation(
                 bail!("Extracted spectrum is not a MS2 spectrum");
             }
         };
-    let mut comet_config = CometConfiguration::new(Path::new(&default_comet_file_path))?;
+    let mut comet_config =
+        CometConfiguration::try_from(&Path::new(default_comet_file_path).to_path_buf())?;
 
     // Set general information
     comet_config.set_mass_tolerance(max(lower_mass_tolerance_ppm, upper_mass_tolerance_ppm))?;
