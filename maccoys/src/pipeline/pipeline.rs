@@ -89,17 +89,14 @@ pub struct SearchManifest {
     /// Precursors for the spectrum (mz, charge)
     pub precursors: Option<Vec<(f64, Vec<u8>)>>,
 
-    /// Path to the fasta file
-    pub fasta_file_path: Option<PathBuf>,
+    /// Flag indicating if the search space has been generated
+    pub is_search_space_generated: bool,
 
-    /// Path to the Comet params file
-    pub comet_params_file_path: Option<PathBuf>,
+    /// Flag indicating if the Comet search has been performed
+    pub is_comet_search_done: bool,
 
-    /// Path to the PSM file
-    pub psm_file_path: Option<PathBuf>,
-
-    /// Godness file path
-    pub goodness_file_path: Option<PathBuf>,
+    /// Flag indicating if the goodness and rescoring has been performed
+    pub is_goodness_and_rescoring_done: bool,
 }
 
 impl SearchManifest {
@@ -123,11 +120,48 @@ impl SearchManifest {
             spectrum_work_dir: None,
             spectrum_mzml_path: None,
             precursors: None,
-            fasta_file_path: None,
-            comet_params_file_path: None,
-            psm_file_path: None,
-            goodness_file_path: None,
+            is_search_space_generated: false,
+            is_comet_search_done: false,
+            is_goodness_and_rescoring_done: false,
         }
+    }
+
+    pub fn get_fasta_file_path(&self, precursor_mz: f64, precursor_charge: u8) -> Option<PathBuf> {
+        if self.spectrum_work_dir.is_none() {
+            return None;
+        }
+        Some(
+            self.spectrum_work_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("{}_{}.fasta", precursor_mz, precursor_charge)),
+        )
+    }
+
+    pub fn get_comet_params_path(
+        &self,
+        precursor_mz: f64,
+        precursor_charge: u8,
+    ) -> Option<PathBuf> {
+        if self.spectrum_work_dir.is_none() {
+            return None;
+        }
+        Some(self.spectrum_work_dir.as_ref().unwrap().join(format!(
+            "{}_{}.comet.params",
+            precursor_mz, precursor_charge
+        )))
+    }
+
+    pub fn get_psms_file_path(&self, precursor_mz: f64, precursor_charge: u8) -> Option<PathBuf> {
+        if self.spectrum_work_dir.is_none() {
+            return None;
+        }
+        Some(
+            self.spectrum_work_dir
+                .as_ref()
+                .unwrap()
+                .join(format!("{}_{}.tsv", precursor_mz, precursor_charge)),
+        )
     }
 }
 
@@ -959,7 +993,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             let mut current_comet_config: Option<CometConfiguration> = None;
 
             loop {
-                while let Some(manifest) = search_space_generation_queue.pop().await {
+                while let Some(mut manifest) = search_space_generation_queue.pop().await {
                     debug!(
                         "Generating search space for {}",
                         manifest.spectrum_id.as_ref().unwrap()
@@ -1033,30 +1067,44 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                     let ptms = current_ptms.as_ref().unwrap();
                     let comet_config = current_comet_config.as_mut().unwrap();
 
+                    // set default charges if none are provided
+                    for (_, precursor_charges) in manifest.precursors.as_mut().unwrap().iter_mut() {
+                        if precursor_charges.is_empty() {
+                            for charge in 2..=config.search.max_charge {
+                                precursor_charges.push(charge);
+                            }
+                        }
+                    }
+
                     for (precursor_mz, precursor_charges) in
                         manifest.precursors.as_ref().unwrap().iter()
                     {
-                        let precursor_charges = if precursor_charges.is_empty() {
-                            (2..=config.search.max_charge).collect()
-                        } else {
-                            precursor_charges.clone()
-                        };
                         for precursor_charge in precursor_charges {
-                            let fasta_file_path = manifest
-                                .spectrum_work_dir
-                                .as_ref()
-                                .unwrap()
-                                .join(format!("{}.fasta", precursor_charge));
-                            let comet_params_file_path = manifest
-                                .spectrum_work_dir
-                                .as_ref()
-                                .unwrap()
-                                .join(format!("{}.comet.params", precursor_charge));
+                            let fasta_file_path = match manifest
+                                .get_fasta_file_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("Fasta file path is None");
+                                    continue;
+                                }
+                            };
+
+                            let comet_params_file_path = match manifest
+                                .get_comet_params_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("Comet params file path is None");
+                                    continue;
+                                }
+                            };
+
                             let mass = mass_to_int(mass_to_charge_to_dalton(
                                 *precursor_mz,
-                                precursor_charge,
+                                *precursor_charge,
                             ));
-                            match comet_config.set_charge(precursor_charge) {
+                            match comet_config.set_charge(*precursor_charge) {
                                 Ok(_) => (),
                                 Err(e) => {
                                     error!("Error setting charge: {:?}", e);
@@ -1094,21 +1142,18 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 }
                             };
 
-                            let mut new_manifest = manifest.clone();
-                            new_manifest.fasta_file_path = Some(fasta_file_path);
-                            new_manifest.comet_params_file_path =
-                                Some(comet_params_file_path.clone());
-                            loop {
-                                new_manifest = match comet_search_queue.push(new_manifest).await {
-                                    Ok(_) => break,
-                                    Err(e) => {
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(100))
-                                            .await;
-                                        e
-                                    }
-                                }
-                            }
                             finishes_search_spaces.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    manifest.is_search_space_generated = true;
+                    loop {
+                        manifest = match comet_search_queue.push(manifest).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                e
+                            }
                         }
                     }
                 }
@@ -1148,52 +1193,82 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         error!("Spectrum mzML is None in comet_search_thread");
                         continue;
                     }
-                    if manifest.fasta_file_path.is_none() {
-                        error!("Fasta file path is None in comet_search_thread");
-                        continue;
-                    }
-                    if manifest.comet_params_file_path.is_none() {
-                        error!("Comet params file path is None in comet_search_thread");
+                    if !manifest.is_search_space_generated {
+                        error!("Search spaces it not generated in comet_search_thread");
                         continue;
                     }
 
-                    manifest.psm_file_path = Some(
-                        manifest
-                            .fasta_file_path
-                            .as_ref()
-                            .unwrap()
-                            .with_extension("txt"),
-                    );
-
-                    match run_comet_search(
-                        &comet_exe,
-                        &manifest.comet_params_file_path.as_ref().unwrap(),
-                        &manifest.fasta_file_path.as_ref().unwrap(),
-                        &manifest.psm_file_path.as_ref().unwrap().with_extension(""),
-                        manifest.spectrum_mzml_path.as_ref().unwrap(),
-                    )
-                    .await
+                    for (precursor_mz, precursor_charges) in
+                        manifest.precursors.as_ref().unwrap().iter()
                     {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Error running Comet search: {:?}", e);
-                            continue;
+                        for precursor_charge in precursor_charges {
+                            let fasta_file_path = match manifest
+                                .get_fasta_file_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("Fasta file path is None");
+                                    continue;
+                                }
+                            };
+
+                            let comet_params_file_path = match manifest
+                                .get_comet_params_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("Comet params file path is None");
+                                    continue;
+                                }
+                            };
+
+                            let psms_file_path = match manifest
+                                .get_psms_file_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("PSM file path is None");
+                                    continue;
+                                }
+                            };
+
+                            match run_comet_search(
+                                &comet_exe,
+                                &comet_params_file_path,
+                                &fasta_file_path,
+                                &psms_file_path.with_extension(""),
+                                manifest.spectrum_mzml_path.as_ref().unwrap(),
+                            )
+                            .await
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!("Error running Comet search: {:?}", e);
+                                    continue;
+                                }
+                            }
+
+                            match fs::rename(&psms_file_path.with_extension("txt"), &psms_file_path)
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!("Error renaming PSM file: {:?}", e);
+                                    continue;
+                                }
+                            }
+
+                            debug!("Comet search done for {}", psms_file_path.display());
                         }
                     }
 
-                    debug!(
-                        "Comet search done for {}",
-                        manifest.psm_file_path.as_ref().unwrap().display()
-                    );
-
-                    match goodness_and_rescoreing_queue.push(manifest).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "Error pushing manifest to FDR queue: {}",
-                                e.spectrum_id.as_ref().unwrap()
-                            );
-                            continue;
+                    manifest.is_comet_search_done = true;
+                    loop {
+                        manifest = match goodness_and_rescoreing_queue.push(manifest).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                e
+                            }
                         }
                     }
                     finished_searches.fetch_add(1, Ordering::Relaxed);
@@ -1223,40 +1298,45 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         manifest.spectrum_id.as_ref().unwrap()
                     );
 
-                    if manifest.psm_file_path.is_none() {
-                        error!("PSM file path is None in goodness_and_rescoring_thread");
+                    if !manifest.is_comet_search_done {
+                        error!("Comet search not finished in goodness_and_rescoring_thread");
                         continue;
                     }
 
-                    let goodness_file_path = manifest
-                        .psm_file_path
-                        .as_ref()
-                        .unwrap()
-                        .with_extension("goodness");
-
-                    match post_process(
-                        manifest.psm_file_path.as_ref().unwrap(),
-                        &goodness_file_path,
-                    )
-                    .await
+                    for (precursor_mz, precursor_charges) in
+                        manifest.precursors.as_ref().unwrap().iter()
                     {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Error post processing: {:?}", e);
-                            continue;
+                        for precursor_charge in precursor_charges {
+                            let psms_file_path = match manifest
+                                .get_psms_file_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("PSM file path is None");
+                                    continue;
+                                }
+                            };
+
+                            let goodness_file_path = psms_file_path.with_extension("goodness.tsv");
+
+                            match post_process(&psms_file_path, &goodness_file_path).await {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!("Error post processing: {:?}", e);
+                                    continue;
+                                }
+                            }
                         }
                     }
 
-                    manifest.goodness_file_path = Some(goodness_file_path);
-
-                    match cleanup_queue.push(manifest).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "Error pushing manifest to FDR queue: {}",
-                                e.spectrum_id.as_ref().unwrap()
-                            );
-                            continue;
+                    manifest.is_goodness_and_rescoring_done = true;
+                    loop {
+                        manifest = match cleanup_queue.push(manifest).await {
+                            Ok(_) => break,
+                            Err(e) => {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                e
+                            }
                         }
                     }
                     finished_goodness_and_rescoring.fetch_add(1, Ordering::Relaxed);
@@ -1295,8 +1375,8 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         manifest.spectrum_id.as_ref().unwrap()
                     );
 
-                    if !manifest.fasta_file_path.is_some() {
-                        error!("Fasta file path is None in cleanup_task");
+                    if !manifest.is_goodness_and_rescoring_done {
+                        error!("Goodness and rescoing is not done in cleanup_task");
                         continue;
                     }
 
@@ -1320,19 +1400,57 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                     // Unwrap the current configuration
                     let config = current_config.as_ref().unwrap();
 
-                    if !config.general.keep_fasta_files {
-                        match tokio::fs::remove_file(manifest.fasta_file_path.as_ref().unwrap())
-                            .await
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!("Error removing fasta file: {}", e);
+                    // Delete the mzML file
+                    match tokio::fs::remove_file(manifest.spectrum_mzml_path.as_ref().unwrap())
+                        .await
+                    {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!("Error removing mzML: {}", e);
+                        }
+                    }
+
+                    for (precursor_mz, precursor_charges) in
+                        manifest.precursors.as_ref().unwrap().iter()
+                    {
+                        for precursor_charge in precursor_charges {
+                            if !config.general.keep_fasta_files {
+                                let psms_file_path = match manifest
+                                    .get_psms_file_path(*precursor_mz, *precursor_charge)
+                                {
+                                    Some(path) => path,
+                                    None => {
+                                        error!("PSM file path is None");
+                                        continue;
+                                    }
+                                };
+
+                                match tokio::fs::remove_file(psms_file_path).await {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!("Error removing fasta file: {}", e);
+                                    }
+                                }
+                            }
+
+                            let comet_params_path = match manifest
+                                .get_comet_params_path(*precursor_mz, *precursor_charge)
+                            {
+                                Some(path) => path,
+                                None => {
+                                    error!("PSM file path is None");
+                                    continue;
+                                }
+                            };
+
+                            match tokio::fs::remove_file(comet_params_path).await {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!("Error removing Comet params file: {}", e);
+                                }
                             }
                         }
                     }
-                    tokio::fs::remove_file(manifest.comet_params_file_path.as_ref().unwrap())
-                        .await
-                        .unwrap();
 
                     finished_cleanups.fetch_add(1, Ordering::Relaxed);
 

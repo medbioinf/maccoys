@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
 use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::{
@@ -205,7 +205,7 @@ impl SearchSpaceGenerator {
                 }
             }
             Client::HttpClient(ref client) => {
-                let mut peptide_stream = client
+                let response = client
                     .post(http_url.as_str())
                     .header("Connection", "close")
                     .header("Accept", "text/plain")
@@ -214,18 +214,14 @@ impl SearchSpaceGenerator {
                         "lower_mass_tolerance_ppm": lower_mass_tolerance_ppm,
                         "upper_mass_tolerance_ppm": upper_mass_tolerance_ppm,
                         "max_variable_modifications": max_variable_modifications,
-                        "modifications": ptms.iter().map(|ptm|
-                            (
-                                *ptm.get_amino_acid().get_code(),
-                                *ptm.get_mass_delta(),
-                                ptm.get_mod_type().to_string(),
-                                ptm.get_position().to_string()
-                            )
-                        ).collect::<Vec<(char, f64, String, String)>>(),
+                        "modifications": ptms
                     }))
                     .send()
-                    .await?
-                    .bytes_stream();
+                    .await?;
+                if !response.status().is_success() {
+                    bail!("Failed to fetch peptides: {}", response.text().await?);
+                }
+                let mut peptide_stream = response.bytes_stream();
                 let mut buffer = Vec::with_capacity(1024);
                 while let Some(chunk) = peptide_stream.next().await {
                     chunk?.iter().for_each(|byte| buffer.push(*byte));
