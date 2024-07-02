@@ -14,10 +14,9 @@ use dihardts_omicstools::proteomics::io::mzml::{
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::{
-    LocalPipelineQueue, LocalPipelineStorage, Pipeline, PipelineConfiguration, RedisPipelineQueue,
-    RedisPipelineStorage,
-};
+use maccoys::pipeline::configuration::PipelineConfiguration;
+use maccoys::pipeline::pipeline::{LocalPipelineQueue, Pipeline, RedisPipelineQueue};
+use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -49,6 +48,12 @@ enum PipelineCommand {
         #[arg(value_delimiter = ' ', num_args = 0..)]
         mzml_file_paths: Vec<String>,
     },
+    // /// Runs the index task separatly
+    // ///
+    // IndexTask {
+    //     /// Path to the configuration file
+    //     config: PathBuf,
+    // },
 }
 
 #[derive(Debug, Parser)]
