@@ -170,6 +170,9 @@ async fn main() -> Result<()> {
         _ => Level::TRACE,
     };
 
+    let file_appender = tracing_appender::rolling::never("./", "maccoys.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
     let filter = EnvFilter::from_default_env()
         .add_directive(verbosity.into())
         .add_directive("scylla=info".parse().unwrap())
@@ -306,7 +309,9 @@ async fn main() -> Result<()> {
                 println!("{}", toml::to_string_pretty(&new_config)?);
             }
             PipelineCommand::LocalRun {
+                use_redis,
                 ptms_file,
+                work_dir,
                 config,
                 default_comet_params_file,
                 mzml_file_paths,
@@ -328,9 +333,10 @@ async fn main() -> Result<()> {
                 };
 
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
-                if config.pipelines.redis_url.is_none() {
+                if !use_redis {
                     info!("Running local pipeline");
                     Pipeline::<LocalPipelineQueue, LocalPipelineStorage>::run_locally(
+                        work_dir,
                         config,
                         comet_config,
                         ptms,
@@ -340,6 +346,7 @@ async fn main() -> Result<()> {
                 } else {
                     info!("Running redis pipeline");
                     Pipeline::<RedisPipelineQueue, RedisPipelineStorage>::run_locally(
+                        work_dir,
                         config,
                         comet_config,
                         ptms,

@@ -34,24 +34,22 @@ use macpepdb::{
     },
 };
 use rustis::commands::ListCommands;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 // local imports
 use crate::{
     functions::{
-        create_search_space, create_spectrum_workdir, create_work_dir, post_process,
-        run_comet_search, sanatize_string,
+        create_search_space, create_work_dir, post_process, run_comet_search, sanatize_string,
     },
     io::comet::configuration::Configuration as CometConfiguration,
-    pipeline::configuration::{
-        CLEANUP_QUEUE_KEY, COMET_SEARCH_QUEUE_KEY, GOODNESS_AND_RESCORING_QUEUE_KEY,
-        INDEX_QUEUE_KEY, PREPARATION_QUEUE_KEY, SEARCH_SPACE_GENERATION_QUEUE_KEY,
-    },
 };
 
 use super::{
-    configuration::{PipelineConfiguration, PipelineQueueConfiguration},
+    configuration::{
+        CometSearchTaskConfiguration, PipelineConfiguration, SearchParameters,
+        SearchSpaceGenerationTaskConfiguration, TaskConfiguration,
+    },
     storage::PipelineStorage,
 };
 
@@ -68,26 +66,26 @@ pub struct SearchManifest {
     /// Search UUID
     pub uuid: String,
 
-    /// Work directory where on folder per MS run is created
-    pub work_dir: PathBuf,
+    /// MS run path
+    pub ms_run_name: String,
 
     /// Path to the original mzML file containing the MS run
     pub ms_run_mzml_path: PathBuf,
 
     /// Spectrum ID of the spectrum to be searched
-    pub spectrum_id: Option<String>,
+    pub spectrum_id: String,
 
     /// mzML with the spectrum to be searched
-    pub spectrum_mzml: Option<Vec<u8>>,
-
-    /// Workdir for the spectrum
-    pub spectrum_work_dir: Option<PathBuf>,
-
-    /// Path to the spectrum mzML
-    pub spectrum_mzml_path: Option<PathBuf>,
+    pub spectrum_mzml: Vec<u8>,
 
     /// Precursors for the spectrum (mz, charge)
-    pub precursors: Option<Vec<(f64, Vec<u8>)>>,
+    pub precursors: Vec<(f64, Vec<u8>)>,
+
+    /// Flag indicating if the indexing has been done
+    pub is_indexing_done: bool,
+
+    /// Flag indicating if the preparation has been done
+    pub is_preparation_done: bool,
 
     /// Flag indicating if the search space has been generated
     pub is_search_space_generated: bool,
@@ -106,62 +104,122 @@ impl SearchManifest {
     /// * `work_dir` - Work directory where on folder per MS run is created
     /// * `ms_run_mzml_path` - Path to the original mzML file containing the MS run
     ///
-    pub fn new(uuid: String, work_dir: PathBuf, ms_run_mzml_path: PathBuf) -> Self {
-        let sanitized_mzml_stem =
-            sanatize_string(ms_run_mzml_path.file_stem().unwrap().to_str().unwrap());
-        let work_dir = work_dir.join(sanitized_mzml_stem);
+    pub fn new(uuid: String, ms_run_mzml_path: PathBuf) -> Self {
+        let ms_run_name = sanatize_string(ms_run_mzml_path.file_stem().unwrap().to_str().unwrap());
 
         Self {
             uuid,
-            work_dir,
+            ms_run_name,
             ms_run_mzml_path,
-            spectrum_id: None,
-            spectrum_mzml: None,
-            spectrum_work_dir: None,
-            spectrum_mzml_path: None,
-            precursors: None,
-            is_search_space_generated: false,
-            is_comet_search_done: false,
-            is_goodness_and_rescoring_done: false,
+            spectrum_id: String::new(),
+            spectrum_mzml: Vec::new(),
+            precursors: Vec::new(),
+            is_indexing_done: true,
+            is_preparation_done: true,
+            is_search_space_generated: true,
+            is_comet_search_done: true,
+            is_goodness_and_rescoring_done: true,
         }
     }
 
-    pub fn get_fasta_file_path(&self, precursor_mz: f64, precursor_charge: u8) -> Option<PathBuf> {
-        if self.spectrum_work_dir.is_none() {
-            return None;
-        }
-        Some(
-            self.spectrum_work_dir
-                .as_ref()
-                .unwrap()
-                .join(format!("{}_{}.fasta", precursor_mz, precursor_charge)),
-        )
+    /// Returns the path to the MS run directory
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_ms_run_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
+        work_dir.join(&self.ms_run_name)
     }
 
-    pub fn get_comet_params_path(
+    /// Retuns the path of the spectrum directory wihtin the MS run directory
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_spectrum_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
+        self.get_ms_run_dir_path(work_dir)
+            .join(sanatize_string(&self.spectrum_id))
+    }
+
+    /// Retuns the path of the spectrum mzML
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_spectrum_mzml_path(&self, work_dir: &PathBuf) -> PathBuf {
+        self.get_spectrum_dir_path(work_dir).join("spectrum.mzML")
+    }
+
+    /// Returns the path to the fasta file for the spectrum's precursor
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `precursor_mz` - Precursor mass to charge ratio
+    /// * `precursor_charge` - Precursor charge
+    ///
+    pub fn get_fasta_file_path(
         &self,
+        work_dir: &PathBuf,
         precursor_mz: f64,
         precursor_charge: u8,
-    ) -> Option<PathBuf> {
-        if self.spectrum_work_dir.is_none() {
-            return None;
-        }
-        Some(self.spectrum_work_dir.as_ref().unwrap().join(format!(
-            "{}_{}.comet.params",
-            precursor_mz, precursor_charge
-        )))
+    ) -> PathBuf {
+        self.get_spectrum_dir_path(work_dir)
+            .join(format!("{}_{}.fasta", precursor_mz, precursor_charge))
     }
 
-    pub fn get_psms_file_path(&self, precursor_mz: f64, precursor_charge: u8) -> Option<PathBuf> {
-        if self.spectrum_work_dir.is_none() {
-            return None;
-        }
-        Some(
-            self.spectrum_work_dir
-                .as_ref()
-                .unwrap()
-                .join(format!("{}_{}.tsv", precursor_mz, precursor_charge)),
-        )
+    /// Returns the path to the Comet parameter file for the spectrum's precursor
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `precursor_mz` - Precursor mass to charge ratio
+    /// * `precursor_charge` - Precursor charge
+    ///
+    pub fn get_comet_params_path(
+        &self,
+        work_dir: &PathBuf,
+        precursor_mz: f64,
+        precursor_charge: u8,
+    ) -> PathBuf {
+        self.get_spectrum_dir_path(work_dir)
+            .join(format!("{}_{}.comet.param", precursor_mz, precursor_charge))
+    }
+
+    /// Returns the path to the PSM file for the spectrum's precursor
+    /// This alredy has the TSV file extension while Comet writes it with the extension .txt
+    /// It is renamed after the search
+    ///
+    /// # Argumentss
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `precursor_mz` - Precursor mass to charge ratio
+    /// * `precursor_charge` - Precursor charge
+    ///
+    pub fn get_psms_file_path(
+        &self,
+        work_dir: &PathBuf,
+        precursor_mz: f64,
+        precursor_charge: u8,
+    ) -> PathBuf {
+        self.get_spectrum_dir_path(work_dir)
+            .join(format!("{}_{}.tsv", precursor_mz, precursor_charge))
+    }
+
+    /// Returns the path to the goodness TSV file for the spectrum's precursor
+    ///
+    /// # Argumentss
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `precursor_mz` - Precursor mass to charge ratio
+    /// * `precursor_charge` - Precursor charge
+    ///
+    pub fn get_goodness_file_path(
+        &self,
+        work_dir: &PathBuf,
+        precursor_mz: f64,
+        precursor_charge: u8,
+    ) -> PathBuf {
+        self.get_spectrum_dir_path(work_dir).join(format!(
+            "{}_{}.goodness.tsv",
+            precursor_mz, precursor_charge
+        ))
     }
 }
 
@@ -169,10 +227,7 @@ impl SearchManifest {
 ///
 pub trait PipelineQueue: Send + Sync + Sized {
     /// Create a new pipeline queue
-    fn new(
-        config: &PipelineQueueConfiguration,
-        queue_key: &str,
-    ) -> impl Future<Output = Result<Self>> + Send;
+    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send;
 
     fn get_capacity(&self) -> usize;
 
@@ -205,29 +260,21 @@ pub struct LocalPipelineQueue {
     queue: Queue<SearchManifest>,
 
     /// Capacity of the queue
-    size: usize,
+    capacity: usize,
 }
 
 impl PipelineQueue for LocalPipelineQueue {
-    fn new(
-        config: &PipelineQueueConfiguration,
-        queue_key: &str,
-    ) -> impl Future<Output = Result<Self>> + Send {
+    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send {
         async {
-            let capacity = match config.capacities.get(queue_key) {
-                Some(capacity) => *capacity,
-                None => config.default_capacity,
-            };
-
             Ok(Self {
-                queue: Queue::new(capacity),
-                size: capacity,
+                queue: Queue::new(config.queue_capacity),
+                capacity: config.queue_capacity,
             })
         }
     }
 
     fn get_capacity(&self) -> usize {
-        self.size
+        self.capacity
     }
 
     fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
@@ -265,22 +312,13 @@ pub struct RedisPipelineQueue {
 }
 
 impl PipelineQueue for RedisPipelineQueue {
-    fn new(
-        config: &PipelineQueueConfiguration,
-        queue_key: &str,
-    ) -> impl Future<Output = Result<Self>> + Send {
+    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send {
         async move {
             if config.redis_url.is_none() {
                 bail!("Redis URL is None")
             }
-            let capacity = match config.capacities.get(queue_key) {
-                Some(capacity) => *capacity,
-                None => config.default_capacity,
-            };
-            let queue_name = match config.redis_queue_names.get(queue_key) {
-                Some(queue_name) => queue_name.to_string(),
-                None => queue_key.to_string(),
-            };
+
+            trace!("Storages: {:?} / {}", &config.redis_url, &config.queue_name);
 
             let mut redis_client_config =
                 rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())?;
@@ -293,8 +331,8 @@ impl PipelineQueue for RedisPipelineQueue {
                 .context("Error opening connection to Redis")?;
             Ok(Self {
                 client,
-                queue_name,
-                capacity,
+                queue_name: config.queue_name.clone(),
+                capacity: config.queue_capacity,
             })
         }
     }
@@ -432,12 +470,14 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// Run the pipeline locally for each mzML file
     ///
     /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
     /// * `config` - Configuration for the pipeline
     /// * `comet_config` - Configuration for Comet
     /// * `ptms` - Post translational modifications
     /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
     pub async fn run_locally(
+        work_dir: PathBuf,
         config: PipelineConfiguration,
         mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
@@ -446,27 +486,28 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
 
-        create_work_dir(&config.general.work_dir).await?;
+        create_work_dir(&work_dir).await?;
 
-        comet_config.set_ptms(&ptms, config.search.max_variable_modifications)?;
+        comet_config.set_ptms(&ptms, config.search_parameters.max_variable_modifications)?;
         comet_config.set_num_results(10000)?;
 
-        let mut storage = S::new(&config).await?;
-        storage.set_configuration(&uuid, &config).await?;
+        let mut storage = S::new(&config.storage).await?;
+        storage
+            .set_search_parameters(&uuid, config.search_parameters.clone())
+            .await?;
         storage.set_ptms(&uuid, &ptms).await?;
         storage.set_comet_config(&uuid, &comet_config).await?;
 
         let storage = Arc::new(storage);
 
         // Create the queues
-        let index_queue = Arc::new(Q::new(&config.pipelines, INDEX_QUEUE_KEY).await?);
-        let preparation_queue = Arc::new(Q::new(&config.pipelines, PREPARATION_QUEUE_KEY).await?);
+        let index_queue = Arc::new(Q::new(&config.index).await?);
+        let preparation_queue = Arc::new(Q::new(&config.preparation).await?);
         let search_space_generation_queue =
-            Arc::new(Q::new(&config.pipelines, SEARCH_SPACE_GENERATION_QUEUE_KEY).await?);
-        let comet_search_queue = Arc::new(Q::new(&config.pipelines, COMET_SEARCH_QUEUE_KEY).await?);
-        let goodness_and_rescoreing_queue =
-            Arc::new(Q::new(&config.pipelines, GOODNESS_AND_RESCORING_QUEUE_KEY).await?);
-        let cleanup_queue = Arc::new(Q::new(&config.pipelines, CLEANUP_QUEUE_KEY).await?);
+            Arc::new(Q::new(&config.search_space_generation).await?);
+        let comet_search_queue = Arc::new(Q::new(&config.comet_search).await?);
+        let goodness_and_rescoreing_queue = Arc::new(Q::new(&config.goodness_and_rescoring).await?);
+        let cleanup_queue = Arc::new(Q::new(&config.cleanup).await?);
 
         // Create the stop flags
         let index_stop_flag = Arc::new(AtomicBool::new(false));
@@ -492,7 +533,14 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 preparation_queue.clone().into(),
                 index_queue.clone().into(),
             ],
-            vec![100, 100, 100, 100, 100, 100],
+            vec![
+                config.cleanup.queue_capacity as u64,
+                config.goodness_and_rescoring.queue_capacity as u64,
+                config.comet_search.queue_capacity as u64,
+                config.search_space_generation.queue_capacity as u64,
+                config.preparation.queue_capacity as u64,
+                config.index.queue_capacity as u64,
+            ],
             vec![
                 "Cleanup".to_owned(),
                 "Goodness and Rescoring".to_owned(),
@@ -523,114 +571,92 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         )?;
 
         let index_handler: tokio::task::JoinHandle<()> = {
-            let index_queue = index_queue.clone();
-            let preparation_queue = preparation_queue.clone();
-            let stop_flag = index_stop_flag.clone();
             tokio::spawn(Self::indexing_task(
+                work_dir.clone(),
                 index_queue.clone(),
-                preparation_queue,
-                stop_flag,
+                preparation_queue.clone(),
+                index_stop_flag.clone(),
             ))
         };
 
         let preparation_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.general.num_preparation_tasks)
+            (0..config.preparation.num_tasks)
                 .into_iter()
                 .map(|_| {
-                    let preparation_queue = preparation_queue.clone();
-                    let search_space_generation_queue = search_space_generation_queue.clone();
-                    let stop_flag = preparation_stop_flag.clone();
                     tokio::spawn(Self::preparation_task(
-                        preparation_queue,
-                        search_space_generation_queue,
-                        stop_flag,
+                        work_dir.clone(),
+                        preparation_queue.clone(),
+                        search_space_generation_queue.clone(),
+                        preparation_stop_flag.clone(),
                     ))
                 })
                 .collect();
 
         let search_space_generation_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.general.num_search_space_generation_tasks)
+            (0..config.search_space_generation.num_tasks)
                 .into_iter()
                 .map(|_| {
-                    let search_space_generation_queue = search_space_generation_queue.clone();
-                    let comet_search_queue = comet_search_queue.clone();
-                    let stop_flag = search_space_generation_stop_flag.clone();
-                    let finished_search_spaces = finished_search_spaces.clone();
                     tokio::spawn(Self::search_space_generation_task(
-                        search_space_generation_queue,
-                        comet_search_queue,
+                        work_dir.clone(),
+                        Arc::new(config.search_space_generation.clone()),
+                        search_space_generation_queue.clone(),
+                        comet_search_queue.clone(),
                         storage.clone(),
-                        stop_flag,
-                        finished_search_spaces,
+                        search_space_generation_stop_flag.clone(),
+                        finished_search_spaces.clone(),
                     ))
                 })
                 .collect();
 
         let comet_search_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.general.num_comet_search_tasks)
+            (0..config.comet_search.num_tasks)
                 .into_iter()
                 .map(|_| {
-                    let comet_search_queue = comet_search_queue.clone();
-                    let goodness_and_rescoreing_queue = goodness_and_rescoreing_queue.clone();
-                    let comet_exe = config.comet.comet_exe_path.clone();
-                    let stop_flag = comet_search_stop_flag.clone();
-                    let finished_searches = finished_searches.clone();
                     tokio::spawn(Self::comet_search_task(
-                        comet_search_queue,
-                        goodness_and_rescoreing_queue,
-                        comet_exe,
-                        stop_flag,
-                        finished_searches,
+                        work_dir.clone(),
+                        Arc::new(config.comet_search.clone()),
+                        storage.clone(),
+                        comet_search_queue.clone(),
+                        goodness_and_rescoreing_queue.clone(),
+                        comet_search_stop_flag.clone(),
+                        finished_searches.clone(),
                     ))
                 })
                 .collect();
 
         let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.general.num_goodness_and_rescoring_tasks)
+            (0..config.goodness_and_rescoring.num_tasks)
                 .into_iter()
                 .map(|_| {
-                    let goodness_and_rescoreing_queue = goodness_and_rescoreing_queue.clone();
-                    let cleanup_queue = cleanup_queue.clone();
-                    let stop_flag = goodness_and_rescoreing_stop_flag.clone();
-                    let finished_goodness_and_rescoring = finished_goodness_and_rescoring.clone();
                     tokio::spawn(Self::goodness_and_rescoring_task(
-                        goodness_and_rescoreing_queue,
-                        cleanup_queue,
-                        stop_flag,
-                        finished_goodness_and_rescoring,
+                        work_dir.clone(),
+                        goodness_and_rescoreing_queue.clone(),
+                        cleanup_queue.clone(),
+                        goodness_and_rescoreing_stop_flag.clone(),
+                        finished_goodness_and_rescoring.clone(),
                     ))
                 })
                 .collect();
 
-        let cleanup_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.general.num_cleanup_tasks)
-                .into_iter()
-                .map(|_| {
-                    let cleanup_queue = cleanup_queue.clone();
-                    let finished_cleanups = finished_cleanups.clone();
-                    let stop_flag = cleanup_stop_flag.clone();
-                    tokio::spawn(Self::cleanup_task(
-                        cleanup_queue,
-                        finished_cleanups,
-                        storage.clone(),
-                        stop_flag,
-                    ))
-                })
-                .collect();
+        let cleanup_handlers: Vec<tokio::task::JoinHandle<()>> = (0..config.cleanup.num_tasks)
+            .into_iter()
+            .map(|_| {
+                tokio::spawn(Self::cleanup_task(
+                    work_dir.clone(),
+                    cleanup_queue.clone(),
+                    finished_cleanups.clone(),
+                    storage.clone(),
+                    cleanup_stop_flag.clone(),
+                ))
+            })
+            .collect();
 
         for mzml_file_path in mzml_file_paths {
-            let manifest = SearchManifest::new(
-                uuid.clone(),
-                config.general.work_dir.clone(),
-                mzml_file_path,
-            );
+            let manifest = SearchManifest::new(uuid.clone(), mzml_file_path);
             match index_queue.push(manifest).await {
                 Ok(_) => (),
                 Err(e) => {
-                    error!(
-                        "Error pushing manifest to index queue: {}",
-                        e.ms_run_mzml_path.display()
-                    );
+                    error!("[{}] Error pushing manifest to index queue.", &e.uuid);
                     continue;
                 }
             }
@@ -709,8 +735,8 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 bail!("Error unwrapping storage");
             }
         };
+        storage.remove_search_params(&uuid).await?;
         storage.remove_comet_config(&uuid).await?;
-        storage.remove_configuration(&uuid).await?;
         storage.remove_ptms(&uuid).await?;
 
         Ok(())
@@ -719,21 +745,25 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// Task to index and split up the mzML file
     ///
     /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
     /// * `index_queue` - Queue for the indexing task
     /// * `preparation_queue` - Queue for the preparation task
     /// * `stop_flag` - Flag to indicate to stop once the index queue is empty
     ///
     pub async fn indexing_task(
+        work_dir: PathBuf,
         index_queue: Arc<Q>,
         preparation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
     ) {
         loop {
             while let Some(manifest) = index_queue.pop().await {
-                match fs::create_dir_all(manifest.work_dir.clone()) {
+                let ms_run_dir_path = manifest.get_ms_run_dir_path(&work_dir);
+
+                match fs::create_dir_all(&ms_run_dir_path) {
                     Ok(_) => (),
                     Err(e) => {
-                        error!("Error creating work directory: {}", e);
+                        error!("[{}] Error creating work directory: {}", &manifest.uuid, e);
                         continue;
                     }
                 }
@@ -741,33 +771,33 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 let index = match Indexer::create_index(&manifest.ms_run_mzml_path, None) {
                     Ok(index) => index,
                     Err(e) => {
-                        error!("Error creating index: {:?}", e);
+                        error!("[{}] Error creating index: {:?}", &manifest.uuid, e);
                         continue;
                     }
                 };
 
-                let index_file_path = manifest.work_dir.join("index.json");
+                let index_file_path = ms_run_dir_path.join("index.json");
                 debug!("Writing index to: {}", index_file_path.display());
                 let index_json = match index.to_json() {
                     Ok(json) => json,
                     Err(e) => {
-                        error!("Error serializing index: {:?}", e);
+                        error!("[{}] Error serializing index: {:?}", &manifest.uuid, e);
                         continue;
                     }
                 };
                 match std::fs::write(&index_file_path, index_json) {
                     Ok(_) => (),
                     Err(e) => {
-                        error!("Error writing index: {:?}", e);
+                        error!("[{}] Error writing index: {:?}", &manifest.uuid, e);
                         continue;
                     }
                 };
 
-                let uuid_path = manifest.work_dir.join("uuid.txt");
-                match std::fs::write(&uuid_path, &manifest.uuid) {
+                let uuid_path = ms_run_dir_path.join("uuid.txt");
+                match tokio::fs::write(&uuid_path, &manifest.uuid).await {
                     Ok(_) => (),
                     Err(e) => {
-                        error!("Error writing uuid: {:?}", e);
+                        error!("[{}] Error writing uuid: {:?}", &manifest.uuid, e);
                         continue;
                     }
                 };
@@ -775,7 +805,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 let mut reader = match IndexedReader::new(&manifest.ms_run_mzml_path, &index) {
                     Ok(reader) => reader,
                     Err(e) => {
-                        error!("Error creating reader: {:?}", e);
+                        error!("[{} /] Error creating reader: {:?}", &manifest.uuid, e);
                         continue;
                     }
                 };
@@ -784,14 +814,15 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                     let mzml = match reader.extract_spectrum(&spec_id) {
                         Ok(content) => content,
                         Err(e) => {
-                            error!("Error extracting spectrum: {:?}", e);
+                            error!("[{}] Error extracting spectrum: {:?}", &manifest.uuid, e);
                             continue;
                         }
                     };
 
                     let mut new_manifest = manifest.clone();
-                    new_manifest.spectrum_id = Some(spec_id.clone());
-                    new_manifest.spectrum_mzml = Some(mzml);
+                    new_manifest.spectrum_id = spec_id.clone();
+                    new_manifest.spectrum_mzml = mzml;
+                    new_manifest.is_indexing_done = true;
 
                     loop {
                         new_manifest = match preparation_queue.push(new_manifest).await {
@@ -815,11 +846,13 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// Task to prepare the spectra work directories for the search space generation and search.
     ///
     /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
     /// * `preparation_queue` - Queue for the preparation task
     /// * `search_space_generation_queue` - Queue for the search space generation task
     /// * `stop_flag` - Flag to indicate to stop once the preparation queue is empty
     ///
     fn preparation_task(
+        work_dir: PathBuf,
         preparation_queue: Arc<Q>,
         search_space_generation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
@@ -827,57 +860,73 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         async move {
             loop {
                 while let Some(mut manifest) = preparation_queue.pop().await {
-                    debug!("Preparing {}", manifest.spectrum_id.as_ref().unwrap());
-                    if manifest.spectrum_id.is_none() {
-                        error!("Spectrum ID is None in spectra_dir_creation_thread");
+                    debug!("[{} / {}] Preparing", &manifest.uuid, &manifest.spectrum_id);
+
+                    if manifest.spectrum_id.is_empty() {
+                        error!(
+                            "[{} / {}] Spectrum ID is empty in spectra_dir_creation_thread",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                         continue;
                     }
-                    if manifest.spectrum_mzml.is_none() {
-                        error!("Spectrum mzML is None in spectra_dir_creation_thread");
+
+                    if manifest.spectrum_mzml.is_empty() {
+                        error!(
+                            "[{} / {}] Spectrum mzML is empty in spectra_dir_creation_thread",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
+                        continue;
+                    }
+
+                    if !manifest.is_indexing_done {
+                        error!(
+                            "[{} / {}] Indexing not done in spectra_dir_creation_thread",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                         continue;
                     }
 
                     let start = match manifest
                         .spectrum_mzml
-                        .as_ref()
-                        .unwrap()
                         .windows(SPECTRUM_START_TAG.len())
                         .position(|window| window == SPECTRUM_START_TAG)
                     {
                         Some(start) => start,
                         None => {
                             error!(
-                                "No spectrum start in {}",
-                                manifest.spectrum_id.as_ref().unwrap()
+                                "[{} / {}] No spectrum start",
+                                &manifest.uuid, &manifest.spectrum_id
                             );
                             continue;
                         }
                     };
+
                     let stop = match manifest
                         .spectrum_mzml
-                        .as_ref()
-                        .unwrap()
                         .windows(SPECTRUM_STOP_TAG.len())
                         .position(|window| window == SPECTRUM_STOP_TAG)
                     {
                         Some(start) => start,
                         None => {
                             error!(
-                                "No spectrum stop in {}",
-                                manifest.spectrum_id.as_ref().unwrap()
+                                "[{} / {}] No spectrum stop",
+                                &manifest.uuid, &manifest.spectrum_id
                             );
                             continue;
                         }
                     };
 
-                    let spectrum_xml = &manifest.spectrum_mzml.as_ref().unwrap()[start..stop];
+                    let spectrum_xml = &manifest.spectrum_mzml[start..stop];
 
                     // As this mzML is already reduced to the spectrum of interest, we can parse it directly
                     // using MzMlReader::parse_spectrum_xml
                     let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_xml) {
                         Ok(spectrum) => spectrum,
                         Err(e) => {
-                            error!("Error parsing spectrum: {:?}", e);
+                            error!(
+                                "[{} / {}] Error parsing spectrum: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
                             continue;
                         }
                     };
@@ -886,14 +935,23 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         Spectrum::MsNSpectrum(spectrum) => spectrum,
                         _ => {
                             // Ignore MS1
-                            info!("Ignoring MS1 spectrum");
+                            trace!(
+                                "[{} / {}] Ignoring MS1 spectrum",
+                                &manifest.uuid,
+                                &manifest.spectrum_id
+                            );
                             continue;
                         }
                     };
 
                     // Ignore MS3 and higher
                     if spectrum.get_ms_level() != 2 {
-                        info!("Ignoring MS{} spectrum", spectrum.get_ms_level());
+                        trace!(
+                            "[{} / {}] Ignoring MS{} spectrum",
+                            &manifest.uuid,
+                            &manifest.spectrum_id,
+                            spectrum.get_ms_level()
+                        );
                         continue;
                     }
 
@@ -913,42 +971,35 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
 
                     drop(spectrum);
 
-                    let spectrum_work_dir = match create_spectrum_workdir(
-                        &manifest.work_dir,
-                        manifest.spectrum_id.as_ref().unwrap(),
-                    )
-                    .await
-                    {
-                        Ok(path) => path,
-                        Err(e) => {
-                            error!("Error creating spectrum work directory: {}", e);
-                            continue;
-                        }
-                    };
+                    let spectrum_dir_path = manifest.get_spectrum_dir_path(&work_dir);
 
-                    let spectrum_mzml_path = spectrum_work_dir.join("spectrum.mzML");
-
-                    match tokio::fs::write(
-                        &spectrum_mzml_path,
-                        manifest.spectrum_mzml.as_ref().unwrap(),
-                    )
-                    .await
-                    {
+                    match fs::create_dir_all(&spectrum_dir_path) {
                         Ok(_) => (),
                         Err(e) => {
                             error!(
-                                "Error writing spectrum.mzML for {}: {}",
-                                manifest.spectrum_id.as_ref().unwrap(),
-                                e
+                                "[{} / {}] Error creating spectrum directory: {}",
+                                &manifest.uuid, manifest.spectrum_id, e
                             );
                             continue;
                         }
                     }
 
-                    manifest.spectrum_work_dir = Some(spectrum_work_dir);
-                    manifest.spectrum_mzml = None; // Free up some memory
-                    manifest.precursors = Some(precursors);
-                    manifest.spectrum_mzml_path = Some(spectrum_mzml_path);
+                    let spectrum_mzml_path = manifest.get_spectrum_mzml_path(&work_dir);
+
+                    match tokio::fs::write(&spectrum_mzml_path, &manifest.spectrum_mzml).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error writing single spectrum: {}",
+                                &manifest.uuid, manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    }
+
+                    manifest.spectrum_mzml = Vec::with_capacity(0); // Free up some memory
+                    manifest.precursors = precursors;
+                    manifest.is_preparation_done = true;
 
                     loop {
                         manifest = match search_space_generation_queue.push(manifest).await {
@@ -974,175 +1025,127 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// Task to generate the search space for the Comet search
     ///
     /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `config` - Configuration for the search space generation task
     /// * `search_space_generation_queue` - Queue for the search space generation task
     /// * `comet_search_queue` - Queue for the Comet search task
     /// * `storage` - Storage to access configuration and PTMs
     /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
     ///
     fn search_space_generation_task(
+        work_dir: PathBuf,
+        config: Arc<SearchSpaceGenerationTaskConfiguration>,
         search_space_generation_queue: Arc<Q>,
         comet_search_queue: Arc<Q>,
         storage: Arc<S>,
         stop_flag: Arc<AtomicBool>,
-        finishes_search_spaces: Arc<AtomicUsize>,
+        finished_search_spaces: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut last_search_uuid = String::new();
-            let mut current_config: Option<PipelineConfiguration> = None;
-            let mut current_ptms: Option<Vec<PostTranslationalModification>> = None;
-            let mut current_comet_config: Option<CometConfiguration> = None;
+            let mut current_search_params = SearchParameters::new();
+            let mut current_ptms: Vec<PostTranslationalModification> = Vec::new();
 
             loop {
                 while let Some(mut manifest) = search_space_generation_queue.pop().await {
                     debug!(
-                        "Generating search space for {}",
-                        manifest.spectrum_id.as_ref().unwrap()
+                        "[{} / {}] Generating search space",
+                        &manifest.uuid, &manifest.spectrum_id
                     );
-                    if manifest.spectrum_work_dir.is_none() {
-                        error!("Spectrum work directory is None in search_space_generation_thread");
-                        continue;
-                    }
-                    if manifest.precursors.is_none() {
-                        error!("Precursors is None in search_space_generation_thread");
+                    if !manifest.is_preparation_done {
+                        error!(
+                            "[{} / {}] Prepartion not done in search_space_generation_task",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                         continue;
                     }
 
                     if last_search_uuid != manifest.uuid {
-                        current_config = match storage.get_configuration(&manifest.uuid).await {
-                            Ok(config) => match config {
-                                Some(config) => Some(config),
-                                None => {
-                                    error!("Configuration not found for {}", manifest.uuid);
+                        current_search_params =
+                            match storage.get_search_parameters(&manifest.uuid).await {
+                                Ok(Some(params)) => params,
+                                Ok(None) => {
+                                    error!(
+                                        "[{} / {}] Search params not found",
+                                        manifest.uuid, manifest.spectrum_id
+                                    );
                                     continue;
                                 }
-                            },
-                            Err(e) => {
-                                error!("Error reading configuration: {:?}", e);
-                                return;
-                            }
-                        };
-                        current_comet_config = match storage.get_comet_config(&manifest.uuid).await
-                        {
-                            Ok(Some(config)) => Some(config),
-                            Ok(None) => {
-                                error!("Comet configuration not found for {}", manifest.uuid);
-                                continue;
-                            }
-                            Err(e) => {
-                                error!("Error reading Comet configuration: {:?}", e);
-                                continue;
-                            }
-                        };
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error getting search params from storage: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            };
+
                         current_ptms = match storage.get_ptms(&manifest.uuid).await {
-                            Ok(ptms) => match ptms {
-                                Some(ptms) => Some(ptms),
-                                None => {
-                                    error!("PTMs not found for {}", manifest.uuid);
-                                    continue;
-                                }
-                            },
+                            Ok(Some(ptms)) => ptms,
+                            Ok(None) => {
+                                error!(
+                                    "[{} / {}] PTMs not found",
+                                    manifest.uuid, manifest.spectrum_id
+                                );
+                                continue;
+                            }
                             Err(e) => {
-                                error!("Error reading PTMs: {:?}", e);
+                                error!(
+                                    "[{} / {}] Error getting PTMs from storage: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
                                 return;
                             }
                         };
                         last_search_uuid = manifest.uuid.clone();
-
-                        let config = current_config.as_ref().unwrap();
-                        let comet_config = current_comet_config.as_mut().unwrap();
-
-                        match comet_config
-                            .set_option("threads", &format!("{}", config.comet.threads))
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!("Error setting threads: {:?}", e);
-                                return;
-                            }
-                        }
                     }
-
-                    // Unwrap the current configuration
-                    let config = current_config.as_ref().unwrap();
-                    let ptms = current_ptms.as_ref().unwrap();
-                    let comet_config = current_comet_config.as_mut().unwrap();
 
                     // set default charges if none are provided
-                    for (_, precursor_charges) in manifest.precursors.as_mut().unwrap().iter_mut() {
+                    for (_, precursor_charges) in manifest.precursors.iter_mut() {
                         if precursor_charges.is_empty() {
-                            for charge in 2..=config.search.max_charge {
-                                precursor_charges.push(charge);
-                            }
+                            precursor_charges.extend(2..=current_search_params.max_charge);
                         }
                     }
 
-                    for (precursor_mz, precursor_charges) in
-                        manifest.precursors.as_ref().unwrap().iter()
-                    {
+                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
                         for precursor_charge in precursor_charges {
-                            let fasta_file_path = match manifest
-                                .get_fasta_file_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("Fasta file path is None");
-                                    continue;
-                                }
-                            };
-
-                            let comet_params_file_path = match manifest
-                                .get_comet_params_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("Comet params file path is None");
-                                    continue;
-                                }
-                            };
+                            let fasta_file_path = manifest.get_fasta_file_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
 
                             let mass = mass_to_int(mass_to_charge_to_dalton(
                                 *precursor_mz,
                                 *precursor_charge,
                             ));
-                            match comet_config.set_charge(*precursor_charge) {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!("Error setting charge: {:?}", e);
-                                    continue;
-                                }
-                            }
-
-                            match comet_config.async_to_file(&comet_params_file_path).await {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!("Error writing Comet params file: {:?}", e);
-                                    continue;
-                                }
-                            }
 
                             match create_search_space(
                                 &fasta_file_path,
-                                ptms.as_ref(),
+                                &current_ptms,
                                 mass,
-                                config.search.lower_mass_tolerance_ppm,
-                                config.search.upper_mass_tolerance_ppm,
-                                config.search.max_variable_modifications,
-                                config.search.decoys_per_peptide,
-                                config.search.target_url.to_owned(),
-                                config.search.decoy_url.clone(),
-                                config.search.target_lookup_url.clone(),
-                                config.search.decoy_cache_url.clone(),
+                                current_search_params.lower_mass_tolerance_ppm,
+                                current_search_params.upper_mass_tolerance_ppm,
+                                current_search_params.max_variable_modifications,
+                                current_search_params.decoys_per_peptide,
+                                config.target_url.to_owned(),
+                                config.decoy_url.clone(),
+                                config.target_lookup_url.clone(),
+                                config.decoy_cache_url.clone(),
                             )
                             .await
                             {
                                 Ok(_) => (),
                                 Err(e) => {
-                                    error!("Error creating search space: {:?}", e);
+                                    error!(
+                                        "[{} / {}] Error creating search space: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
                                     continue;
                                 }
                             };
 
-                            finishes_search_spaces.fetch_add(1, Ordering::Relaxed);
+                            finished_search_spaces.fetch_add(1, Ordering::Relaxed);
                         }
                     }
 
@@ -1169,75 +1172,130 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// Task to run the Comet search
     ///
     /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `config` - Configuration for the Comet search task
+    /// * `storage` - Storage to access params and PTMs
     /// * `comet_search_queue` - Queue for the Comet search task
     /// * `goodness_and_rescoreing_queue` - Goodness and rescoreing queue
-    /// * `comet_exe` - Path to the Comet executable
     /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
     ///
     fn comet_search_task(
+        work_dir: PathBuf,
+        config: Arc<CometSearchTaskConfiguration>,
+        storage: Arc<S>,
         comet_search_queue: Arc<Q>,
         goodness_and_rescoreing_queue: Arc<Q>,
-        comet_exe: PathBuf,
         stop_flag: Arc<AtomicBool>,
         finished_searches: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
+            let mut last_search_uuid = String::new();
+            let mut current_comet_config: Option<CometConfiguration> = None;
+
             loop {
                 while let Some(mut manifest) = comet_search_queue.pop().await {
                     debug!(
-                        "Running Comet search for {}",
-                        manifest.spectrum_id.as_ref().unwrap()
+                        "[{} / {}] Running Comet search",
+                        &manifest.uuid, &manifest.spectrum_id
                     );
 
-                    if manifest.spectrum_mzml_path.is_none() {
-                        error!("Spectrum mzML is None in comet_search_thread");
-                        continue;
-                    }
                     if !manifest.is_search_space_generated {
-                        error!("Search spaces it not generated in comet_search_thread");
+                        error!(
+                            "[{} / {}] Search space not generated in `comet_search_task`",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                         continue;
                     }
 
-                    for (precursor_mz, precursor_charges) in
-                        manifest.precursors.as_ref().unwrap().iter()
-                    {
+                    if last_search_uuid != manifest.uuid {
+                        current_comet_config = match storage.get_comet_config(&manifest.uuid).await
+                        {
+                            Ok(Some(config)) => Some(config),
+                            Ok(None) => {
+                                error!(
+                                    "[{} / {}] Comet config not found",
+                                    &manifest.uuid, &manifest.spectrum_id
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error getting comet config from storage: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        match current_comet_config
+                            .as_mut()
+                            .unwrap()
+                            .set_option("threads", &format!("{}", config.threads))
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error setting threads in Comet configuration: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        last_search_uuid = manifest.uuid.clone();
+                    }
+
+                    // Unwrap the current Comet configuration for easier access
+                    let comet_config = current_comet_config.as_mut().unwrap();
+
+                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
                         for precursor_charge in precursor_charges {
-                            let fasta_file_path = match manifest
-                                .get_fasta_file_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("Fasta file path is None");
-                                    continue;
-                                }
-                            };
+                            let fasta_file_path = manifest.get_fasta_file_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
 
-                            let comet_params_file_path = match manifest
-                                .get_comet_params_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("Comet params file path is None");
-                                    continue;
-                                }
-                            };
+                            let psms_file_path = manifest.get_psms_file_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
 
-                            let psms_file_path = match manifest
-                                .get_psms_file_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("PSM file path is None");
+                            let comet_params_file_path = manifest.get_comet_params_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
+
+                            match comet_config.set_charge(*precursor_charge) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error setting charge: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
                                     continue;
                                 }
-                            };
+                            }
+
+                            match comet_config.async_to_file(&comet_params_file_path).await {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error writing Comet params: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
 
                             match run_comet_search(
-                                &comet_exe,
+                                &config.comet_exe_path,
                                 &comet_params_file_path,
                                 &fasta_file_path,
                                 &psms_file_path.with_extension(""),
-                                manifest.spectrum_mzml_path.as_ref().unwrap(),
+                                &manifest.get_spectrum_mzml_path(&work_dir),
                             )
                             .await
                             {
@@ -1248,7 +1306,11 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 }
                             }
 
-                            match fs::rename(&psms_file_path.with_extension("txt"), &psms_file_path)
+                            match tokio::fs::rename(
+                                &psms_file_path.with_extension("txt"),
+                                &psms_file_path,
+                            )
+                            .await
                             {
                                 Ok(_) => (),
                                 Err(e) => {
@@ -1257,7 +1319,12 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 }
                             }
 
-                            debug!("Comet search done for {}", psms_file_path.display());
+                            debug!(
+                                "[{} / {}] Comet search done for {}",
+                                &manifest.uuid,
+                                &manifest.spectrum_id,
+                                psms_file_path.display()
+                            );
                         }
                     }
 
@@ -1282,9 +1349,8 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         }
     }
 
-    // fn fdr_task()
-
     fn goodness_and_rescoring_task(
+        work_dir: PathBuf,
         goodness_and_rescoreing_queue: Arc<Q>,
         cleanup_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
@@ -1294,30 +1360,31 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             loop {
                 while let Some(mut manifest) = goodness_and_rescoreing_queue.pop().await {
                     debug!(
-                        "Goodness and rescoring {}",
-                        manifest.spectrum_id.as_ref().unwrap()
+                        "[{} / {}] Goodness and rescoring",
+                        &manifest.uuid, &manifest.spectrum_id
                     );
 
                     if !manifest.is_comet_search_done {
-                        error!("Comet search not finished in goodness_and_rescoring_thread");
+                        error!(
+                            "[{} / {}] Comet search not finished in goodness_and_rescoring_thread",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                         continue;
                     }
 
-                    for (precursor_mz, precursor_charges) in
-                        manifest.precursors.as_ref().unwrap().iter()
-                    {
+                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
                         for precursor_charge in precursor_charges {
-                            let psms_file_path = match manifest
-                                .get_psms_file_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("PSM file path is None");
-                                    continue;
-                                }
-                            };
+                            let psms_file_path = manifest.get_psms_file_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
 
-                            let goodness_file_path = psms_file_path.with_extension("goodness.tsv");
+                            let goodness_file_path = manifest.get_goodness_file_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
 
                             match post_process(&psms_file_path, &goodness_file_path).await {
                                 Ok(_) => (),
@@ -1359,6 +1426,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
     ///
     fn cleanup_task(
+        work_dir: PathBuf,
         cleanup_queue: Arc<Q>,
         finished_cleanups: Arc<AtomicUsize>,
         storage: Arc<S>,
@@ -1367,86 +1435,97 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         async move {
             loop {
                 let mut last_search_uuid = String::new();
-                let mut current_config: Option<PipelineConfiguration> = None;
+                let mut current_search_params = SearchParameters::new();
 
                 while let Some(manifest) = cleanup_queue.pop().await {
                     debug!(
-                        "Running cleanup for {}",
-                        manifest.spectrum_id.as_ref().unwrap()
+                        "[{} / {}] Running cleanup",
+                        &manifest.uuid, &manifest.spectrum_id
                     );
 
                     if !manifest.is_goodness_and_rescoring_done {
-                        error!("Goodness and rescoing is not done in cleanup_task");
+                        error!(
+                            "[{} / {}] Goodness and rescoing is not done in cleanup_task",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                         continue;
                     }
 
                     if last_search_uuid != manifest.uuid {
-                        current_config = match storage.get_configuration(&manifest.uuid).await {
-                            Ok(config) => match config {
-                                Some(config) => Some(config),
-                                None => {
-                                    error!("Configuration not found for {}", manifest.uuid);
+                        trace!(
+                            "[cleanup_task] Loading data from storage (UUIDs: old => {}, new=> {})",
+                            &last_search_uuid,
+                            &manifest.uuid
+                        );
+                        current_search_params =
+                            match storage.get_search_parameters(&manifest.uuid).await {
+                                Ok(Some(params)) => params,
+                                Ok(None) => {
+                                    error!(
+                                        "[{} / {}] Search params not found`",
+                                        manifest.uuid, manifest.spectrum_id
+                                    );
                                     continue;
                                 }
-                            },
-                            Err(e) => {
-                                error!("Error reading configuration: {:?}", e);
-                                return;
-                            }
-                        };
-                        last_search_uuid = manifest.uuid.clone();
-                    }
-
-                    // Unwrap the current configuration
-                    let config = current_config.as_ref().unwrap();
-
-                    // Delete the mzML file
-                    match tokio::fs::remove_file(manifest.spectrum_mzml_path.as_ref().unwrap())
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Error removing mzML: {}", e);
-                        }
-                    }
-
-                    for (precursor_mz, precursor_charges) in
-                        manifest.precursors.as_ref().unwrap().iter()
-                    {
-                        for precursor_charge in precursor_charges {
-                            if !config.general.keep_fasta_files {
-                                let psms_file_path = match manifest
-                                    .get_psms_file_path(*precursor_mz, *precursor_charge)
-                                {
-                                    Some(path) => path,
-                                    None => {
-                                        error!("PSM file path is None");
-                                        continue;
-                                    }
-                                };
-
-                                match tokio::fs::remove_file(psms_file_path).await {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        error!("Error removing fasta file: {}", e);
-                                    }
-                                }
-                            }
-
-                            let comet_params_path = match manifest
-                                .get_comet_params_path(*precursor_mz, *precursor_charge)
-                            {
-                                Some(path) => path,
-                                None => {
-                                    error!("PSM file path is None");
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error getting search params from storage: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
                                     continue;
                                 }
                             };
+                        last_search_uuid = manifest.uuid.clone();
+                    }
 
-                            match tokio::fs::remove_file(comet_params_path).await {
+                    // Delete the mzML file
+                    match tokio::fs::remove_file(manifest.get_spectrum_mzml_path(&work_dir)).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error removing mzML: {}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
+                        }
+                    }
+
+                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
+                        for precursor_charge in precursor_charges {
+                            if !current_search_params.keep_fasta_files {
+                                let psms_file_path = manifest.get_fasta_file_path(
+                                    &work_dir,
+                                    *precursor_mz,
+                                    *precursor_charge,
+                                );
+                                match tokio::fs::remove_file(&psms_file_path).await {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!(
+                                            "[{} / {}] Error removing fasta file `{}`: {}",
+                                            &manifest.uuid,
+                                            &manifest.spectrum_id,
+                                            psms_file_path.display(),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            let comet_params_path = manifest.get_comet_params_path(
+                                &work_dir,
+                                *precursor_mz,
+                                *precursor_charge,
+                            );
+                            match tokio::fs::remove_file(&comet_params_path).await {
                                 Ok(_) => (),
                                 Err(e) => {
-                                    error!("Error removing Comet params file: {}", e);
+                                    error!(
+                                        "[{} / {}] Error removing Comet params file `{}`: {}",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        comet_params_path.display(),
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -1455,8 +1534,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                     finished_cleanups.fetch_add(1, Ordering::Relaxed);
 
                     debug!(
-                        "Cleanup done for {}",
-                        manifest.spectrum_work_dir.as_ref().unwrap().display()
+                        "[{} / {}] Cleanup done in `{}`",
+                        &manifest.uuid,
+                        &manifest.spectrum_id,
+                        manifest.get_spectrum_dir_path(&work_dir).display()
                     );
                 }
                 if stop_flag.load(Ordering::Relaxed) {

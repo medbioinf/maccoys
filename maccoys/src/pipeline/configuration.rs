@@ -1,5 +1,5 @@
 // std imports
-use std::{collections::HashMap, path::PathBuf};
+use std::{ops::Deref, path::PathBuf};
 
 pub const CLEANUP_QUEUE_KEY: &str = "cleanup";
 pub const GOODNESS_AND_RESCORING_QUEUE_KEY: &str = "goodness_and_rescoring";
@@ -17,44 +17,10 @@ pub const QUEUE_KEYS: [&str; 6] = [
     INDEX_QUEUE_KEY,
 ];
 
-/// Comet configuration
+/// Search paramerter
 ///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct PipelineCometConfiguration {
-    pub comet_exe_path: PathBuf,
-    pub threads: usize,
-}
-
-/// General pipeline configuration
-///
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct PipelineGeneralConfiguration {
-    /// Work directory where on folder per MS run is created
-    pub work_dir: PathBuf,
-
-    /// Number of concurrent preparation tasks
-    pub num_preparation_tasks: usize,
-
-    /// Number of concurrent search space generation tasks
-    pub num_search_space_generation_tasks: usize,
-
-    /// Number of concurrent Comet search tasks
-    pub num_comet_search_tasks: usize,
-
-    /// Number of concurrent goodness and rescoring tasks
-    pub num_goodness_and_rescoring_tasks: usize,
-
-    /// Number of concurrent cleanup tasks
-    pub num_cleanup_tasks: usize,
-
-    /// Keep fasta files after search
-    pub keep_fasta_files: bool,
-}
-
-/// Configuration for the search
-///
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct PipelineSearchConfiguration {
+pub struct SearchParameters {
     /// Maximum charge state to search if charge is not provided by the precursor
     pub max_charge: u8,
 
@@ -70,8 +36,49 @@ pub struct PipelineSearchConfiguration {
     /// Number of decoys per peptide
     pub decoys_per_peptide: usize,
 
-    /// Optional Path to the PTM file
-    pub ptm_file_path: Option<PathBuf>,
+    /// Score threshold, everything above will be discarded
+    pub score_threshold: f64,
+
+    /// If true the FASTA files will be kept
+    pub keep_fasta_files: bool,
+}
+
+impl SearchParameters {
+    /// Create a new default search parameter
+    ///
+    pub fn new() -> Self {
+        Self {
+            max_charge: 6,
+            lower_mass_tolerance_ppm: 10,
+            upper_mass_tolerance_ppm: 10,
+            max_variable_modifications: 3,
+            decoys_per_peptide: 0,
+            score_threshold: 0.1,
+            keep_fasta_files: false,
+        }
+    }
+}
+
+/// General task configuration
+///
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct TaskConfiguration {
+    /// Number of concurrent tasks
+    pub num_tasks: usize,
+    /// Queue name
+    pub queue_name: String,
+    /// Queue capacity
+    pub queue_capacity: usize,
+    /// Optional redis URL if the queue is not local
+    pub redis_url: Option<String>,
+}
+
+/// Configuration for the search
+///
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SearchSpaceGenerationTaskConfiguration {
+    #[serde(flatten)]
+    pub general: TaskConfiguration,
 
     /// URL to the target database
     pub target_url: String,
@@ -86,38 +93,60 @@ pub struct PipelineSearchConfiguration {
     pub decoy_cache_url: Option<String>,
 }
 
-/// Configuration for the queues
+impl Deref for SearchSpaceGenerationTaskConfiguration {
+    type Target = TaskConfiguration;
+
+    fn deref(&self) -> &TaskConfiguration {
+        &self.general
+    }
+}
+
+/// Comet configuration
+///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct PipelineQueueConfiguration {
-    /// Default capacity for the queues
-    pub default_capacity: usize,
+pub struct CometSearchTaskConfiguration {
+    /// General task configuration
+    #[serde(flatten)]
+    pub general: TaskConfiguration,
+    /// Path to comet executable
+    pub comet_exe_path: PathBuf,
+    /// Number of threads to use
+    pub threads: usize,
+}
 
-    /// Capacities for the different queues
-    pub capacities: HashMap<String, usize>,
+impl Deref for CometSearchTaskConfiguration {
+    type Target = TaskConfiguration;
 
-    /// Optional URL to the Redis server
-    pub redis_url: Option<String>,
-
-    /// Optional names for the Redis queues to be used.
-    /// If not set, the queues are named afte the [QUEUE_KEYS]
-    pub redis_queue_names: HashMap<String, String>,
+    fn deref(&self) -> &TaskConfiguration {
+        &self.general
+    }
 }
 
 /// Configuration for the pipeline
 ///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct PipelineConfiguration {
-    /// General pipeline configuration
-    pub general: PipelineGeneralConfiguration,
+    /// Search parameters
+    pub search_parameters: SearchParameters,
+    /// Index task configuration
+    pub index: TaskConfiguration,
+    /// Preparation task configuration
+    pub preparation: TaskConfiguration,
+    /// Search space generation task configuration
+    pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
+    /// Comet search task configuration
+    pub comet_search: CometSearchTaskConfiguration,
+    /// Goodness and rescoring task configuration
+    pub goodness_and_rescoring: TaskConfiguration,
+    /// Cleanup task configuration
+    pub cleanup: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
 
-    /// Search configuration
-    pub search: PipelineSearchConfiguration,
-
-    /// Comet configuration
-    pub comet: PipelineCometConfiguration,
-
-    /// Queue configuration
-    pub pipelines: PipelineQueueConfiguration,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineStorageConfiguration {
+    pub redis_url: Option<String>,
 }
 
 impl PipelineConfiguration {
@@ -125,43 +154,54 @@ impl PipelineConfiguration {
     ///
     pub fn new() -> Self {
         Self {
-            general: PipelineGeneralConfiguration {
-                work_dir: PathBuf::from("./"),
-                num_preparation_tasks: 1,
-                num_search_space_generation_tasks: 1,
-                num_comet_search_tasks: 1,
-                num_goodness_and_rescoring_tasks: 1,
-                num_cleanup_tasks: 1,
-                keep_fasta_files: true,
+            search_parameters: SearchParameters::new(),
+            index: TaskConfiguration {
+                num_tasks: 1,
+                queue_name: INDEX_QUEUE_KEY.to_string(),
+                queue_capacity: 100,
+                redis_url: None,
             },
-            search: PipelineSearchConfiguration {
-                max_charge: 6,
-                lower_mass_tolerance_ppm: 10,
-                upper_mass_tolerance_ppm: 10,
-                max_variable_modifications: 3,
-                decoys_per_peptide: 1,
-                ptm_file_path: Some(PathBuf::from("./ptms.csv")),
-                target_url: "http://127.0.0.1:3000".to_owned(),
+            preparation: TaskConfiguration {
+                num_tasks: 4,
+                queue_name: PREPARATION_QUEUE_KEY.to_string(),
+                queue_capacity: 1000,
+                redis_url: None,
+            },
+            search_space_generation: SearchSpaceGenerationTaskConfiguration {
+                general: TaskConfiguration {
+                    num_tasks: 64,
+                    queue_name: SEARCH_SPACE_GENERATION_QUEUE_KEY.to_string(),
+                    queue_capacity: 100,
+                    redis_url: None,
+                },
+                target_url: "".to_string(),
                 decoy_url: None,
                 target_lookup_url: None,
                 decoy_cache_url: None,
             },
-            comet: PipelineCometConfiguration {
-                threads: 8,
+            comet_search: CometSearchTaskConfiguration {
+                general: TaskConfiguration {
+                    num_tasks: 4,
+                    queue_name: COMET_SEARCH_QUEUE_KEY.to_string(),
+                    queue_capacity: 100,
+                    redis_url: None,
+                },
                 comet_exe_path: PathBuf::from("/usr/local/bin/comet"),
+                threads: 2,
             },
-            pipelines: PipelineQueueConfiguration {
-                default_capacity: 100,
-                capacities: QUEUE_KEYS
-                    .iter()
-                    .map(|key| (key.to_string(), 100))
-                    .collect(),
+            goodness_and_rescoring: TaskConfiguration {
+                num_tasks: 2,
+                queue_name: GOODNESS_AND_RESCORING_QUEUE_KEY.to_string(),
+                queue_capacity: 100,
                 redis_url: None,
-                redis_queue_names: QUEUE_KEYS
-                    .iter()
-                    .map(|key| (key.to_string(), key.to_string()))
-                    .collect(),
             },
+            cleanup: TaskConfiguration {
+                num_tasks: 1,
+                queue_name: CLEANUP_QUEUE_KEY.to_string(),
+                queue_capacity: 100,
+                redis_url: None,
+            },
+            storage: PipelineStorageConfiguration { redis_url: None },
         }
     }
 }

@@ -8,8 +8,9 @@ use futures::Future;
 use rustis::commands::{GenericCommands, StringCommands};
 
 // local imports
-use super::configuration::PipelineConfiguration;
 use crate::io::comet::configuration::Configuration as CometConfiguration;
+
+use super::configuration::{PipelineStorageConfiguration, SearchParameters};
 
 /// Central storage for configuration, PTM etc.
 ///
@@ -19,26 +20,26 @@ pub trait PipelineStorage: Send + Sync + Sized {
     /// # Arguments
     /// * `config` - Configuration for the storage
     ///
-    fn new(config: &PipelineConfiguration) -> impl Future<Output = Result<Self>> + Send;
+    fn new(config: &PipelineStorageConfiguration) -> impl Future<Output = Result<Self>> + Send;
 
-    /// Get the pipeline configuration
+    /// Get the search parameters
     ///
-    fn get_configuration(
+    fn get_search_parameters(
         &self,
         uuid: &str,
-    ) -> impl Future<Output = Result<Option<PipelineConfiguration>>> + Send;
+    ) -> impl Future<Output = Result<Option<SearchParameters>>> + Send;
 
     /// Set the pipeline configuration
     ///
-    fn set_configuration(
+    fn set_search_parameters(
         &mut self,
         uuid: &str,
-        config: &PipelineConfiguration,
+        params: SearchParameters,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Remove the pipeline configuration
     ///
-    fn remove_configuration(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
+    fn remove_search_params(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Get the PTM reader
     ///
@@ -78,8 +79,8 @@ pub trait PipelineStorage: Send + Sync + Sized {
     ///
     fn remove_comet_config(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
 
-    fn get_configuration_key(uuid: &str) -> String {
-        format!("config:{}", uuid)
+    fn get_search_parameters_key(uuid: &str) -> String {
+        format!("search_parameter:{}", uuid)
     }
 
     fn get_ptms_key(uuid: &str) -> String {
@@ -95,7 +96,7 @@ pub trait PipelineStorage: Send + Sync + Sized {
 ///
 pub struct LocalPipelineStorage {
     /// Pipeline configuration
-    configs: HashMap<String, PipelineConfiguration>,
+    search_parameters: HashMap<String, SearchParameters>,
 
     /// Post translational modifications
     ptms_collections: HashMap<String, Vec<PostTranslationalModification>>,
@@ -105,33 +106,30 @@ pub struct LocalPipelineStorage {
 }
 
 impl PipelineStorage for LocalPipelineStorage {
-    async fn new(_config: &PipelineConfiguration) -> Result<Self> {
+    async fn new(_config: &PipelineStorageConfiguration) -> Result<Self> {
         Ok(Self {
-            configs: HashMap::new(),
+            search_parameters: HashMap::new(),
             ptms_collections: HashMap::new(),
             comet_configs: HashMap::new(),
         })
     }
 
-    async fn get_configuration(&self, uuid: &str) -> Result<Option<PipelineConfiguration>> {
+    async fn get_search_parameters(&self, uuid: &str) -> Result<Option<SearchParameters>> {
         Ok(self
-            .configs
-            .get(&Self::get_configuration_key(uuid))
+            .search_parameters
+            .get(&Self::get_search_parameters_key(uuid))
             .cloned())
     }
 
-    async fn set_configuration(
-        &mut self,
-        uuid: &str,
-        config: &PipelineConfiguration,
-    ) -> Result<()> {
-        self.configs
-            .insert(Self::get_configuration_key(uuid), config.clone());
+    async fn set_search_parameters(&mut self, uuid: &str, params: SearchParameters) -> Result<()> {
+        self.search_parameters
+            .insert(Self::get_search_parameters_key(uuid), params);
         Ok(())
     }
 
-    async fn remove_configuration(&mut self, uuid: &str) -> Result<()> {
-        self.configs.remove(&Self::get_configuration_key(uuid));
+    async fn remove_search_params(&mut self, uuid: &str) -> Result<()> {
+        self.search_parameters
+            .remove(&Self::get_search_parameters_key(uuid));
         Ok(())
     }
 
@@ -181,13 +179,13 @@ pub struct RedisPipelineStorage {
 }
 
 impl PipelineStorage for RedisPipelineStorage {
-    async fn new(config: &PipelineConfiguration) -> Result<Self> {
-        if config.pipelines.redis_url.is_none() {
+    async fn new(config: &PipelineStorageConfiguration) -> Result<Self> {
+        if config.redis_url.is_none() {
             bail!("[STORAGE] Redis URL is None")
         }
 
         let mut redis_client_config =
-            rustis::client::Config::from_str(config.pipelines.redis_url.as_ref().unwrap())?;
+            rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())?;
         redis_client_config.retry_on_error = true;
         redis_client_config.reconnection = rustis::client::ReconnectionConfig::new_constant(0, 5);
 
@@ -198,42 +196,38 @@ impl PipelineStorage for RedisPipelineStorage {
         Ok(Self { client })
     }
 
-    async fn get_configuration(&self, uuid: &str) -> Result<Option<PipelineConfiguration>> {
-        let config_json: String = self
+    async fn get_search_parameters(&self, uuid: &str) -> Result<Option<SearchParameters>> {
+        let params_json: String = self
             .client
-            .get(Self::get_configuration_key(uuid))
+            .get(Self::get_search_parameters_key(uuid))
             .await
-            .context("[STORAGE] Error getting configuration")?;
+            .context("[STORAGE] Error getting search params")?;
 
-        if config_json.is_empty() {
+        if params_json.is_empty() {
             return Ok(None);
         }
 
-        let config: PipelineConfiguration = serde_json::from_str(&config_json)
-            .context("[STORAGE] Error deserializing configuration")?;
+        let params: SearchParameters = serde_json::from_str(&params_json)
+            .context("[STORAGE] Error deserializing search params")?;
 
-        Ok(Some(config))
+        Ok(Some(params))
     }
 
-    async fn set_configuration(
-        &mut self,
-        uuid: &str,
-        config: &PipelineConfiguration,
-    ) -> Result<()> {
-        let config_json =
-            serde_json::to_string(config).context("[STORAGE] Error serializing config")?;
+    async fn set_search_parameters(&mut self, uuid: &str, params: SearchParameters) -> Result<()> {
+        let params_json =
+            serde_json::to_string(&params).context("[STORAGE] Error serializing search params")?;
 
         self.client
-            .set(Self::get_configuration_key(uuid), config_json)
+            .set(Self::get_search_parameters_key(uuid), params_json)
             .await
             .context("[STORAGE] Error setting configuration")
     }
 
-    async fn remove_configuration(&mut self, uuid: &str) -> Result<()> {
+    async fn remove_search_params(&mut self, uuid: &str) -> Result<()> {
         self.client
-            .del(Self::get_configuration_key(uuid))
+            .del(Self::get_search_parameters_key(uuid))
             .await
-            .context("[STORAGE] Error removing configuration")?;
+            .context("[STORAGE] Error removing search params")?;
         Ok(())
     }
 
@@ -280,7 +274,7 @@ impl PipelineStorage for RedisPipelineStorage {
             .client
             .get(Self::get_comet_config_key(uuid))
             .await
-            .context("[STORAGE] Error getting PTMs")?;
+            .context("[STORAGE] Error getting Comet configuration")?;
 
         if comet_params_json.is_empty() {
             return Ok(None);
