@@ -1,5 +1,5 @@
 # std imports
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 # 3rd party imports
 import numpy as np
@@ -13,11 +13,11 @@ SIGNIFICANCE_LEVEL_ALPHA: float = 0.05
 """
 
 
-def anderson_darling(x: pd.Series, dist: str) -> Tuple[float, float]:
+def anderson_darling(x: List[float], dist: str) -> Tuple[float, float]:
     """Anderson-Darling test for goodness of fit.
 
     Args:
-        x (pd.Series): Array of values to be tested
+        x (List[float]): Array of values to be tested
         cdf_fn (Callable[[Any], Any]): CDF function to be tested against
 
     Returns:
@@ -42,11 +42,11 @@ def anderson_darling(x: pd.Series, dist: str) -> Tuple[float, float]:
     return (test_res.statistic, pvalue)
 
 
-def kolmogorov_smirnov(x: pd.Series, dist: str) -> Tuple[float, float]:
+def kolmogorov_smirnov(x: List[float], dist: str) -> Tuple[float, float]:
     """Kolmogorov-Smirnov test for goodness of fit.
 
     Args:
-        x (pd.Series): Array of values to be tested
+        x (List[float]): Array of values to be tested
         cdf_fn (Callable[[Any], Any]): CDF function to be tested against
 
     Returns:
@@ -58,11 +58,11 @@ def kolmogorov_smirnov(x: pd.Series, dist: str) -> Tuple[float, float]:
     return (test_res.statistic, test_res.pvalue)
 
 
-def cramer_von_mises(x: pd.Series, dist: str) -> Tuple[float, float]:
+def cramer_von_mises(x: List[float], dist: str) -> Tuple[float, float]:
     """Cramer-von Mises test for goodness of fit.
 
     Args:
-        x (pd.Series): Array of values to be tested
+        x (List[float]): Array of values to be tested
         cdf_fn (Callable[[Any], Any]): CDF function to be tested against
 
     Returns:
@@ -76,11 +76,11 @@ def cramer_von_mises(x: pd.Series, dist: str) -> Tuple[float, float]:
     return (test_res.statistic, test_res.pvalue)
 
 
-def lilliefors(x: pd.Series, dist: str) -> Tuple[float, float]:
+def lilliefors(x: List[float], dist: str) -> Tuple[float, float]:
     """Lilliefors test for goodness of fit.
 
     Args:
-        x (pd.Series): Array of values to be tested
+        x (List[float]): Array of values to be tested
         cdf_fn (Callable[[Any], Any]): CDF function to be tested against
 
     Returns:
@@ -102,7 +102,7 @@ DISTRIBUTIONS: Dict[str, scipy.stats.rv_continuous] = {
 
 
 GOODNESS_OF_FIT_TESTS: Tuple[
-    Tuple[str, List[str], Callable[[pd.Series, str], Tuple[float, float]]], ...
+    Tuple[str, List[str], Callable[[List[float], str], Tuple[float, float]]], ...
 ] = (
     ("Anderson-Darling", ["norm", "expon"], anderson_darling),
     ("Kolmogorov-Smirnov", list(DISTRIBUTIONS.keys()), kolmogorov_smirnov),
@@ -113,34 +113,32 @@ GOODNESS_OF_FIT_TESTS: Tuple[
 """
 
 
-def calc_goodnesses(psms: pd.DataFrame, base_score_col: str) -> pd.DataFrame:
+def calc_goodnesses(scores: List[float]) -> List[Tuple[str, str, float, float]]:
     """
     Calculate goodness of fit for the PSM distirbution
 
     Parameters
     ----------
-    psms : pd.DataFrame
-        PSMs
-    base_score_col : str
-        Score name to use
+    score: List[float]
+        PSMs scores
 
     Returns
     -------
-    pd.DataFrame
-        Goodness of fit values
+    List[Tuple[str, str, float, float]]
+        Test name, distribution name, test statistic, p-value
     """
-    goodnesses: Dict[str, List[Any]] = {"values": ["D", "p-value"]}
-    # If there are no PSMs, return a dataframe with NaNs
-    if psms.empty:
-        for test_name, dist_names, test_fn in GOODNESS_OF_FIT_TESTS:
+    goodnesses = []
+
+    if len(scores) == 0:
+        for test_name, dist_names, _ in GOODNESS_OF_FIT_TESTS:
             for dist_name in dist_names:
-                goodnesses[f"{dist_name}::{test_name}"] = [np.nan, np.nan]
-        return pd.DataFrame(goodnesses)
+                goodnesses.append((test_name, dist_name, np.nan, np.nan))
+        return goodnesses
 
     for test_name, dist_names, test_fn in GOODNESS_OF_FIT_TESTS:
         for dist_name in dist_names:
-            goodness_dist_name = f"{dist_name}::{test_name}"
-            goddness = test_fn(psms[base_score_col], dist_name)
-            goodnesses[goodness_dist_name] = [goddness[0], goddness[1]]
+            goddness = test_fn(scores, dist_name)
+            goodnesses.append((test_name, dist_name, goddness[0], goddness[1]))
 
-    return pd.DataFrame(goodnesses)
+    return goodnesses
+

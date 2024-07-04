@@ -33,16 +33,21 @@ use macpepdb::{
         queue_monitor::{MonitorableQueue, QueueMonitor},
     },
 };
+use polars::prelude::*;
+use pyo3::{prelude::*, types::PyList};
 use rustis::commands::ListCommands;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 // local imports
 use crate::{
-    functions::{
-        create_search_space, create_work_dir, post_process, run_comet_search, sanatize_string,
+    constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
+    functions::{create_search_space, create_work_dir, run_comet_search, sanatize_string},
+    goodness_of_fit_record::GoodnessOfFitRecord,
+    io::comet::{
+        configuration::Configuration as CometConfiguration,
+        peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
     },
-    io::comet::configuration::Configuration as CometConfiguration,
 };
 
 use super::{
@@ -1357,6 +1362,65 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         finished_goodness_and_rescoring: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
+            let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
+            let (to_rust, mut from_python) =
+                tokio::sync::mpsc::channel::<(Vec<GoodnessOfFitRecord>, Vec<f64>, Vec<f64>)>(1);
+
+            let python_handle: std::thread::JoinHandle<Result<()>> =
+                std::thread::spawn(move || {
+                    match Python::with_gil(|py| {
+                        // std imports
+                        let signal = py.import_bound("signal")?;
+                        // maccoys imports
+                        let goodness_of_fit_mod =
+                            PyModule::import_bound(py, "maccoys.goodness_of_fit")?;
+                        let scoring_mod = PyModule::import_bound(py, "maccoys.scoring")?;
+                        // enable CTRL-C
+                        signal
+                            .getattr("signal")?
+                            .call1((signal.getattr("SIGINT")?, signal.getattr("SIG_DFL")?))?;
+
+                        // Load all necessary functions
+                        let calc_goodnesses_fn = goodness_of_fit_mod.getattr("calc_goodnesses")?;
+                        let calculate_exp_score_fn = scoring_mod.getattr("calculate_exp_score")?;
+                        let calculate_distance_score_fn =
+                            scoring_mod.getattr("calculate_distance_score")?;
+
+                        while let Some(psm_scores) = from_rust.blocking_recv() {
+                            // Cast to python list
+                            let psm_scores = PyList::new_bound(py, psm_scores);
+
+                            let goodness_of_fits: Vec<GoodnessOfFitRecord> = calc_goodnesses_fn
+                                .call1((&psm_scores,))?
+                                .extract::<Vec<(String, String, f64, f64)>>()?
+                                .into_iter()
+                                .map(|row| GoodnessOfFitRecord::from(row))
+                                .collect();
+
+                            let exponential_score: Vec<f64> =
+                                calculate_exp_score_fn.call1((&psm_scores,))?.extract()?;
+
+                            let distance_score: Vec<f64> = calculate_distance_score_fn
+                                .call1((&psm_scores,))?
+                                .extract()?;
+
+                            to_rust.blocking_send((
+                                goodness_of_fits,
+                                exponential_score,
+                                distance_score,
+                            ))?;
+                        }
+
+                        Ok::<_, anyhow::Error>(())
+                    }) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!("[PYTHON] Error running Python thread: {:?}", e);
+                        }
+                    }
+                    Ok(())
+                });
+
             loop {
                 while let Some(mut manifest) = goodness_and_rescoreing_queue.pop().await {
                     debug!(
@@ -1386,13 +1450,158 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 *precursor_charge,
                             );
 
-                            match post_process(&psms_file_path, &goodness_file_path).await {
+                            let mut psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
+                                Ok(Some(psms)) => psms,
+                                Ok(None) => {
+                                    error!(
+                                        "[{} / {}] No PSMs found in `{}`",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        psms_file_path.display()
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error reading PSMs from `{}`: {:?}",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        psms_file_path.display(),
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let psms_score_series = match psms.column(COMET_EXP_BASE_SCORE) {
+                                Ok(scores) => scores,
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error selecting scores `{}` from PSMs: {:?}",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        COMET_EXP_BASE_SCORE,
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let psms_score: Vec<f64> = match psms_score_series.f64() {
+                                Ok(scores) => scores
+                                    .to_vec()
+                                    .into_iter()
+                                    .map(|score| score.unwrap_or(-1.0))
+                                    .collect(),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error converting scores to f64: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            match to_python.send(psms_score).await {
                                 Ok(_) => (),
                                 Err(e) => {
-                                    error!("Error post processing: {:?}", e);
+                                    error!(
+                                        "[{} / {}] Error sending scores to Python: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
                                     continue;
                                 }
                             }
+
+                            let (goodness_of_fits, exponential_scores, dist_scores) =
+                                match from_python.recv().await {
+                                    Some(goodness_of_fit) => goodness_of_fit,
+                                    None => {
+                                        error!(
+                                            "[{} / {}] No goodness of fit received from Python",
+                                            &manifest.uuid, &manifest.spectrum_id
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                            let mut writer = match csv::WriterBuilder::new()
+                                .delimiter(b'\t')
+                                .has_headers(true)
+                                .from_path(&goodness_file_path)
+                            {
+                                Ok(writer) => writer,
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error creating CSV writer for `{}`: {:?}",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        goodness_file_path.display(),
+                                        e
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            for goodness_row in goodness_of_fits {
+                                match writer.serialize(goodness_row) {
+                                    Ok(_) => (),
+                                    Err(e) => {
+                                        error!(
+                                            "[{} / {}] Error writing goodness of fit to `{}`: {:?}",
+                                            &manifest.uuid,
+                                            &manifest.spectrum_id,
+                                            goodness_file_path.display(),
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            match psms.with_column(Series::new(EXP_SCORE_NAME, exponential_scores))
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error adding exponential scores to PSMs: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            match psms.with_column(Series::new(DIST_SCORE_NAME, dist_scores)) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error adding distance scores to PSMs: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            match PeptideSpectrumMatchTsv::overwrite(psms, &psms_file_path) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error writing PSMs to `{}`: {:?}",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        psms_file_path.display(),
+                                        e
+                                    );
+                                    continue;
+                                }
+                            }
+
+                            debug!(
+                                "[{} / {}] Goodness and rescoring done for `{}`",
+                                &manifest.uuid,
+                                &manifest.spectrum_id,
+                                goodness_file_path.display()
+                            );
                         }
                     }
 
@@ -1413,6 +1622,13 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 }
                 // wait before checking the queue again
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            }
+            drop(to_python);
+            match python_handle.join() {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Error joining Python thread: {:?}", e);
+                }
             }
         }
     }

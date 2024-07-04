@@ -36,9 +36,15 @@ enum PipelineCommand {
     /// Runs the full pipline locally.
     ///
     LocalRun {
+        /// Use redis, make sure the Redis URL is set in the configs
+        /// (makes only sense for debugging and testing when running locally)
+        #[arg(short, long, default_value = "false")]
+        use_redis: bool,
         /// PTM file path
         #[arg(short, long)]
         ptms_file: Option<PathBuf>,
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
         /// Path to the configuration file
         config: PathBuf,
         /// Default comet params
