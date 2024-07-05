@@ -1453,7 +1453,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                             let mut psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
                                 Ok(Some(psms)) => psms,
                                 Ok(None) => {
-                                    error!(
+                                    info!(
                                         "[{} / {}] No PSMs found in `{}`",
                                         &manifest.uuid,
                                         &manifest.spectrum_id,
