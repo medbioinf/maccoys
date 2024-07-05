@@ -15,7 +15,8 @@ use dihardts_omicstools::proteomics::post_translational_modifications::PostTrans
 use glob::glob;
 use indicatif::ProgressStyle;
 use maccoys::pipeline::configuration::PipelineConfiguration;
-use maccoys::pipeline::pipeline::{LocalPipelineQueue, Pipeline, RedisPipelineQueue};
+use maccoys::pipeline::pipeline::Pipeline;
+use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
 use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;

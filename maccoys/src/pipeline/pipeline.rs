@@ -3,7 +3,6 @@ use std::{
     fs,
     marker::PhantomData,
     path::PathBuf,
-    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -11,8 +10,7 @@ use std::{
 };
 
 // 3rd party imports
-use anyhow::{bail, Context, Result};
-use deadqueue::limited::Queue;
+use anyhow::{bail, Result};
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::{
@@ -25,36 +23,33 @@ use dihardts_omicstools::{
     mass_spectrometry::unit_conversions::mass_to_charge_to_dalton,
     proteomics::post_translational_modifications::PostTranslationalModification,
 };
-use futures::Future;
 use macpepdb::{
     mass::convert::to_int as mass_to_int,
-    tools::{
-        progress_monitor::ProgressMonitor,
-        queue_monitor::{MonitorableQueue, QueueMonitor},
-    },
+    tools::{progress_monitor::ProgressMonitor, queue_monitor::QueueMonitor},
 };
 use polars::prelude::*;
 use pyo3::{prelude::*, types::PyList};
-use rustis::commands::ListCommands;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 // local imports
 use crate::{
     constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
-    functions::{create_search_space, create_work_dir, run_comet_search, sanatize_string},
+    functions::{create_search_space, create_work_dir, run_comet_search},
     goodness_of_fit_record::GoodnessOfFitRecord,
     io::comet::{
         configuration::Configuration as CometConfiguration,
         peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
     },
+    pipeline::{queue::PipelineQueueArc, search_manifest::SearchManifest},
 };
 
 use super::{
     configuration::{
         CometSearchTaskConfiguration, PipelineConfiguration, SearchParameters,
-        SearchSpaceGenerationTaskConfiguration, TaskConfiguration,
+        SearchSpaceGenerationTaskConfiguration,
     },
+    queue::PipelineQueue,
     storage::PipelineStorage,
 };
 
@@ -63,399 +58,6 @@ const SPECTRUM_START_TAG: &'static [u8; 10] = b"<spectrum ";
 
 /// Default stop tag for a spectrum in mzML
 const SPECTRUM_STOP_TAG: &'static [u8; 11] = b"</spectrum>";
-
-/// Manifest for a search, storing the current state of the search
-/// and serving as the message between the different tasks
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct SearchManifest {
-    /// Search UUID
-    pub uuid: String,
-
-    /// MS run path
-    pub ms_run_name: String,
-
-    /// Path to the original mzML file containing the MS run
-    pub ms_run_mzml_path: PathBuf,
-
-    /// Spectrum ID of the spectrum to be searched
-    pub spectrum_id: String,
-
-    /// mzML with the spectrum to be searched
-    pub spectrum_mzml: Vec<u8>,
-
-    /// Precursors for the spectrum (mz, charge)
-    pub precursors: Vec<(f64, Vec<u8>)>,
-
-    /// Flag indicating if the indexing has been done
-    pub is_indexing_done: bool,
-
-    /// Flag indicating if the preparation has been done
-    pub is_preparation_done: bool,
-
-    /// Flag indicating if the search space has been generated
-    pub is_search_space_generated: bool,
-
-    /// Flag indicating if the Comet search has been performed
-    pub is_comet_search_done: bool,
-
-    /// Flag indicating if the goodness and rescoring has been performed
-    pub is_goodness_and_rescoring_done: bool,
-}
-
-impl SearchManifest {
-    /// Create a new search manifest
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where on folder per MS run is created
-    /// * `ms_run_mzml_path` - Path to the original mzML file containing the MS run
-    ///
-    pub fn new(uuid: String, ms_run_mzml_path: PathBuf) -> Self {
-        let ms_run_name = sanatize_string(ms_run_mzml_path.file_stem().unwrap().to_str().unwrap());
-
-        Self {
-            uuid,
-            ms_run_name,
-            ms_run_mzml_path,
-            spectrum_id: String::new(),
-            spectrum_mzml: Vec::new(),
-            precursors: Vec::new(),
-            is_indexing_done: true,
-            is_preparation_done: true,
-            is_search_space_generated: true,
-            is_comet_search_done: true,
-            is_goodness_and_rescoring_done: true,
-        }
-    }
-
-    /// Returns the path to the MS run directory
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    ///
-    pub fn get_ms_run_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
-        work_dir.join(&self.ms_run_name)
-    }
-
-    /// Retuns the path of the spectrum directory wihtin the MS run directory
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    ///
-    pub fn get_spectrum_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
-        self.get_ms_run_dir_path(work_dir)
-            .join(sanatize_string(&self.spectrum_id))
-    }
-
-    /// Retuns the path of the spectrum mzML
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    ///
-    pub fn get_spectrum_mzml_path(&self, work_dir: &PathBuf) -> PathBuf {
-        self.get_spectrum_dir_path(work_dir).join("spectrum.mzML")
-    }
-
-    /// Returns the path to the fasta file for the spectrum's precursor
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    /// * `precursor_mz` - Precursor mass to charge ratio
-    /// * `precursor_charge` - Precursor charge
-    ///
-    pub fn get_fasta_file_path(
-        &self,
-        work_dir: &PathBuf,
-        precursor_mz: f64,
-        precursor_charge: u8,
-    ) -> PathBuf {
-        self.get_spectrum_dir_path(work_dir)
-            .join(format!("{}_{}.fasta", precursor_mz, precursor_charge))
-    }
-
-    /// Returns the path to the Comet parameter file for the spectrum's precursor
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    /// * `precursor_mz` - Precursor mass to charge ratio
-    /// * `precursor_charge` - Precursor charge
-    ///
-    pub fn get_comet_params_path(
-        &self,
-        work_dir: &PathBuf,
-        precursor_mz: f64,
-        precursor_charge: u8,
-    ) -> PathBuf {
-        self.get_spectrum_dir_path(work_dir)
-            .join(format!("{}_{}.comet.param", precursor_mz, precursor_charge))
-    }
-
-    /// Returns the path to the PSM file for the spectrum's precursor
-    /// This alredy has the TSV file extension while Comet writes it with the extension .txt
-    /// It is renamed after the search
-    ///
-    /// # Argumentss
-    /// * `work_dir` - Work directory where the results are stored
-    /// * `precursor_mz` - Precursor mass to charge ratio
-    /// * `precursor_charge` - Precursor charge
-    ///
-    pub fn get_psms_file_path(
-        &self,
-        work_dir: &PathBuf,
-        precursor_mz: f64,
-        precursor_charge: u8,
-    ) -> PathBuf {
-        self.get_spectrum_dir_path(work_dir)
-            .join(format!("{}_{}.tsv", precursor_mz, precursor_charge))
-    }
-
-    /// Returns the path to the goodness TSV file for the spectrum's precursor
-    ///
-    /// # Argumentss
-    /// * `work_dir` - Work directory where the results are stored
-    /// * `precursor_mz` - Precursor mass to charge ratio
-    /// * `precursor_charge` - Precursor charge
-    ///
-    pub fn get_goodness_file_path(
-        &self,
-        work_dir: &PathBuf,
-        precursor_mz: f64,
-        precursor_charge: u8,
-    ) -> PathBuf {
-        self.get_spectrum_dir_path(work_dir).join(format!(
-            "{}_{}.goodness.tsv",
-            precursor_mz, precursor_charge
-        ))
-    }
-}
-
-/// Trait defining the methods for a pipeline queue
-///
-pub trait PipelineQueue: Send + Sync + Sized {
-    /// Create a new pipeline queue
-    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send;
-
-    fn get_capacity(&self) -> usize;
-
-    /// Pop a manifest from the queue
-    /// Returns None if the queue is empty
-    ///
-    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> + Send;
-
-    /// Push a manifest to the queue
-    /// Returns the manifest if the queue is full
-    ///
-    /// # Arguments
-    /// * `manifest` - The manifest to push to the queue
-    ///
-    fn push(
-        &self,
-        manifest: SearchManifest,
-    ) -> impl std::future::Future<Output = Result<(), SearchManifest>> + Send;
-
-    /// Get the length of the queue
-    ///
-    fn len(&self) -> impl Future<Output = usize> + Send;
-}
-
-/// Implementation of a local pipeline queue. useful to debug, testing, reviewing or
-/// very beefy servers
-///
-pub struct LocalPipelineQueue {
-    /// Queue for search manifests to be processed
-    queue: Queue<SearchManifest>,
-
-    /// Capacity of the queue
-    capacity: usize,
-}
-
-impl PipelineQueue for LocalPipelineQueue {
-    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send {
-        async {
-            Ok(Self {
-                queue: Queue::new(config.queue_capacity),
-                capacity: config.queue_capacity,
-            })
-        }
-    }
-
-    fn get_capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
-        async { self.queue.try_pop() }
-    }
-
-    fn push(
-        &self,
-        manifest: SearchManifest,
-    ) -> impl std::future::Future<Output = Result<(), SearchManifest>> + Send {
-        async {
-            match self.queue.try_push(manifest) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(e),
-            }
-        }
-    }
-
-    fn len(&self) -> impl Future<Output = usize> + Send {
-        async { self.queue.len() }
-    }
-}
-
-/// Redis implementation of the pipeline queue for distributed systems
-///
-pub struct RedisPipelineQueue {
-    /// Redis client
-    client: rustis::client::Client,
-
-    /// Name of the queue
-    queue_name: String,
-
-    /// Capacity of the queue
-    capacity: usize,
-}
-
-impl PipelineQueue for RedisPipelineQueue {
-    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send {
-        async move {
-            if config.redis_url.is_none() {
-                bail!("Redis URL is None")
-            }
-
-            trace!("Storages: {:?} / {}", &config.redis_url, &config.queue_name);
-
-            let mut redis_client_config =
-                rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())?;
-            redis_client_config.retry_on_error = true;
-            redis_client_config.reconnection =
-                rustis::client::ReconnectionConfig::new_constant(0, 5);
-
-            let client = rustis::client::Client::connect(redis_client_config)
-                .await
-                .context("Error opening connection to Redis")?;
-            Ok(Self {
-                client,
-                queue_name: config.queue_name.clone(),
-                capacity: config.queue_capacity,
-            })
-        }
-    }
-
-    fn get_capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> {
-        async {
-            let serialized_manifest: String = match self
-                .client
-                .lpop::<_, _, Vec<String>>(&self.queue_name, 1)
-                .await
-            {
-                Ok(response) => {
-                    if !response.is_empty() {
-                        response[0].clone()
-                    } else {
-                        String::new()
-                    }
-                }
-                Err(e) => {
-                    error!("Error popping manifest from queue: {:?}", e);
-                    return None;
-                }
-            };
-
-            if serialized_manifest.is_empty() {
-                return None;
-            }
-
-            match serde_json::from_str(&serialized_manifest) {
-                Ok(manifest) => manifest,
-                Err(e) => {
-                    error!(
-                        "[{}] Error deserializing manifest: {:?}",
-                        self.queue_name, e
-                    );
-                    None
-                }
-            }
-        }
-    }
-
-    fn push(
-        &self,
-        manifest: SearchManifest,
-    ) -> impl std::future::Future<Output = Result<(), SearchManifest>> + Send {
-        async {
-            // Simple mechanism to prevent overcommitment of queue
-            loop {
-                if self.len().await < self.get_capacity() {
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-            let serialized_manifest = match serde_json::to_string(&manifest) {
-                Ok(serialized_manifest) => serialized_manifest,
-                Err(e) => {
-                    error!("[{}] Error serializing manifest: {:?}", self.queue_name, e);
-                    return Err(manifest);
-                }
-            };
-
-            match self
-                .client
-                .rpush(&self.queue_name, serialized_manifest)
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    error!(
-                        "[{}] Error pushing manifest to queue: {:?}",
-                        self.queue_name, e
-                    );
-                    Err(manifest)
-                }
-            }
-        }
-    }
-
-    fn len(&self) -> impl Future<Output = usize> + Send {
-        async {
-            match self.client.llen(&self.queue_name).await {
-                Ok(size) => size,
-                Err(e) => {
-                    error!("[{}] Error getting queue size: {:?}", self.queue_name, e);
-                    self.capacity + 111
-                }
-            }
-        }
-    }
-}
-
-/// New Arc type to implement the MonitorableQueue trait from `macpepdb`
-///
-struct PipelineQueueArc<T>(Arc<T>)
-where
-    T: PipelineQueue;
-
-impl<T> MonitorableQueue for PipelineQueueArc<T>
-where
-    T: PipelineQueue + 'static,
-{
-    async fn len(&self) -> usize {
-        self.0.len().await
-    }
-}
-
-impl<Q> From<Arc<Q>> for PipelineQueueArc<Q>
-where
-    Q: PipelineQueue,
-{
-    fn from(queue: Arc<Q>) -> Self {
-        Self(queue)
-    }
-}
 
 /// Pipelines to run the MaCcoyS identification pipeline
 ///
