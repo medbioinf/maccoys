@@ -21,6 +21,7 @@ use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -29,6 +30,27 @@ use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::{create_search_space, post_process};
 use maccoys::io::comet::configuration::Configuration as CometConfiguration;
 use maccoys::web::server::start as start_web_server;
+
+/// Log rotation values for CLI
+///
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum LogRotation {
+    Minutely,
+    Hourly,
+    Daily,
+    Never,
+}
+
+impl Into<Rotation> for LogRotation {
+    fn into(self) -> Rotation {
+        match self {
+            LogRotation::Minutely => Rotation::MINUTELY,
+            LogRotation::Hourly => Rotation::HOURLY,
+            LogRotation::Daily => Rotation::DAILY,
+            LogRotation::Never => Rotation::NEVER,
+        }
+    }
+}
 
 #[derive(Debug, Subcommand)]
 enum PipelineCommand {
@@ -161,6 +183,12 @@ struct Cli {
     /// > 3 - Trace
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Hourly roated logfile.
+    #[arg(short, long)]
+    log_file: Option<PathBuf>,
+    /// Log rotation interval
+    #[arg(value_enum, long, default_value = "never")]
+    log_rotation: LogRotation,
     #[command(subcommand)]
     command: Commands,
 }
@@ -177,26 +205,52 @@ async fn main() -> Result<()> {
         _ => Level::TRACE,
     };
 
-    let file_appender = tracing_appender::rolling::never("./", "maccoys.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    // wrapping each layer into an Option to allow for easy runtime configuration
+    // see: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/index.html#runtime-configuration-with-layers
 
-    let filter = EnvFilter::from_default_env()
-        .add_directive(verbosity.into())
-        .add_directive("scylla=info".parse().unwrap())
-        .add_directive("tokio_postgres=info".parse().unwrap())
-        .add_directive("hyper=info".parse().unwrap())
-        .add_directive("reqwest=info".parse().unwrap())
-        .add_directive("rustis=info".parse().unwrap());
+    let filter = Some(
+        EnvFilter::from_default_env()
+            .add_directive(verbosity.into())
+            .add_directive("scylla=info".parse().unwrap())
+            .add_directive("tokio_postgres=info".parse().unwrap())
+            .add_directive("hyper=info".parse().unwrap())
+            .add_directive("reqwest=info".parse().unwrap())
+            .add_directive("rustis=info".parse().unwrap()),
+    );
 
-    let indicatif_layer = IndicatifLayer::new().with_progress_style(
+    let indicatif_layer = Some(IndicatifLayer::new().with_progress_style(
         ProgressStyle::with_template(
             "{spinner:.cyan} {span_child_prefix}{span_name}{{{span_fields}}} {wide_msg} {elapsed}",
         )
         .unwrap()
-    ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent(" ").with_max_progress_bars(20, None);
+    ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent(" ").with_max_progress_bars(20, None));
+
+    let indicatif_writer_layer = Some(
+        tracing_subscriber::fmt::layer()
+            .with_writer(indicatif_layer.as_ref().unwrap().get_stderr_writer()),
+    );
+
+    // Keep WorkerGuard for tracing_appender in scope to prevent it from being dropped
+    // otherwise the log is not written to the file
+    let mut _log_filw_writer_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+
+    let log_file_layer = match args.log_file {
+        Some(log_file) => {
+            let file_appender = RollingFileAppender::new(
+                args.log_rotation.into(),
+                log_file.parent().unwrap(),
+                log_file.file_name().unwrap(),
+            );
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            _log_filw_writer_guard = Some(guard);
+            Some(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+        }
+        None => None,
+    };
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(indicatif_layer.get_stderr_writer()))
+        .with(indicatif_writer_layer)
+        .with(log_file_layer)
         .with(indicatif_layer)
         .with(filter)
         .init();

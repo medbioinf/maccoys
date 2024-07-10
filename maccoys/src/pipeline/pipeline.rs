@@ -175,6 +175,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             vec![None; NUMBER_OF_COUNTERS],
             COUNTER_LABLES
                 .iter()
+                .rev()
                 .map(|label| label.to_string())
                 .collect(),
             None,
