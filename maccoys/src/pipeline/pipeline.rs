@@ -41,7 +41,11 @@ use crate::{
         configuration::Configuration as CometConfiguration,
         peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
     },
-    pipeline::{queue::PipelineQueueArc, search_manifest::SearchManifest},
+    pipeline::{
+        queue::PipelineQueueArc,
+        search_manifest::SearchManifest,
+        storage::{COUNTER_LABLES, NUMBER_OF_COUNTERS},
+    },
 };
 
 use super::{
@@ -104,6 +108,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             .await?;
         storage.set_ptms(&uuid, &ptms).await?;
         storage.set_comet_config(&uuid, &comet_config).await?;
+        storage.init_counters(&uuid).await?;
 
         let storage = Arc::new(storage);
 
@@ -123,12 +128,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         let comet_search_stop_flag = Arc::new(AtomicBool::new(false));
         let goodness_and_rescoreing_stop_flag = Arc::new(AtomicBool::new(false));
         let cleanup_stop_flag = Arc::new(AtomicBool::new(false));
+        let metrics_stop_flag = Arc::new(AtomicBool::new(false));
 
         // Metrics
-        let finished_search_spaces = Arc::new(AtomicUsize::new(0));
-        let finished_searches = Arc::new(AtomicUsize::new(0));
-        let finished_goodness_and_rescoring = Arc::new(AtomicUsize::new(0));
-        let finished_cleanups = Arc::new(AtomicUsize::new(0));
+        let metrics = vec![Arc::new(AtomicUsize::new(0)); NUMBER_OF_COUNTERS];
 
         let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
             "",
@@ -159,27 +162,28 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             None,
         )?;
 
+        let metrics_poll_taks = tokio::spawn(Self::poll_store_metrics_task(
+            storage.clone(),
+            uuid.clone(),
+            metrics.clone(),
+            metrics_stop_flag.clone(),
+        ));
+
         let mut metrics_monitor = ProgressMonitor::new(
             "",
-            vec![
-                finished_cleanups.clone(),
-                finished_goodness_and_rescoring.clone(),
-                finished_searches.clone(),
-                finished_search_spaces.clone(),
-            ],
-            vec![None, None, None, None],
-            vec![
-                "Cleanups".to_owned(),
-                "Post processing".to_owned(),
-                "Searches".to_owned(),
-                "Build search spaces".to_owned(),
-            ],
+            metrics.clone(),
+            vec![None; NUMBER_OF_COUNTERS],
+            COUNTER_LABLES
+                .iter()
+                .map(|label| label.to_string())
+                .collect(),
             None,
         )?;
 
         let index_handler: tokio::task::JoinHandle<()> = {
             tokio::spawn(Self::indexing_task(
                 work_dir.clone(),
+                storage.clone(),
                 index_queue.clone(),
                 preparation_queue.clone(),
                 index_stop_flag.clone(),
@@ -192,6 +196,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 .map(|_| {
                     tokio::spawn(Self::preparation_task(
                         work_dir.clone(),
+                        storage.clone(),
                         preparation_queue.clone(),
                         search_space_generation_queue.clone(),
                         preparation_stop_flag.clone(),
@@ -206,11 +211,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                     tokio::spawn(Self::search_space_generation_task(
                         work_dir.clone(),
                         Arc::new(config.search_space_generation.clone()),
+                        storage.clone(),
                         search_space_generation_queue.clone(),
                         comet_search_queue.clone(),
-                        storage.clone(),
                         search_space_generation_stop_flag.clone(),
-                        finished_search_spaces.clone(),
                     ))
                 })
                 .collect();
@@ -226,7 +230,6 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         comet_search_queue.clone(),
                         goodness_and_rescoreing_queue.clone(),
                         comet_search_stop_flag.clone(),
-                        finished_searches.clone(),
                     ))
                 })
                 .collect();
@@ -237,10 +240,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                 .map(|_| {
                     tokio::spawn(Self::goodness_and_rescoring_task(
                         work_dir.clone(),
+                        storage.clone(),
                         goodness_and_rescoreing_queue.clone(),
                         cleanup_queue.clone(),
                         goodness_and_rescoreing_stop_flag.clone(),
-                        finished_goodness_and_rescoring.clone(),
                     ))
                 })
                 .collect();
@@ -250,9 +253,8 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             .map(|_| {
                 tokio::spawn(Self::cleanup_task(
                     work_dir.clone(),
-                    cleanup_queue.clone(),
-                    finished_cleanups.clone(),
                     storage.clone(),
+                    cleanup_queue.clone(),
                     cleanup_stop_flag.clone(),
                 ))
             })
@@ -333,6 +335,8 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
             }
         }
 
+        metrics_stop_flag.store(true, Ordering::Relaxed);
+        metrics_poll_taks.await?;
         queue_monitor.stop().await?;
         metrics_monitor.stop().await?;
 
@@ -345,8 +349,62 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         storage.remove_search_params(&uuid).await?;
         storage.remove_comet_config(&uuid).await?;
         storage.remove_ptms(&uuid).await?;
+        storage.remove_counters(&uuid).await?;
 
         Ok(())
+    }
+
+    /// Task to poll the metrcis from the storage to monitor them
+    ///
+    /// # Arguments
+    /// * `storage` - Storage to access the metrics
+    /// * `uuid` - UUID of the search
+    /// * `metrics` - Metrics to store the values
+    /// * `stop_flag` - Flag to indicate to stop polling
+    ///
+    async fn poll_store_metrics_task(
+        storage: Arc<S>,
+        uuid: String,
+        metrics: Vec<Arc<AtomicUsize>>,
+        stop_flag: Arc<AtomicBool>,
+    ) {
+        loop {
+            metrics[0].store(
+                storage.get_started_searches_ctr(&uuid).await.unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            metrics[1].store(
+                storage.get_prepared_ctr(&uuid).await.unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            metrics[2].store(
+                storage
+                    .get_search_space_generation_ctr(&uuid)
+                    .await
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            metrics[3].store(
+                storage.get_comet_search_ctr(&uuid).await.unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            metrics[4].store(
+                storage
+                    .get_goodness_and_rescoring_ctr(&uuid)
+                    .await
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            metrics[5].store(
+                storage.get_cleanup_ctr(&uuid).await.unwrap_or(0),
+                Ordering::Relaxed,
+            );
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+        }
     }
 
     /// Task to index and split up the mzML file
@@ -359,6 +417,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     ///
     pub async fn indexing_task(
         work_dir: PathBuf,
+        storage: Arc<S>,
         index_queue: Arc<Q>,
         preparation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
@@ -431,6 +490,17 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                     new_manifest.spectrum_mzml = mzml;
                     new_manifest.is_indexing_done = true;
 
+                    match storage.increment_started_searches_ctr(&manifest.uuid).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error incrementing indexing counter: {:?}",
+                                &new_manifest.uuid, &new_manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    }
+
                     loop {
                         new_manifest = match preparation_queue.push(new_manifest).await {
                             Ok(_) => break,
@@ -460,6 +530,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     ///
     fn preparation_task(
         work_dir: PathBuf,
+        storage: Arc<S>,
         preparation_queue: Arc<Q>,
         search_space_generation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
@@ -604,6 +675,17 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         }
                     }
 
+                    match storage.increment_prepared_ctr(&manifest.uuid).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error incrementing prepare counter: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    }
+
                     manifest.spectrum_mzml = Vec::with_capacity(0); // Free up some memory
                     manifest.precursors = precursors;
                     manifest.is_preparation_done = true;
@@ -642,11 +724,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     fn search_space_generation_task(
         work_dir: PathBuf,
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
+        storage: Arc<S>,
         search_space_generation_queue: Arc<Q>,
         comet_search_queue: Arc<Q>,
-        storage: Arc<S>,
         stop_flag: Arc<AtomicBool>,
-        finished_search_spaces: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut last_search_uuid = String::new();
@@ -752,7 +833,19 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                                 }
                             };
 
-                            finished_search_spaces.fetch_add(1, Ordering::Relaxed);
+                            match storage
+                                .increment_search_space_generation_ctr(&manifest.uuid)
+                                .await
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error incrementing search space generation counter: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                     }
 
@@ -793,7 +886,6 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         comet_search_queue: Arc<Q>,
         goodness_and_rescoreing_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-        finished_searches: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let mut last_search_uuid = String::new();
@@ -935,6 +1027,17 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         }
                     }
 
+                    match storage.increment_comet_search_ctr(&manifest.uuid).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error incrementing Comet search counter: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    }
+
                     manifest.is_comet_search_done = true;
                     loop {
                         manifest = match goodness_and_rescoreing_queue.push(manifest).await {
@@ -945,7 +1048,6 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                             }
                         }
                     }
-                    finished_searches.fetch_add(1, Ordering::Relaxed);
                 }
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
@@ -958,10 +1060,10 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
 
     fn goodness_and_rescoring_task(
         work_dir: PathBuf,
+        storage: Arc<S>,
         goodness_and_rescoreing_queue: Arc<Q>,
         cleanup_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-        finished_goodness_and_rescoring: Arc<AtomicUsize>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
             let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
@@ -1207,6 +1309,20 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         }
                     }
 
+                    match storage
+                        .increment_goodness_and_rescoring_ctr(&manifest.uuid)
+                        .await
+                    {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error incrementing goodness and rescoring counter: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    }
+
                     manifest.is_goodness_and_rescoring_done = true;
                     loop {
                         manifest = match cleanup_queue.push(manifest).await {
@@ -1217,7 +1333,6 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                             }
                         }
                     }
-                    finished_goodness_and_rescoring.fetch_add(1, Ordering::Relaxed);
                 }
                 if stop_flag.load(Ordering::Relaxed) {
                     break;
@@ -1245,9 +1360,8 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     ///
     fn cleanup_task(
         work_dir: PathBuf,
-        cleanup_queue: Arc<Q>,
-        finished_cleanups: Arc<AtomicUsize>,
         storage: Arc<S>,
+        cleanup_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
@@ -1349,7 +1463,16 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
                         }
                     }
 
-                    finished_cleanups.fetch_add(1, Ordering::Relaxed);
+                    match storage.increment_cleanup_ctr(&manifest.uuid).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error incrementing cleanup counter: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    }
 
                     debug!(
                         "[{} / {}] Cleanup done in `{}`",
