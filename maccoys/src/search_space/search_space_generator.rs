@@ -434,6 +434,7 @@ impl SearchSpaceGenerator {
         decoys_per_peptide: usize,
     ) -> Result<(usize, usize)> {
         let mut fasta_file = File::create(fasta_path).await?;
+        #[allow(unused_assignments)]
         let mut target_ctr = 0;
         let mut decoy_ctr = 0;
 
