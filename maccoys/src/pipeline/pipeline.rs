@@ -1,7 +1,6 @@
 // std imports
 use std::{
     fs,
-    marker::PhantomData,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -63,21 +62,11 @@ const SPECTRUM_START_TAG: &'static [u8; 10] = b"<spectrum ";
 /// Default stop tag for a spectrum in mzML
 const SPECTRUM_STOP_TAG: &'static [u8; 11] = b"</spectrum>";
 
-/// Pipelines to run the MaCcoyS identification pipeline
+/// Pipeline to run the MaCcoyS identification pipeline
 ///
-/// # Generics
-/// * `Q` - Type of the queue to use
-///
-pub struct Pipeline<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
-    _phantom_queue: PhantomData<Q>,
-    _storage: PhantomData<S>,
-}
+pub struct Pipeline;
 
-impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
+impl Pipeline {
     /// Run the pipeline locally for each mzML file
     ///
     /// # Arguments
@@ -87,7 +76,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `ptms` - Post translational modifications
     /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
-    pub async fn run_locally(
+    pub async fn run_locally<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         config: PipelineConfiguration,
         mut comet_config: CometConfiguration,
@@ -363,7 +352,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `metrics` - Metrics to store the values
     /// * `stop_flag` - Flag to indicate to stop polling
     ///
-    async fn poll_store_metrics_task(
+    async fn poll_store_metrics_task<S: PipelineStorage>(
         storage: Arc<S>,
         uuid: String,
         metrics: Vec<Arc<AtomicUsize>>,
@@ -416,7 +405,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `preparation_queue` - Queue for the preparation task
     /// * `stop_flag` - Flag to indicate to stop once the index queue is empty
     ///
-    pub async fn indexing_task(
+    pub async fn indexing_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         index_queue: Arc<Q>,
@@ -529,7 +518,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `search_space_generation_queue` - Queue for the search space generation task
     /// * `stop_flag` - Flag to indicate to stop once the preparation queue is empty
     ///
-    fn preparation_task(
+    fn preparation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         preparation_queue: Arc<Q>,
@@ -722,7 +711,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `storage` - Storage to access configuration and PTMs
     /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
     ///
-    fn search_space_generation_task(
+    fn search_space_generation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
@@ -880,7 +869,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `goodness_and_rescoreing_queue` - Goodness and rescoreing queue
     /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
     ///
-    fn comet_search_task(
+    fn comet_search_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         config: Arc<CometSearchTaskConfiguration>,
         storage: Arc<S>,
@@ -1059,7 +1048,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
         }
     }
 
-    fn goodness_and_rescoring_task(
+    fn goodness_and_rescoring_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         goodness_and_rescoreing_queue: Arc<Q>,
@@ -1359,7 +1348,7 @@ impl<Q: PipelineQueue, S: PipelineStorage> Pipeline<Q, S> {
     /// * `storage` - Storage to access configuration
     /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
     ///
-    fn cleanup_task(
+    fn cleanup_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         cleanup_queue: Arc<Q>,

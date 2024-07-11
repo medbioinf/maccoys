@@ -14,7 +14,7 @@ use dihardts_omicstools::proteomics::io::mzml::{
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::configuration::PipelineConfiguration;
+use maccoys::pipeline::configuration::{PipelineConfiguration, TaskConfiguration};
 use maccoys::pipeline::pipeline::Pipeline;
 use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
 use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
@@ -77,12 +77,13 @@ enum PipelineCommand {
         #[arg(value_delimiter = ' ', num_args = 0..)]
         mzml_file_paths: Vec<String>,
     },
-    // /// Runs the index task separatly
-    // ///
-    // IndexTask {
-    //     /// Path to the configuration file
-    //     config: PathBuf,
-    // },
+    /// Standalone indexing for distributed processing
+    Index {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the configuration file `index`-section of the pipeline configuration
+        config: PathBuf,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -396,7 +397,7 @@ async fn main() -> Result<()> {
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
                 if !use_redis {
                     info!("Running local pipeline");
-                    Pipeline::<LocalPipelineQueue, LocalPipelineStorage>::run_locally(
+                    Pipeline::run_locally::<LocalPipelineQueue, LocalPipelineStorage>(
                         work_dir,
                         config,
                         comet_config,
@@ -406,7 +407,7 @@ async fn main() -> Result<()> {
                     .await?;
                 } else {
                     info!("Running redis pipeline");
-                    Pipeline::<RedisPipelineQueue, RedisPipelineStorage>::run_locally(
+                    Pipeline::run_locally::<RedisPipelineQueue, RedisPipelineStorage>(
                         work_dir,
                         config,
                         comet_config,
@@ -415,6 +416,11 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
+            }
+            PipelineCommand::Index { work_dir, config } => {
+                let config: TaskConfiguration =
+                    toml::from_str(&read_to_string(&config).context("Reading config file")?)
+                        .context("Deserialize config")?;
             }
         },
     };
