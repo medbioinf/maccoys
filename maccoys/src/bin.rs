@@ -14,10 +14,8 @@ use dihardts_omicstools::proteomics::io::mzml::{
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::configuration::{PipelineConfiguration, TaskConfiguration};
+use maccoys::pipeline::configuration::{PipelineConfiguration, RemotePipelineConfiguration};
 use maccoys::pipeline::pipeline::Pipeline;
-use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
-use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{error, info, Level};
@@ -29,6 +27,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::{create_search_space, post_process};
 use maccoys::io::comet::configuration::Configuration as CometConfiguration;
+use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
+use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use maccoys::web::server::start as start_web_server;
 
 /// Log rotation values for CLI
@@ -77,12 +77,75 @@ enum PipelineCommand {
         #[arg(value_delimiter = ' ', num_args = 0..)]
         mzml_file_paths: Vec<String>,
     },
+    /// Add the given MS runs to the remote pipeline
+    /// Use `search-monitor` after this to monitor the search
+    RemoteRun {
+        /// PTM file path
+        #[arg(short, long)]
+        ptms_file: Option<PathBuf>,
+        /// Contains `search_parameters`, `index`-, & `storages`-section of the pipeline configuration
+        config: PathBuf,
+        /// Default comet params
+        default_comet_params_file: PathBuf,
+        /// Paths to mzML files
+        /// Glob patterns are allowed. e.g. /path/to/**/*.mzML, put them in quotes if your shell expands them.
+        #[arg(value_delimiter = ' ', num_args = 0..)]
+        mzml_file_paths: Vec<String>,
+    },
+    /// Monitor for remote searches
+    SearchMonitor {
+        /// Contains `search_parameters`, `index`-, & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+        /// Search UUID
+        uuid: String,
+    },
     /// Standalone indexing for distributed processing
     Index {
         /// Work directroy where each MS run will get a subdirectory
         work_dir: PathBuf,
-        /// Path to the configuration file `index`-section of the pipeline configuration
-        config: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `index`-, `preparation`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Standalone preparation for distributed processing
+    Preparation {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `preparation`-, `search_space_generation`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Standalone search space generation for distributed processing
+    SearchSpaceGeneration {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `search_space_generation`-, `comet_search`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Standalone comet search for distributed processing
+    CometSearch {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `comet_search`-, `goodness_and_rescoring`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Standalone goodness and rescoring for distributed processing
+    GoodnessAndRescoring {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `comet_search`-, `goodness_and_rescoring`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Standalone cleanup for distributed processing
+    Cleanup {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `goodness_and_rescoring`-, `cleanup`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
     },
 }
 
@@ -417,11 +480,72 @@ async fn main() -> Result<()> {
                     .await?;
                 }
             }
-            PipelineCommand::Index { work_dir, config } => {
-                let config: TaskConfiguration =
+            PipelineCommand::RemoteRun {
+                ptms_file,
+                config,
+                default_comet_params_file,
+                mzml_file_paths,
+            } => {
+                let config: RemotePipelineConfiguration =
                     toml::from_str(&read_to_string(&config).context("Reading config file")?)
                         .context("Deserialize config")?;
+
+                let mut ptms: Vec<PostTranslationalModification> = Vec::new();
+                if let Some(ptms_file) = &ptms_file {
+                    ptms = PtmReader::read(Path::new(ptms_file))?;
+                }
+
+                let comet_config = match CometConfiguration::try_from(&default_comet_params_file) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        bail!("Error reading Comet configuration: {:?}", e);
+                    }
+                };
+
+                let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
+
+                info!("Running remote pipeline");
+                Pipeline::run_remotely(ptms, comet_config, config, mzml_file_paths).await?;
             }
+            PipelineCommand::SearchMonitor {
+                config_file_path,
+                uuid,
+            } => {
+                let config: RemotePipelineConfiguration = toml::from_str(
+                    &read_to_string(&config_file_path).context("Reading config file")?,
+                )
+                .context("Deserialize config")?;
+
+                info!("Running search monitor");
+                Pipeline::start_search_monitor(config, uuid).await?;
+            }
+            // TODO: Is there a more generic way to implment the standalone tasks?
+            // Only thing which changes is the configuration type and config attributes to call for the input and output queues
+            // Except the cleanup task, which does not have an output queue
+            PipelineCommand::Index {
+                work_dir,
+                config_file_path,
+            } => Pipeline::standalone_indexing(work_dir, config_file_path).await?,
+            PipelineCommand::Preparation {
+                work_dir,
+                config_file_path,
+            } => Pipeline::standalone_preparation(work_dir, config_file_path).await?,
+            PipelineCommand::SearchSpaceGeneration {
+                work_dir,
+                config_file_path,
+            } => Pipeline::standalone_search_space_generation(work_dir, config_file_path).await?,
+            PipelineCommand::CometSearch {
+                work_dir,
+                config_file_path,
+            } => Pipeline::standalone_comet_search(work_dir, config_file_path).await?,
+            PipelineCommand::GoodnessAndRescoring {
+                work_dir,
+                config_file_path,
+            } => Pipeline::standalone_goodness_and_rescoring(work_dir, config_file_path).await?,
+            PipelineCommand::Cleanup {
+                work_dir,
+                config_file_path,
+            } => Pipeline::standalone_cleanup(work_dir, config_file_path).await?,
         },
     };
     Ok(())

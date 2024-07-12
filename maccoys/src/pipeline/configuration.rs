@@ -205,3 +205,87 @@ impl PipelineConfiguration {
         }
     }
 }
+
+/// Configuration for standalone cleanup
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct RemotePipelineConfiguration {
+    /// Search parameter
+    pub search_parameters: SearchParameters,
+    /// Index task configuration
+    pub index: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
+/// Configuration for standalone indexing
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneIndexingConfiguration {
+    /// Index task configuration
+    pub index: TaskConfiguration,
+    /// Preparation task configuration
+    pub preparation: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
+/// Configuration for standalone preparation
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandalonePreparationConfiguration {
+    /// Preparation task configuration
+    pub preparation: TaskConfiguration,
+    /// Search space generation task configuration
+    pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
+/// Configuration for standalone search space generation
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneSearchSpaceGenerationConfiguration {
+    /// Search space generation task configuration
+    pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
+    /// Comet search task configuration
+    pub comet_search: CometSearchTaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
+/// Configuration for standalone comet search
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneCometSearchConfiguration {
+    /// Comet search task configuration
+    pub comet_search: CometSearchTaskConfiguration,
+    /// Goodness and rescoring task configuration
+    pub goodness_and_rescoring: TaskConfiguration,
+    /// Cleanup task configuration
+    pub cleanup: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
+/// Configuration for standalone indexing
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneGoodnessAndRescoringConfiguration {
+    /// Goodness and rescoring task configuration
+    pub goodness_and_rescoring: TaskConfiguration,
+    /// Cleanup task configuration
+    pub cleanup: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
+/// Configuration for standalone cleanup
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneCleanupConfiguration {
+    /// Cleanup task configuration
+    pub cleanup: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}

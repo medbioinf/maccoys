@@ -9,7 +9,7 @@ use std::{
 };
 
 // 3rd party imports
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::{
@@ -32,6 +32,18 @@ use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 // local imports
+use super::{
+    configuration::{
+        CometSearchTaskConfiguration, PipelineConfiguration, RemotePipelineConfiguration,
+        SearchParameters, SearchSpaceGenerationTaskConfiguration,
+        StandaloneCometSearchConfiguration, StandaloneGoodnessAndRescoringConfiguration,
+        StandaloneIndexingConfiguration, StandalonePreparationConfiguration,
+        StandaloneSearchSpaceGenerationConfiguration,
+    },
+    convert::IntoInputOutputQueueAndStorage,
+    queue::{PipelineQueue, RedisPipelineQueue},
+    storage::{PipelineStorage, RedisPipelineStorage},
+};
 use crate::{
     constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
     functions::{create_search_space, create_work_dir, run_comet_search},
@@ -45,15 +57,6 @@ use crate::{
         search_manifest::SearchManifest,
         storage::{COUNTER_LABLES, NUMBER_OF_COUNTERS},
     },
-};
-
-use super::{
-    configuration::{
-        CometSearchTaskConfiguration, PipelineConfiguration, SearchParameters,
-        SearchSpaceGenerationTaskConfiguration,
-    },
-    queue::PipelineQueue,
-    storage::PipelineStorage,
 };
 
 /// Default start tag for a spectrum in mzML
@@ -518,7 +521,7 @@ impl Pipeline {
     /// * `search_space_generation_queue` - Queue for the search space generation task
     /// * `stop_flag` - Flag to indicate to stop once the preparation queue is empty
     ///
-    fn preparation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
+    pub fn preparation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         preparation_queue: Arc<Q>,
@@ -711,7 +714,10 @@ impl Pipeline {
     /// * `storage` - Storage to access configuration and PTMs
     /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
     ///
-    fn search_space_generation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
+    pub fn search_space_generation_task<
+        Q: PipelineQueue + 'static,
+        S: PipelineStorage + 'static,
+    >(
         work_dir: PathBuf,
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
@@ -869,7 +875,7 @@ impl Pipeline {
     /// * `goodness_and_rescoreing_queue` - Goodness and rescoreing queue
     /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
     ///
-    fn comet_search_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
+    pub fn comet_search_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         config: Arc<CometSearchTaskConfiguration>,
         storage: Arc<S>,
@@ -1048,7 +1054,7 @@ impl Pipeline {
         }
     }
 
-    fn goodness_and_rescoring_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
+    pub fn goodness_and_rescoring_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         goodness_and_rescoreing_queue: Arc<Q>,
@@ -1348,7 +1354,7 @@ impl Pipeline {
     /// * `storage` - Storage to access configuration
     /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
     ///
-    fn cleanup_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
+    pub fn cleanup_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
         work_dir: PathBuf,
         storage: Arc<S>,
         cleanup_queue: Arc<Q>,
@@ -1478,5 +1484,322 @@ impl Pipeline {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         }
+    }
+
+    /// Stars the
+    pub async fn run_remotely(
+        ptms: Vec<PostTranslationalModification>,
+        comet_config: CometConfiguration,
+        config: RemotePipelineConfiguration,
+        mzml_file_paths: Vec<PathBuf>,
+    ) -> Result<String> {
+        let uuid = Uuid::new_v4().to_string();
+        info!("Search UUID: {}", &uuid);
+
+        let mut storage = RedisPipelineStorage::new(&config.storage).await?;
+        storage.init_counters(&uuid).await?;
+        storage.set_ptms(&uuid, &ptms).await?;
+        storage.set_comet_config(&uuid, &comet_config).await?;
+        storage
+            .set_search_parameters(&uuid, config.search_parameters.clone())
+            .await?;
+
+        let storage = Arc::new(storage);
+
+        let index_queue = Arc::new(RedisPipelineQueue::new(&config.index).await?);
+
+        let metrics_stop_flag = Arc::new(AtomicBool::new(false));
+
+        // Metrics
+        let metrics = vec![Arc::new(AtomicUsize::new(0)); NUMBER_OF_COUNTERS];
+
+        let metrics_poll_taks = tokio::spawn(Self::poll_store_metrics_task(
+            storage,
+            uuid.clone(),
+            metrics.clone(),
+            metrics_stop_flag.clone(),
+        ));
+
+        let mut metrics_monitor = ProgressMonitor::new(
+            "",
+            metrics.clone(),
+            vec![None; NUMBER_OF_COUNTERS],
+            COUNTER_LABLES
+                .iter()
+                .rev()
+                .map(|label| label.to_string())
+                .collect(),
+            None,
+        )?;
+
+        for mzml_file_path in mzml_file_paths {
+            let manifest = SearchManifest::new(uuid.clone(), mzml_file_path);
+            match index_queue.push(manifest).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("[{}] Error pushing manifest to index queue.", &e.uuid);
+                    continue;
+                }
+            }
+        }
+
+        metrics_stop_flag.store(true, Ordering::Relaxed);
+        metrics_poll_taks.await?;
+
+        metrics_monitor.stop().await?;
+
+        Ok(uuid)
+    }
+
+    pub async fn start_search_monitor(
+        config: RemotePipelineConfiguration,
+        uuid: String,
+    ) -> Result<()> {
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
+
+        let metrics_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let metrics = vec![Arc::new(AtomicUsize::new(0)); NUMBER_OF_COUNTERS];
+
+        let metrics_poll_taks = tokio::spawn(Self::poll_store_metrics_task(
+            storage,
+            uuid.clone(),
+            metrics.clone(),
+            metrics_stop_flag.clone(),
+        ));
+
+        let mut metrics_monitor = ProgressMonitor::new(
+            "",
+            metrics.clone(),
+            vec![None; NUMBER_OF_COUNTERS],
+            COUNTER_LABLES
+                .iter()
+                .rev()
+                .map(|label| label.to_string())
+                .collect(),
+            None,
+        )?;
+
+        tokio::signal::ctrl_c().await?;
+
+        metrics_stop_flag.store(true, Ordering::Relaxed);
+        metrics_poll_taks.await?;
+
+        metrics_monitor.stop().await?;
+
+        Ok(())
+    }
+
+    pub async fn standalone_indexing(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneIndexingConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.into_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.index.num_tasks)
+            .into_iter()
+            .map(|_| {
+                tokio::spawn(Self::indexing_task(
+                    work_dir.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    output_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn standalone_preparation(
+        work_dir: PathBuf,
+        config_file_path: PathBuf,
+    ) -> Result<()> {
+        let config: StandalonePreparationConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.into_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.preparation.num_tasks)
+            .into_iter()
+            .map(|_| {
+                tokio::spawn(Self::preparation_task(
+                    work_dir.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    output_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn standalone_search_space_generation(
+        work_dir: PathBuf,
+        config_file_path: PathBuf,
+    ) -> Result<()> {
+        let config: StandaloneSearchSpaceGenerationConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.into_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let search_space_generation_config = Arc::new(config.search_space_generation.clone());
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.search_space_generation.num_tasks)
+                .into_iter()
+                .map(|_| {
+                    tokio::spawn(Self::search_space_generation_task(
+                        work_dir.clone(),
+                        search_space_generation_config.clone(),
+                        storage.clone(),
+                        input_queue.clone(),
+                        output_queue.clone(),
+                        stop_flag.clone(),
+                    ))
+                })
+                .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn standalone_comet_search(
+        work_dir: PathBuf,
+        config_file_path: PathBuf,
+    ) -> Result<()> {
+        let config: StandaloneCometSearchConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.into_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let comet_search_config = Arc::new(config.comet_search.clone());
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.comet_search.num_tasks)
+            .into_iter()
+            .map(|_| {
+                tokio::spawn(Self::comet_search_task(
+                    work_dir.clone(),
+                    comet_search_config.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    output_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn standalone_goodness_and_rescoring(
+        work_dir: PathBuf,
+        config_file_path: PathBuf,
+    ) -> Result<()> {
+        let config: StandaloneGoodnessAndRescoringConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.into_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.goodness_and_rescoring.num_tasks)
+                .into_iter()
+                .map(|_| {
+                    tokio::spawn(Self::goodness_and_rescoring_task(
+                        work_dir.clone(),
+                        storage.clone(),
+                        input_queue.clone(),
+                        output_queue.clone(),
+                        stop_flag.clone(),
+                    ))
+                })
+                .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn standalone_cleanup(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneGoodnessAndRescoringConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
+        let input_queue = Arc::new(RedisPipelineQueue::new(&config.cleanup).await?);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.cleanup.num_tasks)
+            .into_iter()
+            .map(|_| {
+                tokio::spawn(Self::cleanup_task(
+                    work_dir.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }
