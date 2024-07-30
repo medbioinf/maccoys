@@ -99,10 +99,22 @@ pub async fn run_comet_search(
         comet_args.join(" ")
     );
 
-    tokio::process::Command::new(comet_exe)
+    let output = tokio::process::Command::new(comet_exe)
         .args(comet_args)
         .output()
         .await?;
+
+    if !output.status.success() {
+        bail!(
+            "Comet search failed:\n\t{}",
+            String::from_utf8_lossy(&output.stderr).replace("\n", "\n\t")
+        );
+    }
+
+    trace!(
+        "Comet search finished:\n\t{}",
+        String::from_utf8_lossy(&output.stdout).replace("\n", "\n\t")
+    );
 
     Ok(())
 }
