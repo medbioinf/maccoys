@@ -14,9 +14,6 @@ pub struct SearchManifest {
     /// MS run path
     pub ms_run_name: String,
 
-    /// Path to the original mzML file containing the MS run
-    pub ms_run_mzml_path: PathBuf,
-
     /// Spectrum ID of the spectrum to be searched
     pub spectrum_id: String,
 
@@ -49,13 +46,18 @@ impl SearchManifest {
     /// * `work_dir` - Work directory where on folder per MS run is created
     /// * `ms_run_mzml_path` - Path to the original mzML file containing the MS run
     ///
-    pub fn new(uuid: String, ms_run_mzml_path: PathBuf) -> Self {
-        let ms_run_name = sanatize_string(ms_run_mzml_path.file_stem().unwrap().to_str().unwrap());
+    pub fn new(uuid: String, mzml_file_name: &str) -> Self {
+        let ms_run_name = sanatize_string(
+            PathBuf::from(mzml_file_name)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        );
 
         Self {
             uuid,
             ms_run_name,
-            ms_run_mzml_path,
             spectrum_id: String::new(),
             spectrum_mzml: Vec::new(),
             precursors: Vec::new(),
@@ -67,13 +69,40 @@ impl SearchManifest {
         }
     }
 
+    /// Returns the search directory
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_search_dir(&self, work_dir: &PathBuf) -> PathBuf {
+        work_dir.join(&self.uuid)
+    }
+
     /// Returns the path to the MS run directory
     ///
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
     pub fn get_ms_run_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
-        work_dir.join(&self.ms_run_name)
+        self.get_search_dir(work_dir).join(&self.ms_run_name)
+    }
+
+    /// Returns the path to the MS run mzML
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_ms_run_mzml_path(&self, work_dir: &PathBuf) -> PathBuf {
+        self.get_ms_run_dir_path(work_dir).join("run.mzML")
+    }
+
+    /// Returns the path to the mzML index JSON
+    ///
+    /// # Arguments
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_index_path(&self, work_dir: &PathBuf) -> PathBuf {
+        self.get_ms_run_dir_path(work_dir).join("index.json")
     }
 
     /// Retuns the path of the spectrum directory wihtin the MS run directory

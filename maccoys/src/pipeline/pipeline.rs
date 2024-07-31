@@ -1,6 +1,8 @@
 // std imports
 use std::{
     fs,
+    io::Cursor,
+    num::ParseIntError,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,7 +11,14 @@ use std::{
 };
 
 // 3rd party imports
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use axum::{
+    extract::{DefaultBodyLimit, Multipart, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Router,
+};
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::{
@@ -28,13 +37,15 @@ use macpepdb::{
 };
 use polars::prelude::*;
 use pyo3::{prelude::*, types::PyList};
+use signal_hook::{consts::SIGINT, iterator::Signals};
+use tokio::sync::{mpsc::error::TryRecvError, RwLock};
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 // local imports
 use super::{
     configuration::{
-        CometSearchTaskConfiguration, PipelineConfiguration, RemotePipelineConfiguration,
+        CometSearchTaskConfiguration, PipelineConfiguration, RemoteEntypointConfiguration,
         SearchParameters, SearchSpaceGenerationTaskConfiguration,
         StandaloneCometSearchConfiguration, StandaloneGoodnessAndRescoringConfiguration,
         StandaloneIndexingConfiguration, StandalonePreparationConfiguration,
@@ -46,8 +57,10 @@ use super::{
 };
 use crate::{
     constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
+    errors::axum::web_error::AnyhowWebError,
     functions::{create_search_space, create_work_dir, run_comet_search},
     goodness_of_fit_record::GoodnessOfFitRecord,
+    io::axum::multipart::write_streamed_file,
     io::comet::{
         configuration::Configuration as CometConfiguration,
         peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
@@ -65,6 +78,14 @@ const SPECTRUM_START_TAG: &'static [u8; 10] = b"<spectrum ";
 /// Default stop tag for a spectrum in mzML
 const SPECTRUM_STOP_TAG: &'static [u8; 11] = b"</spectrum>";
 
+/// Shared state for the remote entrypoint service
+///
+struct EntrypointServiceState {
+    index_queue: RedisPipelineQueue,
+    storage: RwLock<RedisPipelineStorage>,
+    work_dir: PathBuf,
+}
+
 /// Pipeline to run the MaCcoyS identification pipeline
 ///
 pub struct Pipeline;
@@ -73,7 +94,7 @@ impl Pipeline {
     /// Run the pipeline locally for each mzML file
     ///
     /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
+    /// * `work_dir` - Work directory where each search is stored
     /// * `config` - Configuration for the pipeline
     /// * `comet_config` - Configuration for Comet
     /// * `ptms` - Post translational modifications
@@ -254,7 +275,14 @@ impl Pipeline {
             .collect();
 
         for mzml_file_path in mzml_file_paths {
-            let manifest = SearchManifest::new(uuid.clone(), mzml_file_path);
+            let manifest = SearchManifest::new(
+                uuid.clone(),
+                mzml_file_path.file_name().unwrap().to_str().unwrap(),
+            );
+
+            tokio::fs::create_dir_all(manifest.get_ms_run_dir_path(&work_dir)).await?;
+            tokio::fs::copy(&mzml_file_path, manifest.get_ms_run_mzml_path(&work_dir)).await?;
+
             match index_queue.push(manifest).await {
                 Ok(_) => (),
                 Err(e) => {
@@ -417,25 +445,16 @@ impl Pipeline {
     ) {
         loop {
             while let Some(manifest) = index_queue.pop().await {
-                let ms_run_dir_path = manifest.get_ms_run_dir_path(&work_dir);
+                let index =
+                    match Indexer::create_index(&manifest.get_ms_run_mzml_path(&work_dir), None) {
+                        Ok(index) => index,
+                        Err(e) => {
+                            error!("[{}] Error creating index: {:?}", &manifest.uuid, e);
+                            continue;
+                        }
+                    };
 
-                match fs::create_dir_all(&ms_run_dir_path) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!("[{}] Error creating work directory: {}", &manifest.uuid, e);
-                        continue;
-                    }
-                }
-
-                let index = match Indexer::create_index(&manifest.ms_run_mzml_path, None) {
-                    Ok(index) => index,
-                    Err(e) => {
-                        error!("[{}] Error creating index: {:?}", &manifest.uuid, e);
-                        continue;
-                    }
-                };
-
-                let index_file_path = ms_run_dir_path.join("index.json");
+                let index_file_path = manifest.get_index_path(&work_dir);
                 debug!("Writing index to: {}", index_file_path.display());
                 let index_json = match index.to_json() {
                     Ok(json) => json,
@@ -444,7 +463,7 @@ impl Pipeline {
                         continue;
                     }
                 };
-                match std::fs::write(&index_file_path, index_json) {
+                match tokio::fs::write(&index_file_path, index_json).await {
                     Ok(_) => (),
                     Err(e) => {
                         error!("[{}] Error writing index: {:?}", &manifest.uuid, e);
@@ -452,16 +471,8 @@ impl Pipeline {
                     }
                 };
 
-                let uuid_path = ms_run_dir_path.join("uuid.txt");
-                match tokio::fs::write(&uuid_path, &manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!("[{}] Error writing uuid: {:?}", &manifest.uuid, e);
-                        continue;
-                    }
-                };
-
-                let mut reader = match IndexedReader::new(&manifest.ms_run_mzml_path, &index) {
+                let ms_run_mzml = manifest.get_ms_run_mzml_path(&work_dir);
+                let mut reader = match IndexedReader::new(&ms_run_mzml, &index) {
                     Ok(reader) => reader,
                     Err(e) => {
                         error!("[{} /] Error creating reader: {:?}", &manifest.uuid, e);
@@ -1009,7 +1020,11 @@ impl Pipeline {
                             {
                                 Ok(_) => (),
                                 Err(e) => {
-                                    error!("Error renaming PSM file: {:?}", e);
+                                    error!(
+                                        "Error renaming PSM file `{}`: {:?}",
+                                        &psms_file_path.with_extension("txt").display(),
+                                        e
+                                    );
                                     continue;
                                 }
                             }
@@ -1065,20 +1080,16 @@ impl Pipeline {
             let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
             let (to_rust, mut from_python) =
                 tokio::sync::mpsc::channel::<(Vec<GoodnessOfFitRecord>, Vec<f64>, Vec<f64>)>(1);
+            let python_stop_flag = Arc::new(AtomicBool::new(false));
+            let python_thread_stop_flag = python_stop_flag.clone(); // Getting moved in to the python thread
 
             let python_handle: std::thread::JoinHandle<Result<()>> =
                 std::thread::spawn(move || {
                     match Python::with_gil(|py| {
-                        // std imports
-                        let signal = py.import_bound("signal")?;
                         // maccoys imports
                         let goodness_of_fit_mod =
                             PyModule::import_bound(py, "maccoys.goodness_of_fit")?;
                         let scoring_mod = PyModule::import_bound(py, "maccoys.scoring")?;
-                        // enable CTRL-C
-                        signal
-                            .getattr("signal")?
-                            .call1((signal.getattr("SIGINT")?, signal.getattr("SIG_DFL")?))?;
 
                         // Load all necessary functions
                         let calc_goodnesses_fn = goodness_of_fit_mod.getattr("calc_goodnesses")?;
@@ -1086,8 +1097,22 @@ impl Pipeline {
                         let calculate_distance_score_fn =
                             scoring_mod.getattr("calculate_distance_score")?;
 
-                        while let Some(psm_scores) = from_rust.blocking_recv() {
-                            // Cast to python list
+                        loop {
+                            if python_thread_stop_flag.load(Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let psm_scores = match from_rust.try_recv() {
+                                Ok(scores) => scores,
+                                Err(TryRecvError::Empty) => {
+                                    std::thread::sleep(tokio::time::Duration::from_millis(100));
+                                    continue;
+                                }
+                                Err(TryRecvError::Disconnected) => {
+                                    break;
+                                }
+                            };
+
                             let psm_scores = PyList::new_bound(py, psm_scores);
 
                             let goodness_of_fits: Vec<GoodnessOfFitRecord> = calc_goodnesses_fn
@@ -1118,6 +1143,7 @@ impl Pipeline {
                             error!("[PYTHON] Error running Python thread: {:?}", e);
                         }
                     }
+                    debug!("[PYTHON] Python thread stopped");
                     Ok(())
                 });
 
@@ -1331,6 +1357,7 @@ impl Pipeline {
                     }
                 }
                 if stop_flag.load(Ordering::Relaxed) {
+                    python_stop_flag.store(true, Ordering::Relaxed);
                     break;
                 }
                 // wait before checking the queue again
@@ -1486,87 +1513,170 @@ impl Pipeline {
         }
     }
 
-    /// Stars the
+    /// Enqueues a search to a remote server
+    ///
+    /// # Arguments
+    /// * `base_url` - Base URL of the remote server
+    /// * `search_parameters_path` - Path to the search parameters file
+    /// * `comet_params_path` - Path to the Comet parameters file
+    /// * `mzml_file_paths` - Paths to the mzML files
+    /// * `ptms_path` - Optional path to the PTMs file
+    ///
     pub async fn run_remotely(
-        ptms: Vec<PostTranslationalModification>,
-        comet_config: CometConfiguration,
-        config: RemotePipelineConfiguration,
+        base_url: String,
+        search_parameters_path: PathBuf,
+        comet_params_path: PathBuf,
         mzml_file_paths: Vec<PathBuf>,
+        ptms_path: Option<PathBuf>,
     ) -> Result<String> {
-        let uuid = Uuid::new_v4().to_string();
-        info!("Search UUID: {}", &uuid);
+        let enqueue_url = format!("{}/api/pipeline/enqueue", base_url);
 
-        let mut storage = RedisPipelineStorage::new(&config.storage).await?;
-        storage.init_counters(&uuid).await?;
-        storage.set_ptms(&uuid, &ptms).await?;
-        storage.set_comet_config(&uuid, &comet_config).await?;
-        storage
-            .set_search_parameters(&uuid, config.search_parameters.clone())
-            .await?;
+        let search_parameters_reader =
+            reqwest::Body::wrap_stream(tokio_util::codec::FramedRead::new(
+                tokio::fs::File::open(search_parameters_path).await?,
+                tokio_util::codec::BytesCodec::new(),
+            ));
 
-        let storage = Arc::new(storage);
-
-        let index_queue = Arc::new(RedisPipelineQueue::new(&config.index).await?);
-
-        let metrics_stop_flag = Arc::new(AtomicBool::new(false));
-
-        // Metrics
-        let metrics = vec![Arc::new(AtomicUsize::new(0)); NUMBER_OF_COUNTERS];
-
-        let metrics_poll_taks = tokio::spawn(Self::poll_store_metrics_task(
-            storage,
-            uuid.clone(),
-            metrics.clone(),
-            metrics_stop_flag.clone(),
+        let comet_params_reader = reqwest::Body::wrap_stream(tokio_util::codec::FramedRead::new(
+            tokio::fs::File::open(comet_params_path).await?,
+            tokio_util::codec::BytesCodec::new(),
         ));
 
-        let mut metrics_monitor = ProgressMonitor::new(
-            "",
-            metrics.clone(),
-            vec![None; NUMBER_OF_COUNTERS],
-            COUNTER_LABLES
-                .iter()
-                .rev()
-                .map(|label| label.to_string())
-                .collect(),
-            None,
-        )?;
+        let mut form = reqwest::multipart::Form::new()
+            .part(
+                "search_params",
+                reqwest::multipart::Part::stream(search_parameters_reader),
+            )
+            .part(
+                "comet_params",
+                reqwest::multipart::Part::stream(comet_params_reader),
+            );
 
-        for mzml_file_path in mzml_file_paths {
-            let manifest = SearchManifest::new(uuid.clone(), mzml_file_path);
-            match index_queue.push(manifest).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("[{}] Error pushing manifest to index queue.", &e.uuid);
-                    continue;
-                }
-            }
+        if let Some(ptms_path) = ptms_path {
+            let ptms_reader = reqwest::Body::wrap_stream(tokio_util::codec::FramedRead::new(
+                tokio::fs::File::open(ptms_path).await?,
+                tokio_util::codec::BytesCodec::new(),
+            ));
+
+            form = form.part("ptms", reqwest::multipart::Part::stream(ptms_reader));
         }
 
-        metrics_stop_flag.store(true, Ordering::Relaxed);
-        metrics_poll_taks.await?;
+        for (index, mzml_file_path) in mzml_file_paths.iter().enumerate() {
+            let mzml_reader = reqwest::Body::wrap_stream(tokio_util::codec::FramedRead::new(
+                tokio::fs::File::open(mzml_file_path).await?,
+                tokio_util::codec::BytesCodec::new(),
+            ));
 
-        metrics_monitor.stop().await?;
+            let file_name = match mzml_file_path.file_name() {
+                Some(file_name) => file_name.to_string_lossy().to_string(),
+                None => {
+                    bail!(
+                        "Error getting file name from path: {}",
+                        mzml_file_path.display()
+                    );
+                }
+            };
+
+            form = form.part(
+                format!("mzml_{}", index),
+                reqwest::multipart::Part::stream(mzml_reader).file_name(file_name),
+            );
+        }
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(enqueue_url)
+            .multipart(form)
+            .header("Connection", "close")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Error submitting search: {:?}",
+                response.text().await?
+            ));
+        }
+
+        let uuid = response.text().await?;
+        info!(
+            "Search submitted with UUID: {}. Start search monitor (exit with CTRL-C).",
+            uuid
+        );
+
+        Self::start_remote_search_monitor(base_url, &uuid).await?;
 
         Ok(uuid)
     }
 
-    pub async fn start_search_monitor(
-        config: RemotePipelineConfiguration,
-        uuid: String,
-    ) -> Result<()> {
-        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
-
+    /// Starts a progress monitor for a remote search
+    ///
+    /// # Arguments
+    /// * `base_url` - Base URL of the remote server
+    /// * `uuid` - UUID of the search
+    ///
+    pub async fn start_remote_search_monitor(base_url: String, uuid: &str) -> Result<()> {
+        let monitor_url = format!("{}/api/pipeline/monitor/{}", base_url, uuid);
         let metrics_stop_flag = Arc::new(AtomicBool::new(false));
-
         let metrics = vec![Arc::new(AtomicUsize::new(0)); NUMBER_OF_COUNTERS];
 
-        let metrics_poll_taks = tokio::spawn(Self::poll_store_metrics_task(
-            storage,
-            uuid.clone(),
-            metrics.clone(),
-            metrics_stop_flag.clone(),
-        ));
+        let thread_metrics_stop_flag = metrics_stop_flag.clone();
+        let thread_metrics = metrics.clone();
+
+        // Polls the metrics from the remote server
+        let metrics_poll_taks: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+            let mut next_poll = tokio::time::Instant::now();
+            while !thread_metrics_stop_flag.load(Ordering::Relaxed) {
+                if next_poll >= tokio::time::Instant::now() {
+                    tokio::time::sleep(next_poll - tokio::time::Instant::now()).await;
+                }
+                next_poll = tokio::time::Instant::now() + tokio::time::Duration::from_millis(300); // Should be smaller then the monitoring interval
+
+                let response = match reqwest::get(&monitor_url).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        error!("Error getting metrics: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let tsv = match response.text().await {
+                    Ok(csv) => csv,
+                    Err(e) => {
+                        error!("Error reading metrics line: {:?}", e);
+                        continue;
+                    }
+                };
+
+                let mut tsv_line_iter = tsv.lines().skip(1);
+
+                let polled_metrics: Result<Vec<usize>, ParseIntError> = match tsv_line_iter.next() {
+                    Some(metrics) => metrics
+                        .trim()
+                        .split("\t")
+                        .map(|metric| metric.parse::<usize>())
+                        .collect(),
+                    None => {
+                        error!("No metrics found in response");
+                        continue;
+                    }
+                };
+
+                match polled_metrics {
+                    Ok(polled_metrics) => polled_metrics
+                        .into_iter()
+                        .zip(thread_metrics.iter())
+                        .for_each(|(polled_metric, metric)| {
+                            metric.store(polled_metric, Ordering::Relaxed);
+                        }),
+                    Err(e) => {
+                        error!("Error parsing metrics: {:?}", e);
+                        continue;
+                    }
+                };
+            }
+            Ok(())
+        });
 
         let mut metrics_monitor = ProgressMonitor::new(
             "",
@@ -1583,11 +1693,257 @@ impl Pipeline {
         tokio::signal::ctrl_c().await?;
 
         metrics_stop_flag.store(true, Ordering::Relaxed);
-        metrics_poll_taks.await?;
+        metrics_poll_taks.await??;
 
         metrics_monitor.stop().await?;
 
         Ok(())
+    }
+
+    /// Starts a http service to submit new searches
+    /// and monitor the progress of the searches.
+    ///
+    /// # Arguments
+    /// * `interface` - Interface to bind the service to
+    /// * `port` - Port to bind the service to
+    /// * `work_dir` - Work directory where the results are stored
+    /// * `config` - Configuration for the remote entrypoint
+    ///
+    pub async fn start_remote_entrypoint(
+        interface: String,
+        port: u16,
+        work_dir: PathBuf,
+        config: RemoteEntypointConfiguration,
+    ) -> Result<()> {
+        let index_queue = RedisPipelineQueue::new(&config.index).await?;
+        let storage = RwLock::new(RedisPipelineStorage::new(&config.storage).await?);
+
+        let state = Arc::new(EntrypointServiceState {
+            index_queue,
+            storage,
+            work_dir,
+        });
+
+        // Build our application with route
+        let app = Router::new()
+            .route(
+                "/api/pipeline/enqueue",
+                post(Self::remote_entrypoint_enqueue_endpoint),
+            )
+            .route(
+                "/api/pipeline/monitor/:uuid",
+                get(Self::remote_entrypoint_monitor_endpoint),
+            )
+            .layer(DefaultBodyLimit::disable())
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", interface, port)).await?;
+        tracing::info!("ready for connections, listening on {}", interface);
+        axum::serve(listener, app).await.unwrap();
+
+        Ok(())
+    }
+
+    /// Entrypoint for submitting new searches. Returns the UUID of the search.
+    ///
+    /// # Arguments
+    /// * `state` - Application state containing the storage, work directory and index queue
+    ///
+    /// # API
+    /// ## Request
+    /// * Path: `/api/pipeline/enqueue`
+    /// * Method: `POST`
+    /// * Content-Type: `multipart/form-data`
+    ///
+    /// ### Body
+    /// * `mzml_*` - Every fields starting with `mzml_` is considered as a mzML file
+    /// * `search_parameters` - Search parameters in TOML format (section `search_parameters` from the configuration file without the section name)
+    /// * `comet_params` - Comet parameter file
+    /// * `ptms` - CSV file containing PTMs
+    ///
+    /// ## Response
+    /// ```
+    /// ae2439d1-7940-4b43-b96e-444a1e99e78d
+    /// ```
+    ///
+    async fn remote_entrypoint_enqueue_endpoint(
+        State(state): State<Arc<EntrypointServiceState>>,
+        mut payload: Multipart,
+    ) -> Result<Response, AnyhowWebError> {
+        // Manifest files
+        let uuid = Uuid::new_v4().to_string();
+        let mut ptms: Vec<PostTranslationalModification> = Vec::new();
+        let mut manifests: Vec<SearchManifest> = Vec::new();
+
+        // Mandatory file flags
+        let mut is_search_params_uploaded = false;
+        let mut is_comet_params_uploaded = false;
+
+        while let Ok(Some(field)) = payload.next_field().await {
+            let field_name = match field.name() {
+                Some(name) => name,
+                None => return Err(anyhow!("Field has no name").into()),
+            };
+
+            if field_name.starts_with("mzml_") {
+                let file_name = match field.file_name() {
+                    Some(file_name) => file_name.to_string(),
+                    None => continue,
+                };
+                let manifest = SearchManifest::new(uuid.clone(), &file_name);
+                tokio::fs::create_dir_all(&manifest.get_ms_run_dir_path(&state.work_dir)).await?;
+
+                write_streamed_file(&manifest.get_ms_run_mzml_path(&state.work_dir), field).await?;
+                manifests.push(manifest);
+                continue;
+            }
+
+            if field_name == "search_params" {
+                let search_params: SearchParameters = match &field.text().await {
+                    Ok(text) => toml::from_str(text).context("Parsing search parameters TOML")?,
+                    Err(err) => {
+                        return Err(anyhow!("Error reading search params field: {:?}", err).into())
+                    }
+                };
+                state
+                    .storage
+                    .write()
+                    .await
+                    .set_search_parameters(&uuid, search_params)
+                    .await?;
+                is_search_params_uploaded = true;
+                continue;
+            }
+
+            if field_name == "comet_params" {
+                let comet_params: CometConfiguration = match &field.text().await {
+                    Ok(text) => CometConfiguration::new(text.to_string())?,
+                    Err(err) => {
+                        return Err(anyhow!("Error reading Comet params field: {:?}", err).into())
+                    }
+                };
+                state
+                    .storage
+                    .write()
+                    .await
+                    .set_comet_config(&uuid, &comet_params)
+                    .await?;
+                is_comet_params_uploaded = true;
+                continue;
+            }
+
+            // Optional PTMs
+            if field_name == "ptms" {
+                let ptm_csv = match field.bytes().await {
+                    Ok(csv) => Cursor::new(csv),
+                    Err(err) => return Err(anyhow!("Error reading PTMs field: {:?}", err).into()),
+                };
+
+                let reader = csv::ReaderBuilder::new()
+                    .has_headers(true)
+                    .delimiter(b',')
+                    .from_reader(ptm_csv);
+
+                ptms = reader
+                    .into_deserialize::<PostTranslationalModification>()
+                    .into_iter()
+                    .map(|ptm_result| match ptm_result {
+                        Ok(ptm) => Ok(ptm),
+                        Err(e) => Err(anyhow::Error::new(e)),
+                    })
+                    .collect::<Result<Vec<PostTranslationalModification>>>()?;
+
+                debug!("PTMs: {}", &ptms.len());
+            }
+        }
+
+        if manifests.is_empty() {
+            return Err(anyhow!("No mzML files uploaded").into());
+        }
+
+        if !is_search_params_uploaded {
+            tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+            return Err(anyhow!("Search parameters not uploaded").into());
+        }
+
+        if !is_comet_params_uploaded {
+            tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+            return Err(anyhow!("Comet parameters not uploaded").into());
+        }
+
+        // Add remaining data
+        state.storage.write().await.set_ptms(&uuid, &ptms).await?;
+        state.storage.write().await.init_counters(&uuid).await?;
+
+        for mut manifest in manifests.into_iter() {
+            loop {
+                manifest = match state.index_queue.push(manifest).await {
+                    Ok(_) => break,
+                    Err(errored_manifest) => {
+                        error!("Error pushing manifest to index queue");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        errored_manifest
+                    }
+                }
+            }
+        }
+
+        Ok((StatusCode::OK, uuid).into_response())
+    }
+
+    /// Entrypoint for monitoring the progress of a search
+    ///
+    /// # API
+    /// ## Request
+    /// * Path: `/api/pipeline/monitor/:uuid`
+    /// * Method: `GET`
+    ///
+    /// ## Response
+    /// RSV with metrics
+    /// ```tsv
+    /// started_searches        prepared        search_space_generation comet_search    goodness_and_rescoring  cleanup
+    /// 13852   10357   286     64      47      47
+    /// ```
+    ///
+    async fn remote_entrypoint_monitor_endpoint(
+        State(state): State<Arc<EntrypointServiceState>>,
+        axum::extract::Path(uuid): axum::extract::Path<String>,
+    ) -> Result<Response<String>, AnyhowWebError> {
+        let counters: Vec<usize> = {
+            let storage = state.storage.read().await;
+            vec![
+                storage.get_started_searches_ctr(&uuid).await?,
+                storage.get_prepared_ctr(&uuid).await?,
+                storage.get_search_space_generation_ctr(&uuid).await?,
+                storage.get_comet_search_ctr(&uuid).await?,
+                storage.get_goodness_and_rescoring_ctr(&uuid).await?,
+                storage.get_cleanup_ctr(&uuid).await?,
+            ]
+        };
+
+        // Start with column names
+        let mut csv = COUNTER_LABLES
+            .iter()
+            .map(|label| label.to_string())
+            .collect::<Vec<String>>()
+            .join("\t");
+        // add a new line
+        csv.push_str("\n");
+        // Add the counters
+        csv.push_str(
+            &counters
+                .into_iter()
+                .map(|ctr| format!("{}", ctr))
+                .collect::<Vec<String>>()
+                .join("\t"),
+        );
+
+        let response = axum::response::Response::builder()
+            .header("Content-Type", "text/tab-separated-values")
+            .status(StatusCode::OK)
+            .body(csv)?;
+
+        Ok(response)
     }
 
     pub async fn standalone_indexing(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
@@ -1751,8 +2107,22 @@ impl Pipeline {
         let storage = Arc::new(storage);
         let input_queue = Arc::new(input_queue);
         let output_queue = Arc::new(output_queue);
-
         let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let mut signals = Signals::new(&[SIGINT])?;
+
+        let signal_stop_flag = stop_flag.clone();
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                match sig {
+                    SIGINT => {
+                        info!("Gracefully stopping.");
+                        signal_stop_flag.store(true, Ordering::Relaxed);
+                    }
+                    _ => (),
+                }
+            }
+        });
 
         let handles: Vec<tokio::task::JoinHandle<()>> =
             (0..config.goodness_and_rescoring.num_tasks)

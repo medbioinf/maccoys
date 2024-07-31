@@ -14,7 +14,7 @@ use dihardts_omicstools::proteomics::io::mzml::{
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use indicatif::ProgressStyle;
-use maccoys::pipeline::configuration::{PipelineConfiguration, RemotePipelineConfiguration};
+use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
 use maccoys::pipeline::pipeline::Pipeline;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
@@ -83,19 +83,32 @@ enum PipelineCommand {
         /// PTM file path
         #[arg(short, long)]
         ptms_file: Option<PathBuf>,
-        /// Contains `search_parameters`, `index`-, & `storages`-section of the pipeline configuration
-        config: PathBuf,
-        /// Default comet params
-        default_comet_params_file: PathBuf,
+        /// Base url to the entrypoin, e.g. http://localhost:8080
+        base_url: String,
+        /// Search parameters file path, contains `search_parameters`-section of the pipeline configuration
+        search_parameters_file: PathBuf,
+        /// Comet params
+        comet_params_file: PathBuf,
         /// Paths to mzML files
         /// Glob patterns are allowed. e.g. /path/to/**/*.mzML, put them in quotes if your shell expands them.
         #[arg(value_delimiter = ' ', num_args = 0..)]
         mzml_file_paths: Vec<String>,
     },
+    /// Starts a web service which can be made public to submit data to be processed
+    RemoteEntrypoint {
+        /// Interface where the service is spawned
+        interface: String,
+        /// Port where the service is spawned
+        port: u16,
+        /// Directory where each search is stored
+        work_dir: PathBuf,
+        /// Contains `index`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
     /// Monitor for remote searches
     SearchMonitor {
         /// Contains `search_parameters`, `index`-, & `storages`-section of the pipeline configuration
-        config_file_path: PathBuf,
+        base_url: String,
         /// Search UUID
         uuid: String,
     },
@@ -482,42 +495,40 @@ async fn main() -> Result<()> {
             }
             PipelineCommand::RemoteRun {
                 ptms_file,
-                config,
-                default_comet_params_file,
+                base_url,
+                search_parameters_file,
+                comet_params_file,
                 mzml_file_paths,
             } => {
-                let config: RemotePipelineConfiguration =
-                    toml::from_str(&read_to_string(&config).context("Reading config file")?)
-                        .context("Deserialize config")?;
-
-                let mut ptms: Vec<PostTranslationalModification> = Vec::new();
-                if let Some(ptms_file) = &ptms_file {
-                    ptms = PtmReader::read(Path::new(ptms_file))?;
-                }
-
-                let comet_config = match CometConfiguration::try_from(&default_comet_params_file) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        bail!("Error reading Comet configuration: {:?}", e);
-                    }
-                };
-
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
 
-                info!("Running remote pipeline");
-                Pipeline::run_remotely(ptms, comet_config, config, mzml_file_paths).await?;
+                info!("Enqueue into remote pipeline");
+                let uuid = Pipeline::run_remotely(
+                    base_url,
+                    search_parameters_file,
+                    comet_params_file,
+                    mzml_file_paths,
+                    ptms_file,
+                )
+                .await?;
+                println!("Do not forget your UUID: {}", uuid);
             }
-            PipelineCommand::SearchMonitor {
+            PipelineCommand::RemoteEntrypoint {
+                interface,
+                port,
+                work_dir,
                 config_file_path,
-                uuid,
             } => {
-                let config: RemotePipelineConfiguration = toml::from_str(
+                let config: RemoteEntypointConfiguration = toml::from_str(
                     &read_to_string(&config_file_path).context("Reading config file")?,
                 )
                 .context("Deserialize config")?;
 
+                Pipeline::start_remote_entrypoint(interface, port, work_dir, config).await?;
+            }
+            PipelineCommand::SearchMonitor { base_url, uuid } => {
                 info!("Running search monitor");
-                Pipeline::start_search_monitor(config, uuid).await?;
+                Pipeline::start_remote_search_monitor(base_url, &uuid).await?;
             }
             // TODO: Is there a more generic way to implment the standalone tasks?
             // Only thing which changes is the configuration type and config attributes to call for the input and output queues

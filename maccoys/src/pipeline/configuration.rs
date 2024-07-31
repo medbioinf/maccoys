@@ -206,12 +206,10 @@ impl PipelineConfiguration {
     }
 }
 
-/// Configuration for standalone cleanup
+/// Configuration for the remote entrypoint
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
-pub struct RemotePipelineConfiguration {
-    /// Search parameter
-    pub search_parameters: SearchParameters,
+pub struct RemoteEntypointConfiguration {
     /// Index task configuration
     pub index: TaskConfiguration,
     /// Storage configuration

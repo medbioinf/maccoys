@@ -2,6 +2,7 @@
 use std::collections::HashSet;
 use std::fs::{read_to_string, write as write_to_file};
 use std::path::{Path, PathBuf};
+use std::string::ToString;
 
 // 3rd party imports
 use anyhow::{bail, Result};
@@ -293,6 +294,12 @@ impl TryFrom<&PathBuf> for Configuration {
     fn try_from(path: &PathBuf) -> Result<Self> {
         let content = read_to_string(path)?;
         Ok(Self::new(content)?)
+    }
+}
+
+impl ToString for Configuration {
+    fn to_string(&self) -> String {
+        self.content.clone()
     }
 }
 

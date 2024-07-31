@@ -22,7 +22,7 @@ use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use polars::prelude::*;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 use crate::constants::{
     COMET_DIST_BASE_SCORE, COMET_EXP_BASE_SCORE, COMET_MAX_PSMS, DIST_SCORE_NAME, EXP_SCORE_NAME,

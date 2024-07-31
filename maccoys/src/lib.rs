@@ -5,6 +5,8 @@
 pub mod constants;
 /// Module for database operations.
 pub mod database;
+/// MaCcoyS specific errors
+pub mod errors;
 /// Basic functions necessary for running a MaCcoyS search.
 pub mod functions;
 /// Goodness of fit record for MaCcoyS searches.
