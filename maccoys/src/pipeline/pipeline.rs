@@ -117,11 +117,13 @@ impl Pipeline {
 
         let mut storage = S::new(&config.storage).await?;
         storage
-            .set_search_parameters(&uuid, config.search_parameters.clone())
+            .init_search(
+                &uuid,
+                config.search_parameters.clone(),
+                &ptms,
+                &comet_config,
+            )
             .await?;
-        storage.set_ptms(&uuid, &ptms).await?;
-        storage.set_comet_config(&uuid, &comet_config).await?;
-        storage.init_counters(&uuid).await?;
 
         let storage = Arc::new(storage);
 
@@ -367,10 +369,7 @@ impl Pipeline {
                 bail!("Error unwrapping storage");
             }
         };
-        storage.remove_search_params(&uuid).await?;
-        storage.remove_comet_config(&uuid).await?;
-        storage.remove_ptms(&uuid).await?;
-        storage.remove_counters(&uuid).await?;
+        storage.cleanup_search(&uuid).await?;
 
         Ok(())
     }
@@ -1772,12 +1771,10 @@ impl Pipeline {
     ) -> Result<Response, AnyhowWebError> {
         // Manifest files
         let uuid = Uuid::new_v4().to_string();
+        let mut search_params: Option<SearchParameters> = None;
+        let mut comet_params: Option<CometConfiguration> = None;
         let mut ptms: Vec<PostTranslationalModification> = Vec::new();
         let mut manifests: Vec<SearchManifest> = Vec::new();
-
-        // Mandatory file flags
-        let mut is_search_params_uploaded = false;
-        let mut is_comet_params_uploaded = false;
 
         while let Ok(Some(field)) = payload.next_field().await {
             let field_name = match field.name() {
@@ -1799,36 +1796,24 @@ impl Pipeline {
             }
 
             if field_name == "search_params" {
-                let search_params: SearchParameters = match &field.text().await {
-                    Ok(text) => toml::from_str(text).context("Parsing search parameters TOML")?,
+                search_params = match &field.text().await {
+                    Ok(text) => {
+                        Some(toml::from_str(text).context("Parsing search parameters TOML")?)
+                    }
                     Err(err) => {
                         return Err(anyhow!("Error reading search params field: {:?}", err).into())
                     }
                 };
-                state
-                    .storage
-                    .write()
-                    .await
-                    .set_search_parameters(&uuid, search_params)
-                    .await?;
-                is_search_params_uploaded = true;
                 continue;
             }
 
             if field_name == "comet_params" {
-                let comet_params: CometConfiguration = match &field.text().await {
-                    Ok(text) => CometConfiguration::new(text.to_string())?,
+                comet_params = match &field.text().await {
+                    Ok(text) => Some(CometConfiguration::new(text.to_string())?),
                     Err(err) => {
                         return Err(anyhow!("Error reading Comet params field: {:?}", err).into())
                     }
                 };
-                state
-                    .storage
-                    .write()
-                    .await
-                    .set_comet_config(&uuid, &comet_params)
-                    .await?;
-                is_comet_params_uploaded = true;
                 continue;
             }
 
@@ -1861,20 +1846,38 @@ impl Pipeline {
             return Err(anyhow!("No mzML files uploaded").into());
         }
 
-        if !is_search_params_uploaded {
-            tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
-            return Err(anyhow!("Search parameters not uploaded").into());
+        let search_params = match search_params {
+            Some(search_params) => search_params,
+            None => {
+                tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+                return Err(anyhow!("Search parameters not uploaded").into());
+            }
+        };
+
+        let comet_params = match comet_params {
+            Some(comet_params) => comet_params,
+            None => {
+                tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+                return Err(anyhow!("Comet parameters not uploaded").into());
+            }
+        };
+
+        // Init new search
+        match state
+            .storage
+            .write()
+            .await
+            .init_search(&uuid, search_params, &ptms, &comet_params)
+            .await
+        {
+            Ok(_) => (),
+            Err(e) => {
+                tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+                return Err(anyhow!("Error initializing search: {:?}", e).into());
+            }
         }
 
-        if !is_comet_params_uploaded {
-            tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
-            return Err(anyhow!("Comet parameters not uploaded").into());
-        }
-
-        // Add remaining data
-        state.storage.write().await.set_ptms(&uuid, &ptms).await?;
-        state.storage.write().await.init_counters(&uuid).await?;
-
+        // Start enqueuing manifest
         for mut manifest in manifests.into_iter() {
             loop {
                 manifest = match state.index_queue.push(manifest).await {

@@ -232,6 +232,10 @@ pub trait PipelineStorage: Send + Sync + Sized {
         format!("comet_config:{}", uuid)
     }
 
+    fn get_is_completely_enqueued_key(uuid: &str) -> String {
+        format!("is_completely_enqueued:{}", uuid)
+    }
+
     build_key__init__get__increment__remove__ctr_functions!(started_searches);
     build_key__init__get__increment__remove__ctr_functions!(prepared);
     build_key__init__get__increment__remove__ctr_functions!(search_space_generation);
@@ -239,19 +243,33 @@ pub trait PipelineStorage: Send + Sync + Sized {
     build_key__init__get__increment__remove__ctr_functions!(goodness_and_rescoring);
     build_key__init__get__increment__remove__ctr_functions!(cleanup);
 
-    /// Create counters for the given search
+    /// Initialize a keys for new search
     ///
     /// # Arguments
     /// * `uuid` - UUID for the counters
+    /// * `search_parameters` - Search parameters
+    /// * `ptms` - Post translational modifications
+    /// * `comet_config` - Comet configuration
     ///
-    fn init_counters(&mut self, uuid: &str) -> impl Future<Output = Result<()>> {
+    fn init_search(
+        &mut self,
+        uuid: &str,
+        search_parameters: SearchParameters,
+        ptms: &Vec<PostTranslationalModification>,
+        comet_config: &CometConfiguration,
+    ) -> impl Future<Output = Result<()>> {
         async {
+            // Init counters
             self.init_started_searches_ctr(uuid).await?;
             self.init_prepared_ctr(uuid).await?;
             self.init_search_space_generation_ctr(uuid).await?;
             self.init_comet_search_ctr(uuid).await?;
             self.init_goodness_and_rescoring_ctr(uuid).await?;
             self.init_cleanup_ctr(uuid).await?;
+            // Set configs
+            self.set_search_parameters(uuid, search_parameters).await?;
+            self.set_ptms(uuid, ptms).await?;
+            self.set_comet_config(uuid, comet_config).await?;
 
             Ok(())
         }
@@ -262,14 +280,19 @@ pub trait PipelineStorage: Send + Sync + Sized {
     /// # Arguments
     /// * `uuid` - UUID for the counters
     ///
-    fn remove_counters(&mut self, uuid: &str) -> impl Future<Output = Result<()>> {
+    fn cleanup_search(&mut self, uuid: &str) -> impl Future<Output = Result<()>> {
         async {
+            // Remove counters
             self.remove_started_searches_ctr(uuid).await?;
             self.remove_prepared_ctr(uuid).await?;
             self.remove_search_space_generation_ctr(uuid).await?;
             self.remove_comet_search_ctr(uuid).await?;
             self.remove_goodness_and_rescoring_ctr(uuid).await?;
             self.remove_cleanup_ctr(uuid).await?;
+            // Remove configs
+            self.remove_search_params(uuid).await?;
+            self.remove_ptms(uuid).await?;
+            self.remove_comet_config(uuid).await?;
 
             Ok(())
         }
