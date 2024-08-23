@@ -2,109 +2,81 @@
 **The `S` is silent.**
 
 MaCcoyS creates a spectrum specific search space with all available targets matching the precursor(s) of a given MS2 spectrum by fetching them from MaCPepDB. The MS2 spectrum in question is then identified using [Comet](https://uwpr.github.io/Comet/) and the specialized search space.    
-The PSM validation is not relying on the FDR as usual but on a newly introduced hyper score. Therefore the exponential distribution is fitted to the PSM distribution per spectrum. If the PSM distribution is fitting well, this is tested using the \[???\] test, cumulative distribution function is used to calculate a survival score for each spectrum which is the new hyperscore.   
+The PSM validation is not relying on the FDR as usual but on a newly introduced hyper score. Therefore the exponential distribution is fitted to the PSM distribution per spectrum. If the PSM distribution is fitting well, this is tested using the \[???\] test, the cumulative distribution function is used to calculate a survival score for each spectrum which is the new hyperscore.   
 TODO: Separating of PSM
 
+
 ## Installation
+
+### Native
 Coming as soon as published to `crates.io` and `pypy.org`. For now see section [Development](#development)
+
+### Docker
+
+#### Requirements
+* [Docker](https://www.docker.com/)
+
+#### Pull latest container
+Comming as soon as published on quay.io. For now see section [Build latest](#build-latest-container)
+
+#### Build latest container
+1. Clone the repository
+2. Run `docker build -t local/maccoys:latest -f docker/Dockerfile .` 
+
 
 ## Usage
 
-### Create database cache
-Create a cache for decoys.   
-`cargo run -r -- database-build scylla://<COMMA_SEPARATED_LIST_OF_DB_NODES> <KEYSPACE> <URL_OR_FILEPATH_TO_MACPEPDB_CONFIG>`   
-e.g.   
-`cargo run -r -- database-build scylla://127.0.0.1:9042 maccoys http://127.0.0.1:9999/api/configuration`
-
-### Run the decoy insertion endpoint
-This endpoint is needed for caching decoys created for the identification.   
-`cargo run -r web scylla://scylla://<COMMA_SEPARATED_LIST_OF_DB_NODES> <KEYSPACE> <INTERFACE/IP> <PORT>`   
-e.g.   
-`cargo run -r web scylla://localhost:9042 maccoys 127.0.0.1 10000`
-
-### Create a mzML index
-`cargo run -r -- index-spectrum-file --help` will give you an overview what is necessary to identify a MS2 spectra.
-
-Example:
-```
-cargo run -r -- index-spectrum-file ./mzmls/QExHF06833std.mzML  ./tmp/QExHF06833std.index.json
-```
-
-### Identify a single MS2 spectrum
-`cargo run -r -- search --help` will give you an overview what is necessary to identify a MS2 spectra.
-
-Example:
-```
-cargo run -r -- search ./mzmls/QExHF06833std.mzML ./tmp/QExHF06833std.index.json 'controllerType=0 controllerNumber=1 scan=28374' ./tmp test_files/comet.params 5 5 3 0.02 0.0 6 10  scylla://localhost:9042/macpepdb_mouse -p ../macpepdb-rs/test_files/mods.csv
-```
+### MS-file conversion
+MaCcoyS is expecting the MS data in mzML format. Here is a list of tools to convert different vendor formats 
+* `Thermo .raw-file`:
+    * [msconvert of Prote Wizard](https://proteowizard.sourceforge.io/index.html) - Enable vendor peak picking. Windows users have GUI. Also available for Linux and Mac (Intel & Apple Silicon) users via docker: `docker run -it -e WINEDEBUG=-all -v $(pwd):/data chambm/pwiz-skyline-i-agree-to-the-vendor-licenses wine msconvert ...`
+    * [ThermoRawFileParserGUI](http://compomics.github.io/projects/ThermoRawFileParserGUI) & [ThermoRawFileParser](https://github.com/compomics/ThermoRawFileParser) - Standard settings are fine. Not working on Apple Silicon.
+* `Bruker .d-folders`:
+    * (tdf2mzml)[https://github.com/mafreitas/tdf2mzml] - CLI only. Use `--ms1_type centroid`
 
 ### Batch processing
-For a identifying multiple mzMLs including all MS2 use the provided Nextflow workflow.
+MaCcoyS has a integrated pipeline for batch processing which can be used locally or on distributed system.
 
-Example:
-```
-nextflow run -w ./tmp/work maccoys.nf --maccoys-bin $(pwd)/target/release/maccoys --mzml-dir ./tmp/mzmls --results-dir ./tmp/results --target-url scylla://localhost:9042/macpepdb_mouse --fragment-tolerance 0.02 --fragment-bin-offset 0.0
-```
+#### Locally
+Great for testing and playing around
+1. Generate a comet config
+    * native: `comet -p`
+    * docker: `docker run --rm -it --entrypoint "" local/maccoys:dev bash -c 'comet -p > /dev/null; cat comet.params.new' > comet.params.new`
+2. Generate a pipeline config
+    * native: `maccoys pipeline new-config`
+    * docker: `docker run --rm -it local/maccoys:dev pipeline new-config`
+3. Adjust both configs to your MS-parameter and experimental design
+4. Run the pipeline
+    * native: `maccoys -vvvvvv -l <PATH_TO_LOG_FILE> pipeline local-run  <RESULT_FOLDER_PATH> <PATH_TO_MACCOYS_CONFIG_TOML> <PATH_TO_COMET_CONFIG> <MZML_FILES_0> <MZML_FILE_1> ...`
+    * docker: `docker run --rm -it local/maccoys:dev pipeline new-config`
+5. `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv -l /data/logs/maccoys.log pipeline local-run  /data/results /data/<PATH_TO_MACCOYS_CONFIG_TOML> /data/<PATH_TO_COMET_CONFIG> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
 
-#### This has some additional requirements
-* jq (Ubuntu: `apt install jq`, MacOS: `brew install jq`, Conda: `conda install jq`)
-* [Comet](https://github.com/UWPR/Comet/releases)
-    * Add it to your `PATH` environment variable or add a folder called `bin` next to `maccoys.nf`
-* [Nextflow](https://www.nextflow.io/)
+Checkout `... pipline --help` and have a look on the optional parameter and the parameter descriptions which might be helpful.
 
-#### Arguments
-Arguments are mostly equal to the MaCcoyS binary.
+#### Distributed
+The pipeline can also be deployed on multiple machines. Have a look into `Procfile` do get an idea of the setup. The only requirement for the deployment is that each part of the pipeline has access to the results folder, e.g. via NFS, and has access to a central redis server.
 
-##### Required arguments
-| Argument | Description |
-| --- | --- |
-| `--maccoys-bin` | MaCcoyS binary (need to be compiled previously) |
-| `--spec-dir` | Directory with Thermo raw files (*.raw) or mzML files (*.mzml/*.mzML) |
-| `--lower-mass-tol` | Lower mass tolerance of the MS (ppm) |
-| `--upper-mass-tol` | Upper mass tolerance of the MS (ppm) |
-| `--max-var-ptm` | Max. variable PTM per peptide |
-| `--decoys-per-target` | Decoys per target |
-| `--fragment-tolerance` | Fragment tolerance (for Comet `fragment_bin_tolerance`) |
-| `--fragment-bin-offset` | Fragment bin offset (for Comet) |
-| `--max-charge` | Max. charge tried for spectra where precurser charge was not reported. |
-| `--target-url` | Web or database URL for fetching target from MaCPepDB |
-| `--results-dir` | Empty directory for storing results. Directory name is also the name used in the web API / GUI |
+You can test it via:
+1. Shell 1: `docker compose up`
+2. Shell 2: `ultraman start` (you can use any Procfile manager, like (ultraman)[https://github.com/yukihirop/ultraman], (foreman)[https://github.com/ddollar/foreman] or (honcho)[https://github.com/nickstenning/honcho/tree/main])
 
-##### Optional arguments
-| Argument | Description |
-| --- | --- |
-| `--ptm-file` | Files defining PTMs |
-| `--decoy-url` | `http` or `scylla` URL for fetching decoys |
-| `--decoy-cache-url` | `http` or `scylla` URL for storing decoys |
-| `--target-lookup-url` | `http`, `bloom+http` or `scylla` URL for target lookup |
-| `--keep-search-files` | Set this to non-zero to keep the search files (search engine config, FASTA files) |  
-| `--comet-threads` | Set this to something larger zero to limit the number of threads Comet is using |
-| `--comet-max-fork` | If `--comet-threads` is set, the workflow will spawn `cores / --comet-threads` forks. If you can afford more, you can override it here. This is only set if `--comet-threads` is set.  |
+Using the following command, the search is send to the remote entrypoint and scheduled:
+* native: `maccoys -vvvvvv pipeline remote-run <API_BASE_URL> <PATH_TO_SEARCH_PARAMETER_TOML> <PATH_TO_COMET_CONFIG> <MZML_FILES_0> <MZML_FILE_1> ...`
+* docker: `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv pipeline local-run <API_BASE_URL> /data/<PATH_TO_SEARCH_PARAMETER_TOML> /data/<PATH_TO_COMET_CONFIG> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
 
-#### Non-mzML files
-The workflow is able to convert non-mzML file. This is done using Docker images, therefore the run command is a bit different: `nextflow run -profile conversion maccoys.nf ...`
-
-
-##### Apple Silicon (M1, M2, ...)
-```
-env DOCKER_DEFAULT_PLATFORM=linux/amd64 nextflow run -profile docker maccoys.nf ...
-```
-
-TL;DR The used docker images for file conversion are not provided for ARM 64 CPUs, therefore Docker will print a warning on sdterr, which will stop the Nextflow process.
-
-
+MaCcoyS will print an UUID to identify the search, e.g. to recheck the progress with `... -vvvvvvv pipeline search-monitor <API_BASE_URL> <UUID>` and find the results.
 
 ## Development
 
-### Dependencies
-* Rust nightly >= 2023-07-12
-* [Nextflow](https://www.nextflow.io/)
-* Conda | Mamba | Micromamba
+### Requirements
+* Rust: The recommended way is to use [rustup](https://rustup.rs/)
+* Conda | Mamba | Micromamba: All three have the same CLI. Just use Micromamba, it's the fastest.
 
 ### Preparation
-1. Install Rust & Cargo. The easiest way is to install and use `rustup`
-2. `rustup toolchain install nightly-2023-07-12`
-3. Install Conda or one of it derivates
-4. `conda env create -f environment.yaml`
-5. `conda activate maccoys`
-6. Install Nextflow
+1. `micromamba env create -f environment.yaml`
+2. `micromamba activate maccoys`
+3. `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(dirname $(dirname $(which python)))/lib`,
+    this will add environments Python libraries into the `LD_LIBRARY_PATH`-variable so they ara availabe for the Rust compiler
+3. `cargo build`, rustup should install the needed Rust version and compile
+
+
