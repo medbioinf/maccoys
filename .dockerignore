@@ -1,18 +1,29 @@
-# Rust & Cargo files
-/target
-/Cargo.lock
-
-# Nextflow output
-/.nextflow
-/.nextflow.log
-/.nextflow.log.*
-
 # General
-/tmp
+tmp/
 *.tmp
+*.log
+/*.toml
+logs/
+
+# Comet
+*.params
+
+# Rust & Cargo files
+target/
+/Cargo.lock
+!Cargo.toml
+test_files/
+
+# IDE, development and OS
+.DS_Store
+/.vscode
+Procfile
+.gitignore
+docker-compose.yaml
+/.git
 
 #### Python files
-
+!pyproject.toml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
