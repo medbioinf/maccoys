@@ -1,5 +1,5 @@
 // Include readme in doc
-#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../Readme.md"))]
+#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Readme.md"))]
 
 /// Collection of constants
 pub mod constants;

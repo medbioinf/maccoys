@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -204,6 +204,27 @@ pub trait PipelineStorage: Send + Sync + Sized {
     ///
     fn remove_comet_config(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
 
+    /// Initialize the flag that the complete search is enqueued
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn init_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
+
+    /// Sets a flag that the complete search is enqueued
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn set_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
+
+    /// Remove the flag that the complete search is enqueued
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn remove_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
+
     /// Inrement the given counter by one
     ///
     fn increment_ctr(&self, ctr_key: &str) -> impl Future<Output = Result<usize>> + Send;
@@ -270,6 +291,8 @@ pub trait PipelineStorage: Send + Sync + Sized {
             self.set_search_parameters(uuid, search_parameters).await?;
             self.set_ptms(uuid, ptms).await?;
             self.set_comet_config(uuid, comet_config).await?;
+            // Set flags
+            self.init_is_completely_enqueued(uuid).await?;
 
             Ok(())
         }
@@ -293,6 +316,8 @@ pub trait PipelineStorage: Send + Sync + Sized {
             self.remove_search_params(uuid).await?;
             self.remove_ptms(uuid).await?;
             self.remove_comet_config(uuid).await?;
+            // Remove flags
+            self.remove_is_completely_enqueued(uuid).await?;
 
             Ok(())
         }
@@ -363,6 +388,9 @@ pub struct LocalPipelineStorage {
 
     /// Counters
     counters: HashMap<String, Arc<AtomicUsize>>,
+
+    /// Flags
+    flags: HashMap<String, Arc<AtomicBool>>,
 }
 
 impl PipelineStorage for LocalPipelineStorage {
@@ -372,6 +400,7 @@ impl PipelineStorage for LocalPipelineStorage {
             ptms_collections: HashMap::new(),
             comet_configs: HashMap::new(),
             counters: HashMap::new(),
+            flags: HashMap::new(),
         })
     }
 
@@ -432,6 +461,37 @@ impl PipelineStorage for LocalPipelineStorage {
     async fn remove_comet_config(&mut self, uuid: &str) -> Result<()> {
         self.comet_configs.remove(&Self::get_comet_config_key(uuid));
         Ok(())
+    }
+
+    async fn init_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
+        self.flags.insert(
+            Self::get_is_completely_enqueued_key(uuid),
+            Arc::new(AtomicBool::new(false)),
+        );
+        Ok(())
+    }
+
+    async fn set_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
+        match self.flags.get(&Self::get_is_completely_enqueued_key(uuid)) {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            None => bail!(
+                "[STORAGE] Flag {} not found",
+                Self::get_is_completely_enqueued_key(uuid)
+            ),
+        }
+    }
+
+    async fn remove_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
+        match self
+            .flags
+            .remove(&Self::get_is_completely_enqueued_key(uuid))
+        {
+            Some(_) => Ok(()),
+            None => Ok(()),
+        }
     }
 
     async fn increment_ctr(&self, ctr_key: &str) -> Result<usize> {
@@ -599,6 +659,33 @@ impl PipelineStorage for RedisPipelineStorage {
             .del(Self::get_comet_config_key(uuid))
             .await
             .context("[STORAGE] Error removing Comet configuration")?;
+        Ok(())
+    }
+
+    async fn init_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
+        let key = Self::get_is_completely_enqueued_key(uuid);
+        Ok(self
+            .client
+            .set(key, false)
+            .await
+            .context("[STORAGE] Error initialize is completely enqueued ")?)
+    }
+    async fn set_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
+        let key = Self::get_is_completely_enqueued_key(uuid);
+        Ok(self
+            .client
+            .set(key, true)
+            .await
+            .context("[STORAGE] Error setting is completely enqueued")?)
+    }
+
+    async fn remove_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
+        let key = Self::get_is_completely_enqueued_key(uuid);
+        self.client
+            .del(key)
+            .await
+            .context("[STORAGE] Error removing completely enqueued")?;
+
         Ok(())
     }
 
