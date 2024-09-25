@@ -38,7 +38,11 @@ use macpepdb::{
 use polars::prelude::*;
 use pyo3::{prelude::*, types::PyList};
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use tokio::sync::{mpsc::error::TryRecvError, RwLock};
+use tokio::{
+    fs::{create_dir_all, remove_dir_all},
+    io::AsyncWriteExt,
+    sync::{mpsc::error::TryRecvError, RwLock},
+};
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
@@ -58,7 +62,7 @@ use super::{
 use crate::{
     constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
     errors::axum::web_error::AnyhowWebError,
-    functions::{create_search_space, create_work_dir, run_comet_search},
+    functions::{create_search_space, run_comet_search},
     goodness_of_fit_record::GoodnessOfFitRecord,
     io::axum::multipart::write_streamed_file,
     io::comet::{
@@ -82,8 +86,45 @@ const SPECTRUM_STOP_TAG: &'static [u8; 11] = b"</spectrum>";
 ///
 struct EntrypointServiceState {
     index_queue: RedisPipelineQueue,
+    preparation_queue: RedisPipelineQueue,
+    search_space_generation_queue: RedisPipelineQueue,
+    comet_search_queue: RedisPipelineQueue,
+    goodness_and_rescoring_queue: RedisPipelineQueue,
+    cleanup_queue: RedisPipelineQueue,
     storage: RwLock<RedisPipelineStorage>,
     work_dir: PathBuf,
+}
+
+/// Stucture to share pipline workload
+///
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PipelineWorkload {
+    pub index_queue: usize,
+    pub preparation_queue: usize,
+    pub search_space_generation_queue: usize,
+    pub comet_search_queue: usize,
+    pub goodness_and_rescoring_queue: usize,
+    pub cleanup_queue: usize,
+}
+
+impl PipelineWorkload {
+    pub async fn new(
+        index_queue: &impl PipelineQueue,
+        preparation_queue: &impl PipelineQueue,
+        search_space_generation_queue: &impl PipelineQueue,
+        comet_search_queue: &impl PipelineQueue,
+        goodness_and_rescoring_queue: &impl PipelineQueue,
+        cleanup_queue: &impl PipelineQueue,
+    ) -> Self {
+        Self {
+            index_queue: index_queue.len().await,
+            preparation_queue: preparation_queue.len().await,
+            search_space_generation_queue: search_space_generation_queue.len().await,
+            comet_search_queue: comet_search_queue.len().await,
+            goodness_and_rescoring_queue: goodness_and_rescoring_queue.len().await,
+            cleanup_queue: cleanup_queue.len().await,
+        }
+    }
 }
 
 /// Pipeline to run the MaCcoyS identification pipeline
@@ -94,14 +135,16 @@ impl Pipeline {
     /// Run the pipeline locally for each mzML file
     ///
     /// # Arguments
-    /// * `work_dir` - Work directory where each search is stored
+    /// * `result_dir` - Result directory where each search is stored
+    /// * `tmp_dir` - Temporary directory for the pipeline
     /// * `config` - Configuration for the pipeline
     /// * `comet_config` - Configuration for Comet
     /// * `ptms` - Post translational modifications
     /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
     pub async fn run_locally<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        work_dir: PathBuf,
+        result_dir: PathBuf,
+        tmp_dir: PathBuf,
         config: PipelineConfiguration,
         mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
@@ -110,7 +153,12 @@ impl Pipeline {
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
 
-        create_work_dir(&work_dir).await?;
+        create_dir_all(&result_dir)
+            .await
+            .context("Could not create result directory")?;
+        create_dir_all(&tmp_dir)
+            .await
+            .context("Could not create temporery directory")?;
 
         comet_config.set_ptms(&ptms, config.search_parameters.max_variable_modifications)?;
         comet_config.set_num_results(10000)?;
@@ -198,7 +246,7 @@ impl Pipeline {
 
         let index_handler: tokio::task::JoinHandle<()> = {
             tokio::spawn(Self::indexing_task(
-                work_dir.clone(),
+                result_dir.clone(),
                 storage.clone(),
                 index_queue.clone(),
                 preparation_queue.clone(),
@@ -211,7 +259,6 @@ impl Pipeline {
                 .into_iter()
                 .map(|_| {
                     tokio::spawn(Self::preparation_task(
-                        work_dir.clone(),
                         storage.clone(),
                         preparation_queue.clone(),
                         search_space_generation_queue.clone(),
@@ -225,7 +272,6 @@ impl Pipeline {
                 .into_iter()
                 .map(|_| {
                     tokio::spawn(Self::search_space_generation_task(
-                        work_dir.clone(),
                         Arc::new(config.search_space_generation.clone()),
                         storage.clone(),
                         search_space_generation_queue.clone(),
@@ -238,9 +284,10 @@ impl Pipeline {
         let comet_search_handlers: Vec<tokio::task::JoinHandle<()>> =
             (0..config.comet_search.num_tasks)
                 .into_iter()
-                .map(|_| {
+                .map(|comet_proc_idx| {
+                    let comet_tmp_dir = tmp_dir.join(format!("comet_{}", comet_proc_idx));
                     tokio::spawn(Self::comet_search_task(
-                        work_dir.clone(),
+                        comet_tmp_dir,
                         Arc::new(config.comet_search.clone()),
                         storage.clone(),
                         comet_search_queue.clone(),
@@ -255,7 +302,6 @@ impl Pipeline {
                 .into_iter()
                 .map(|_| {
                     tokio::spawn(Self::goodness_and_rescoring_task(
-                        work_dir.clone(),
                         storage.clone(),
                         goodness_and_rescoreing_queue.clone(),
                         cleanup_queue.clone(),
@@ -268,7 +314,7 @@ impl Pipeline {
             .into_iter()
             .map(|_| {
                 tokio::spawn(Self::cleanup_task(
-                    work_dir.clone(),
+                    result_dir.clone(),
                     storage.clone(),
                     cleanup_queue.clone(),
                     cleanup_stop_flag.clone(),
@@ -282,8 +328,8 @@ impl Pipeline {
                 mzml_file_path.file_name().unwrap().to_str().unwrap(),
             );
 
-            tokio::fs::create_dir_all(manifest.get_ms_run_dir_path(&work_dir)).await?;
-            tokio::fs::copy(&mzml_file_path, manifest.get_ms_run_mzml_path(&work_dir)).await?;
+            tokio::fs::create_dir_all(manifest.get_ms_run_dir_path(&result_dir)).await?;
+            tokio::fs::copy(&mzml_file_path, manifest.get_ms_run_mzml_path(&result_dir)).await?;
 
             match index_queue.push(manifest).await {
                 Ok(_) => (),
@@ -370,6 +416,10 @@ impl Pipeline {
             }
         };
         storage.cleanup_search(&uuid).await?;
+
+        remove_dir_all(&tmp_dir)
+            .await
+            .context("Could not delete temporary directory")?;
 
         Ok(())
     }
@@ -490,8 +540,16 @@ impl Pipeline {
 
                     let mut new_manifest = manifest.clone();
                     new_manifest.spectrum_id = spec_id.clone();
-                    new_manifest.spectrum_mzml = mzml;
-                    new_manifest.is_indexing_done = true;
+                    match new_manifest.set_spectrum_mzml(Cursor::new(mzml)) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{}] Error putting mzML to manifest spectrum mzML: {:?}",
+                                &manifest.uuid, e
+                            );
+                            continue;
+                        }
+                    };
 
                     match storage.increment_started_searches_ctr(&manifest.uuid).await {
                         Ok(_) => (),
@@ -532,13 +590,15 @@ impl Pipeline {
     /// * `stop_flag` - Flag to indicate to stop once the preparation queue is empty
     ///
     pub fn preparation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        work_dir: PathBuf,
         storage: Arc<S>,
         preparation_queue: Arc<Q>,
         search_space_generation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
+            let mut current_search_params = SearchParameters::new();
+            let mut last_search_uuid = String::new();
+
             loop {
                 while let Some(mut manifest) = preparation_queue.pop().await {
                     debug!("[{} / {}] Preparing", &manifest.uuid, &manifest.spectrum_id);
@@ -551,7 +611,7 @@ impl Pipeline {
                         continue;
                     }
 
-                    if manifest.spectrum_mzml.is_empty() {
+                    if !manifest.is_spectrum_mzml_set() {
                         error!(
                             "[{} / {}] Spectrum mzML is empty in spectra_dir_creation_thread",
                             &manifest.uuid, &manifest.spectrum_id
@@ -559,16 +619,40 @@ impl Pipeline {
                         continue;
                     }
 
-                    if !manifest.is_indexing_done {
-                        error!(
-                            "[{} / {}] Indexing not done in spectra_dir_creation_thread",
-                            &manifest.uuid, &manifest.spectrum_id
-                        );
-                        continue;
+                    if last_search_uuid != manifest.uuid {
+                        current_search_params =
+                            match storage.get_search_parameters(&manifest.uuid).await {
+                                Ok(Some(params)) => params,
+                                Ok(None) => {
+                                    error!(
+                                        "[{} / {}] Search params not found",
+                                        manifest.uuid, manifest.spectrum_id
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error getting search params from storage: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            };
+                        last_search_uuid = manifest.uuid.clone();
                     }
 
-                    let start = match manifest
-                        .spectrum_mzml
+                    let spectrum_mzml = match manifest.get_spectrum_mzml() {
+                        Ok(spectrum_mzml) => spectrum_mzml,
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error getting spectrum mzML: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let start = match spectrum_mzml
                         .windows(SPECTRUM_START_TAG.len())
                         .position(|window| window == SPECTRUM_START_TAG)
                     {
@@ -582,12 +666,11 @@ impl Pipeline {
                         }
                     };
 
-                    let stop = match manifest
-                        .spectrum_mzml
+                    let stop = match spectrum_mzml
                         .windows(SPECTRUM_STOP_TAG.len())
                         .position(|window| window == SPECTRUM_STOP_TAG)
                     {
-                        Some(start) => start,
+                        Some(stop) => stop,
                         None => {
                             error!(
                                 "[{} / {}] No spectrum stop",
@@ -597,11 +680,12 @@ impl Pipeline {
                         }
                     };
 
-                    let spectrum_xml = &manifest.spectrum_mzml[start..stop];
+                    // Reduce to spectrum
+                    let spectrum_mzml = spectrum_mzml[start..stop].to_vec();
 
                     // As this mzML is already reduced to the spectrum of interest, we can parse it directly
                     // using MzMlReader::parse_spectrum_xml
-                    let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_xml) {
+                    let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_mzml.as_slice()) {
                         Ok(spectrum) => spectrum,
                         Err(e) => {
                             error!(
@@ -636,47 +720,34 @@ impl Pipeline {
                         continue;
                     }
 
-                    // Get mass to charge ratio and charges
-                    let precursors: Vec<(f64, Vec<u8>)> = spectrum
+                    // Get mass to charge ratio and charges the most complicated way possible...
+                    let precursors: Vec<(f64, u8)> = spectrum
                         .get_precursors()
                         .iter()
                         .map(|precursor| {
                             precursor
                                 .get_ions()
                                 .iter()
-                                .map(|(mz, charges)| (*mz, charges.clone()))
-                                .collect::<Vec<(f64, Vec<u8>)>>()
+                                .map(|(mz, charges)| {
+                                    // If precursor has no charges, use the default charges
+                                    if charges.is_empty() {
+                                        (2..=current_search_params.max_charge)
+                                            .map(|charge| (*mz, charge))
+                                            .collect::<Vec<(f64, u8)>>()
+                                    } else {
+                                        charges
+                                            .iter()
+                                            .map(|charge| (*mz, *charge))
+                                            .collect::<Vec<(f64, u8)>>()
+                                    }
+                                })
+                                .flatten()
+                                .collect::<Vec<(f64, u8)>>()
                         })
                         .flatten()
                         .collect();
 
                     drop(spectrum);
-
-                    let spectrum_dir_path = manifest.get_spectrum_dir_path(&work_dir);
-
-                    match fs::create_dir_all(&spectrum_dir_path) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error creating spectrum directory: {}",
-                                &manifest.uuid, manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    let spectrum_mzml_path = manifest.get_spectrum_mzml_path(&work_dir);
-
-                    match tokio::fs::write(&spectrum_mzml_path, &manifest.spectrum_mzml).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error writing single spectrum: {}",
-                                &manifest.uuid, manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
 
                     match storage.increment_prepared_ctr(&manifest.uuid).await {
                         Ok(_) => (),
@@ -689,9 +760,7 @@ impl Pipeline {
                         }
                     }
 
-                    manifest.spectrum_mzml = Vec::with_capacity(0); // Free up some memory
                     manifest.precursors = precursors;
-                    manifest.is_preparation_done = true;
 
                     loop {
                         manifest = match search_space_generation_queue.push(manifest).await {
@@ -717,7 +786,6 @@ impl Pipeline {
     /// Task to generate the search space for the Comet search
     ///
     /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
     /// * `config` - Configuration for the search space generation task
     /// * `search_space_generation_queue` - Queue for the search space generation task
     /// * `comet_search_queue` - Queue for the Comet search task
@@ -728,7 +796,6 @@ impl Pipeline {
         Q: PipelineQueue + 'static,
         S: PipelineStorage + 'static,
     >(
-        work_dir: PathBuf,
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
         search_space_generation_queue: Arc<Q>,
@@ -746,7 +813,7 @@ impl Pipeline {
                         "[{} / {}] Generating search space",
                         &manifest.uuid, &manifest.spectrum_id
                     );
-                    if !manifest.is_preparation_done {
+                    if manifest.precursors.is_empty() {
                         error!(
                             "[{} / {}] Prepartion not done in search_space_generation_task",
                             &manifest.uuid, &manifest.spectrum_id
@@ -794,68 +861,70 @@ impl Pipeline {
                         last_search_uuid = manifest.uuid.clone();
                     }
 
-                    // set default charges if none are provided
-                    for (_, precursor_charges) in manifest.precursors.iter_mut() {
-                        if precursor_charges.is_empty() {
-                            precursor_charges.extend(2..=current_search_params.max_charge);
-                        }
-                    }
+                    let precursors = &manifest.precursors.clone();
 
-                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
-                        for precursor_charge in precursor_charges {
-                            let fasta_file_path = manifest.get_fasta_file_path(
-                                &work_dir,
-                                *precursor_mz,
-                                *precursor_charge,
-                            );
+                    for (precursor_mz, precursor_charge) in precursors.into_iter() {
+                        let mass =
+                            mass_to_int(mass_to_charge_to_dalton(*precursor_mz, *precursor_charge));
 
-                            let mass = mass_to_int(mass_to_charge_to_dalton(
-                                *precursor_mz,
-                                *precursor_charge,
-                            ));
+                        let mut fasta = Box::pin(Cursor::new(Vec::new()));
 
-                            match create_search_space(
-                                &fasta_file_path,
-                                &current_ptms,
-                                mass,
-                                current_search_params.lower_mass_tolerance_ppm,
-                                current_search_params.upper_mass_tolerance_ppm,
-                                current_search_params.max_variable_modifications,
-                                current_search_params.decoys_per_peptide,
-                                config.target_url.to_owned(),
-                                config.decoy_url.clone(),
-                                config.target_lookup_url.clone(),
-                                config.decoy_cache_url.clone(),
-                            )
+                        match create_search_space(
+                            &mut fasta,
+                            &current_ptms,
+                            mass,
+                            current_search_params.lower_mass_tolerance_ppm,
+                            current_search_params.upper_mass_tolerance_ppm,
+                            current_search_params.max_variable_modifications,
+                            current_search_params.decoys_per_peptide,
+                            config.target_url.to_owned(),
+                            config.decoy_url.clone(),
+                            config.target_lookup_url.clone(),
+                            config.decoy_cache_url.clone(),
+                        )
+                        .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error creating search space: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        match fasta.flush().await {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error flushing search space: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        };
+                        fasta.set_position(0);
+
+                        let buffered_fasta = std::io::BufReader::new(fasta.get_ref().as_slice());
+
+                        manifest.push_fasta(buffered_fasta).unwrap();
+
+                        match storage
+                            .increment_search_space_generation_ctr(&manifest.uuid)
                             .await
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error creating search space: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            match storage
-                                .increment_search_space_generation_ctr(&manifest.uuid)
-                                .await
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error incrementing search space generation counter: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error incrementing search space generation counter: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
                             }
                         }
                     }
 
-                    manifest.is_search_space_generated = true;
                     loop {
                         manifest = match comet_search_queue.push(manifest).await {
                             Ok(_) => break,
@@ -878,7 +947,7 @@ impl Pipeline {
     /// Task to run the Comet search
     ///
     /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
+    /// * `local_work_dir` -  Local work directory
     /// * `config` - Configuration for the Comet search task
     /// * `storage` - Storage to access params and PTMs
     /// * `comet_search_queue` - Queue for the Comet search task
@@ -886,7 +955,7 @@ impl Pipeline {
     /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
     ///
     pub fn comet_search_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        work_dir: PathBuf,
+        local_work_dir: PathBuf,
         config: Arc<CometSearchTaskConfiguration>,
         storage: Arc<S>,
         comet_search_queue: Arc<Q>,
@@ -894,8 +963,21 @@ impl Pipeline {
         stop_flag: Arc<AtomicBool>,
     ) -> impl std::future::Future<Output = ()> + Send {
         async move {
+            match create_dir_all(&local_work_dir).await {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Error creating local work directory: {:?}", e);
+                    return;
+                }
+            }
             let mut last_search_uuid = String::new();
             let mut current_comet_config: Option<CometConfiguration> = None;
+            let mut current_search_params = SearchParameters::new();
+
+            let comet_params_file_path = local_work_dir.join("comet.params");
+            let fasta_file_path = local_work_dir.join("search_space.fasta");
+            let psms_file_path = local_work_dir.join("psms.txt");
+            let mzml_file_path = local_work_dir.join("ms_run.mzML");
 
             loop {
                 while let Some(mut manifest) = comet_search_queue.pop().await {
@@ -904,7 +986,7 @@ impl Pipeline {
                         &manifest.uuid, &manifest.spectrum_id
                     );
 
-                    if !manifest.is_search_space_generated {
+                    if !manifest.is_fasta_set() {
                         error!(
                             "[{} / {}] Search space not generated in `comet_search_task`",
                             &manifest.uuid, &manifest.spectrum_id
@@ -947,94 +1029,149 @@ impl Pipeline {
                             }
                         }
 
+                        current_search_params =
+                            match storage.get_search_parameters(&manifest.uuid).await {
+                                Ok(Some(params)) => params,
+                                Ok(None) => {
+                                    error!(
+                                        "[{} / {}] Search params not found`",
+                                        manifest.uuid, manifest.spectrum_id
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error getting search params from storage: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            };
+
                         last_search_uuid = manifest.uuid.clone();
                     }
 
                     // Unwrap the current Comet configuration for easier access
                     let comet_config = current_comet_config.as_mut().unwrap();
 
-                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
-                        for precursor_charge in precursor_charges {
-                            let fasta_file_path = manifest.get_fasta_file_path(
-                                &work_dir,
-                                *precursor_mz,
-                                *precursor_charge,
+                    match manifest.spectrum_mzml_to_file(&mzml_file_path).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!(
+                                "[{} / {}] Error writing spectrum mzML: {:?}",
+                                &manifest.uuid, &manifest.spectrum_id, e
                             );
-
-                            let psms_file_path = manifest.get_psms_file_path(
-                                &work_dir,
-                                *precursor_mz,
-                                *precursor_charge,
-                            );
-
-                            let comet_params_file_path = manifest.get_comet_params_path(
-                                &work_dir,
-                                *precursor_mz,
-                                *precursor_charge,
-                            );
-
-                            match comet_config.set_charge(*precursor_charge) {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error setting charge: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            match comet_config.async_to_file(&comet_params_file_path).await {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error writing Comet params: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            match run_comet_search(
-                                &config.comet_exe_path,
-                                &comet_params_file_path,
-                                &fasta_file_path,
-                                &psms_file_path.with_extension(""),
-                                &manifest.get_spectrum_mzml_path(&work_dir),
-                            )
-                            .await
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!("Error running Comet search: {:?}", e);
-                                    continue;
-                                }
-                            }
-
-                            match tokio::fs::rename(
-                                &psms_file_path.with_extension("txt"),
-                                &psms_file_path,
-                            )
-                            .await
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "Error renaming PSM file `{}`: {:?}",
-                                        &psms_file_path.with_extension("txt").display(),
-                                        e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            debug!(
-                                "[{} / {}] Comet search done for {}",
-                                &manifest.uuid,
-                                &manifest.spectrum_id,
-                                psms_file_path.display()
-                            );
+                            continue;
                         }
+                    }
+
+                    // Unset the spectrum mzML to free up memory
+                    manifest.unset_spectrum_mzml();
+
+                    // Clone precursor so manifest is not borrowed
+                    let precursor = manifest.precursors.clone();
+
+                    for (precusor_idx, (_, precursor_charge)) in precursor.into_iter().enumerate() {
+                        match comet_config.set_charge(precursor_charge) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error setting charge: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        match comet_config.set_num_results(10000) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error setting num results: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        match comet_config.async_to_file(&comet_params_file_path).await {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error writing Comet params: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        if !current_search_params.keep_fasta_files {
+                            match manifest.pop_fasta_to_file(&fasta_file_path).await {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error writing fasta file: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            match manifest
+                                .get_fasta_to_file(precusor_idx, &fasta_file_path)
+                                .await
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error writing fasta file: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
+                        match run_comet_search(
+                            &config.comet_exe_path,
+                            &comet_params_file_path,
+                            &fasta_file_path,
+                            &psms_file_path.with_extension(""),
+                            &mzml_file_path,
+                        )
+                        .await
+                        {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!("Error running Comet search: {:?}", e);
+                                continue;
+                            }
+                        }
+
+                        // Add PSM file to the manifest
+                        let psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
+                            Ok(Some(psms)) => psms,
+                            Ok(None) => DataFrame::empty(),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error reading PSMs from `{}`: {:?}",
+                                    &manifest.uuid,
+                                    &manifest.spectrum_id,
+                                    psms_file_path.display(),
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+
+                        manifest.psms_dataframes.push(psms);
+
+                        debug!(
+                            "[{} / {}] Comet search done for {}",
+                            &manifest.uuid,
+                            &manifest.spectrum_id,
+                            psms_file_path.display()
+                        );
                     }
 
                     match storage.increment_comet_search_ctr(&manifest.uuid).await {
@@ -1048,7 +1185,6 @@ impl Pipeline {
                         }
                     }
 
-                    manifest.is_comet_search_done = true;
                     loop {
                         manifest = match goodness_and_rescoreing_queue.push(manifest).await {
                             Ok(_) => break,
@@ -1069,7 +1205,6 @@ impl Pipeline {
     }
 
     pub fn goodness_and_rescoring_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        work_dir: PathBuf,
         storage: Arc<S>,
         goodness_and_rescoreing_queue: Arc<Q>,
         cleanup_queue: Arc<Q>,
@@ -1153,181 +1288,97 @@ impl Pipeline {
                         &manifest.uuid, &manifest.spectrum_id
                     );
 
-                    if !manifest.is_comet_search_done {
-                        error!(
-                            "[{} / {}] Comet search not finished in goodness_and_rescoring_thread",
+                    if manifest.precursors.len() != manifest.psms_dataframes.len() {
+                        info!(
+                            "[{} / {}] Number of PSM dataframe and precursors do not match",
                             &manifest.uuid, &manifest.spectrum_id
                         );
                         continue;
                     }
 
-                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
-                        for precursor_charge in precursor_charges {
-                            let psms_file_path = manifest.get_psms_file_path(
-                                &work_dir,
-                                *precursor_mz,
-                                *precursor_charge,
-                            );
-
-                            let goodness_file_path = manifest.get_goodness_file_path(
-                                &work_dir,
-                                *precursor_mz,
-                                *precursor_charge,
-                            );
-
-                            let mut psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
-                                Ok(Some(psms)) => psms,
-                                Ok(None) => {
-                                    info!(
-                                        "[{} / {}] No PSMs found in `{}`",
-                                        &manifest.uuid,
-                                        &manifest.spectrum_id,
-                                        psms_file_path.display()
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error reading PSMs from `{}`: {:?}",
-                                        &manifest.uuid,
-                                        &manifest.spectrum_id,
-                                        psms_file_path.display(),
-                                        e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let psms_score_series = match psms.column(COMET_EXP_BASE_SCORE) {
-                                Ok(scores) => scores,
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error selecting scores `{}` from PSMs: {:?}",
-                                        &manifest.uuid,
-                                        &manifest.spectrum_id,
-                                        COMET_EXP_BASE_SCORE,
-                                        e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let psms_score: Vec<f64> = match psms_score_series.f64() {
-                                Ok(scores) => scores
-                                    .to_vec()
-                                    .into_iter()
-                                    .map(|score| score.unwrap_or(-1.0))
-                                    .collect(),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error converting scores to f64: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            match to_python.send(psms_score).await {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error sending scores to Python: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            let (goodness_of_fits, exponential_scores, dist_scores) =
-                                match from_python.recv().await {
-                                    Some(goodness_of_fit) => goodness_of_fit,
-                                    None => {
-                                        error!(
-                                            "[{} / {}] No goodness of fit received from Python",
-                                            &manifest.uuid, &manifest.spectrum_id
-                                        );
-                                        continue;
-                                    }
-                                };
-
-                            let mut writer = match csv::WriterBuilder::new()
-                                .delimiter(b'\t')
-                                .has_headers(true)
-                                .from_path(&goodness_file_path)
-                            {
-                                Ok(writer) => writer,
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error creating CSV writer for `{}`: {:?}",
-                                        &manifest.uuid,
-                                        &manifest.spectrum_id,
-                                        goodness_file_path.display(),
-                                        e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            for goodness_row in goodness_of_fits {
-                                match writer.serialize(goodness_row) {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        error!(
-                                            "[{} / {}] Error writing goodness of fit to `{}`: {:?}",
-                                            &manifest.uuid,
-                                            &manifest.spectrum_id,
-                                            goodness_file_path.display(),
-                                            e
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            match psms.with_column(Series::new(EXP_SCORE_NAME, exponential_scores))
-                            {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error adding exponential scores to PSMs: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            match psms.with_column(Series::new(DIST_SCORE_NAME, dist_scores)) {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error adding distance scores to PSMs: {:?}",
-                                        &manifest.uuid, &manifest.spectrum_id, e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            match PeptideSpectrumMatchTsv::overwrite(psms, &psms_file_path) {
-                                Ok(_) => (),
-                                Err(e) => {
-                                    error!(
-                                        "[{} / {}] Error writing PSMs to `{}`: {:?}",
-                                        &manifest.uuid,
-                                        &manifest.spectrum_id,
-                                        psms_file_path.display(),
-                                        e
-                                    );
-                                    continue;
-                                }
-                            }
-
-                            debug!(
-                                "[{} / {}] Goodness and rescoring done for `{}`",
-                                &manifest.uuid,
-                                &manifest.spectrum_id,
-                                goodness_file_path.display()
-                            );
+                    for psms in manifest.psms_dataframes.iter_mut() {
+                        if psms.is_empty() {
+                            manifest.goodness.push(Vec::with_capacity(0));
+                            continue;
                         }
+
+                        let psms_score_series = match psms.column(COMET_EXP_BASE_SCORE) {
+                            Ok(scores) => scores,
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error selecting scores `{}` from PSMs: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, COMET_EXP_BASE_SCORE, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        let psms_score: Vec<f64> = match psms_score_series.f64() {
+                            Ok(scores) => scores
+                                .to_vec()
+                                .into_iter()
+                                .map(|score| score.unwrap_or(-1.0))
+                                .collect(),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error converting scores to f64: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        };
+
+                        match to_python.send(psms_score).await {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error sending scores to Python: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        let (goodness_of_fits, exponential_scores, dist_scores) =
+                            match from_python.recv().await {
+                                Some(goodness_of_fit) => goodness_of_fit,
+                                None => {
+                                    error!(
+                                        "[{} / {}] No goodness of fit received from Python",
+                                        &manifest.uuid, &manifest.spectrum_id
+                                    );
+                                    continue;
+                                }
+                            };
+
+                        match psms.with_column(Series::new(EXP_SCORE_NAME, exponential_scores)) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error adding exponential scores to PSMs: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        match psms.with_column(Series::new(DIST_SCORE_NAME, dist_scores)) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error adding distance scores to PSMs: {:?}",
+                                    &manifest.uuid, &manifest.spectrum_id, e
+                                );
+                                continue;
+                            }
+                        }
+
+                        manifest.goodness.push(goodness_of_fits);
+
+                        debug!(
+                            "[{} / {}] Goodness and rescoring done",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
                     }
 
                     match storage
@@ -1344,7 +1395,6 @@ impl Pipeline {
                         }
                     }
 
-                    manifest.is_goodness_and_rescoring_done = true;
                     loop {
                         manifest = match cleanup_queue.push(manifest).await {
                             Ok(_) => break,
@@ -1375,13 +1425,13 @@ impl Pipeline {
     /// Task to cleanup the search
     ///
     /// # Arguments
-    /// * `cleanup_queue` - Queue for the cleanup task
-    /// * `finsihed_searches` - Number of finished searches
+    /// * `result_dir` - Result directory where the results are stored
     /// * `storage` - Storage to access configuration
+    /// * `cleanup_queue` - Queue for the cleanup task
     /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
     ///
     pub fn cleanup_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        work_dir: PathBuf,
+        result_dir: PathBuf,
         storage: Arc<S>,
         cleanup_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
@@ -1391,19 +1441,11 @@ impl Pipeline {
                 let mut last_search_uuid = String::new();
                 let mut current_search_params = SearchParameters::new();
 
-                while let Some(manifest) = cleanup_queue.pop().await {
+                while let Some(mut manifest) = cleanup_queue.pop().await {
                     debug!(
                         "[{} / {}] Running cleanup",
                         &manifest.uuid, &manifest.spectrum_id
                     );
-
-                    if !manifest.is_goodness_and_rescoring_done {
-                        error!(
-                            "[{} / {}] Goodness and rescoing is not done in cleanup_task",
-                            &manifest.uuid, &manifest.spectrum_id
-                        );
-                        continue;
-                    }
 
                     if last_search_uuid != manifest.uuid {
                         trace!(
@@ -1432,54 +1474,78 @@ impl Pipeline {
                         last_search_uuid = manifest.uuid.clone();
                     }
 
-                    // Delete the mzML file
-                    match tokio::fs::remove_file(manifest.get_spectrum_mzml_path(&work_dir)).await {
+                    // Clone precursor so manifest is not borrowed
+                    let precursors = manifest.precursors.clone();
+
+                    match create_dir_all(manifest.get_spectrum_dir_path(&result_dir)).await {
                         Ok(_) => (),
                         Err(e) => {
                             error!(
-                                "[{} / {}] Error removing mzML: {}",
+                                "[{} / {}] Error creating spectrum directory: {:?}",
                                 &manifest.uuid, &manifest.spectrum_id, e
                             );
+                            continue;
                         }
                     }
 
-                    for (precursor_mz, precursor_charges) in manifest.precursors.iter() {
-                        for precursor_charge in precursor_charges {
-                            if !current_search_params.keep_fasta_files {
-                                let psms_file_path = manifest.get_fasta_file_path(
-                                    &work_dir,
-                                    *precursor_mz,
-                                    *precursor_charge,
+                    for (precursor_mz, precursor_charge) in precursors.iter() {
+                        let psms_file_path = manifest.get_psms_file_path(
+                            &result_dir,
+                            *precursor_mz,
+                            *precursor_charge,
+                        );
+                        match manifest.pop_psms_to_file(&psms_file_path).await {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error writing PSMs to `{}`: {:?}",
+                                    &manifest.uuid,
+                                    &manifest.spectrum_id,
+                                    psms_file_path.display(),
+                                    e
                                 );
-                                match tokio::fs::remove_file(&psms_file_path).await {
-                                    Ok(_) => (),
-                                    Err(e) => {
-                                        error!(
-                                            "[{} / {}] Error removing fasta file `{}`: {}",
-                                            &manifest.uuid,
-                                            &manifest.spectrum_id,
-                                            psms_file_path.display(),
-                                            e
-                                        );
-                                    }
-                                }
+                                continue;
                             }
+                        }
 
-                            let comet_params_path = manifest.get_comet_params_path(
-                                &work_dir,
+                        let goodness_of_fit_file_path = manifest.get_goodness_file_path(
+                            &result_dir,
+                            *precursor_mz,
+                            *precursor_charge,
+                        );
+                        match manifest.pop_goodness_of_fit_to_file(&goodness_of_fit_file_path) {
+                            Ok(_) => (),
+                            Err(e) => {
+                                error!(
+                                    "[{} / {}] Error writing goodness of fit to `{}`: {:?}",
+                                    &manifest.uuid,
+                                    &manifest.spectrum_id,
+                                    goodness_of_fit_file_path.display(),
+                                    e
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    if current_search_params.keep_fasta_files && manifest.is_fasta_set() {
+                        for (precursor_mz, precursor_charge) in precursors.iter() {
+                            let fasta_file_path = manifest.get_fasta_file_path(
+                                &result_dir,
                                 *precursor_mz,
                                 *precursor_charge,
                             );
-                            match tokio::fs::remove_file(&comet_params_path).await {
+                            match manifest.pop_fasta_to_file(&fasta_file_path).await {
                                 Ok(_) => (),
                                 Err(e) => {
                                     error!(
-                                        "[{} / {}] Error removing Comet params file `{}`: {}",
+                                        "[{} / {}] Error writing fasta to `{}`: {:?}",
                                         &manifest.uuid,
                                         &manifest.spectrum_id,
-                                        comet_params_path.display(),
+                                        fasta_file_path.display(),
                                         e
                                     );
+                                    continue;
                                 }
                             }
                         }
@@ -1500,7 +1566,7 @@ impl Pipeline {
                         "[{} / {}] Cleanup done in `{}`",
                         &manifest.uuid,
                         &manifest.spectrum_id,
-                        manifest.get_spectrum_dir_path(&work_dir).display()
+                        manifest.get_spectrum_dir_path(&result_dir).display()
                     );
                 }
                 if stop_flag.load(Ordering::Relaxed) {
@@ -1699,7 +1765,7 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Starts a http service to submit new searches
+    /// Starts a http service to submit and monitor searches
     /// and monitor the progress of the searches.
     ///
     /// # Arguments
@@ -1715,10 +1781,22 @@ impl Pipeline {
         config: RemoteEntypointConfiguration,
     ) -> Result<()> {
         let index_queue = RedisPipelineQueue::new(&config.index).await?;
+        let preparation_queue = RedisPipelineQueue::new(&config.preparation).await?;
+        let search_space_generation_queue =
+            RedisPipelineQueue::new(&config.search_space_generation).await?;
+        let comet_search_queue = RedisPipelineQueue::new(&config.comet_search).await?;
+        let goodness_and_rescoring_queue =
+            RedisPipelineQueue::new(&config.goodness_and_rescoring).await?;
+        let cleanup_queue = RedisPipelineQueue::new(&config.cleanup).await?;
         let storage = RwLock::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let state = Arc::new(EntrypointServiceState {
             index_queue,
+            preparation_queue,
+            search_space_generation_queue,
+            comet_search_queue,
+            goodness_and_rescoring_queue,
+            cleanup_queue,
             storage,
             work_dir,
         });
@@ -1732,6 +1810,10 @@ impl Pipeline {
             .route(
                 "/api/pipeline/monitor/:uuid",
                 get(Self::remote_entrypoint_monitor_endpoint),
+            )
+            .route(
+                "/api/pipeline/queues",
+                get(Self::remote_entrypoint_queue_monitor),
             )
             .layer(DefaultBodyLimit::disable())
             .with_state(state);
@@ -1949,6 +2031,39 @@ impl Pipeline {
         Ok(response)
     }
 
+    /// Entrypoint for monitoring the queue occupation
+    ///
+    /// # API
+    /// ## Request
+    /// * Path: `/api/pipelines/queues`
+    /// * Method: `GET`
+    ///
+    /// ## Response
+    /// CSV with metrics
+    /// ```tsv
+    /// ```
+    ///
+    async fn remote_entrypoint_queue_monitor(
+        State(state): State<Arc<EntrypointServiceState>>,
+    ) -> Result<Response<String>, AnyhowWebError> {
+        let workload = PipelineWorkload::new(
+            &state.index_queue,
+            &state.preparation_queue,
+            &state.search_space_generation_queue,
+            &state.comet_search_queue,
+            &state.goodness_and_rescoring_queue,
+            &state.cleanup_queue,
+        )
+        .await;
+
+        let response = axum::response::Response::builder()
+            .header("Content-Type", "application/json")
+            .status(StatusCode::OK)
+            .body(serde_json::to_string(&workload)?)?;
+
+        Ok(response)
+    }
+
     pub async fn standalone_indexing(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
         let config: StandaloneIndexingConfiguration =
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
@@ -1982,10 +2097,7 @@ impl Pipeline {
         Ok(())
     }
 
-    pub async fn standalone_preparation(
-        work_dir: PathBuf,
-        config_file_path: PathBuf,
-    ) -> Result<()> {
+    pub async fn standalone_preparation(config_file_path: PathBuf) -> Result<()> {
         let config: StandalonePreparationConfiguration =
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
@@ -2002,7 +2114,6 @@ impl Pipeline {
             .into_iter()
             .map(|_| {
                 tokio::spawn(Self::preparation_task(
-                    work_dir.clone(),
                     storage.clone(),
                     input_queue.clone(),
                     output_queue.clone(),
@@ -2018,10 +2129,7 @@ impl Pipeline {
         Ok(())
     }
 
-    pub async fn standalone_search_space_generation(
-        work_dir: PathBuf,
-        config_file_path: PathBuf,
-    ) -> Result<()> {
+    pub async fn standalone_search_space_generation(config_file_path: PathBuf) -> Result<()> {
         let config: StandaloneSearchSpaceGenerationConfiguration =
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
@@ -2041,7 +2149,6 @@ impl Pipeline {
                 .into_iter()
                 .map(|_| {
                     tokio::spawn(Self::search_space_generation_task(
-                        work_dir.clone(),
                         search_space_generation_config.clone(),
                         storage.clone(),
                         input_queue.clone(),
@@ -2059,7 +2166,7 @@ impl Pipeline {
     }
 
     pub async fn standalone_comet_search(
-        work_dir: PathBuf,
+        local_work_dir: PathBuf,
         config_file_path: PathBuf,
     ) -> Result<()> {
         let config: StandaloneCometSearchConfiguration =
@@ -2078,9 +2185,10 @@ impl Pipeline {
 
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.comet_search.num_tasks)
             .into_iter()
-            .map(|_| {
+            .map(|comet_proc_idx| {
+                let comet_tmp_dir = local_work_dir.join(format!("comet_{}", comet_proc_idx));
                 tokio::spawn(Self::comet_search_task(
-                    work_dir.clone(),
+                    comet_tmp_dir,
                     comet_search_config.clone(),
                     storage.clone(),
                     input_queue.clone(),
@@ -2097,10 +2205,7 @@ impl Pipeline {
         Ok(())
     }
 
-    pub async fn standalone_goodness_and_rescoring(
-        work_dir: PathBuf,
-        config_file_path: PathBuf,
-    ) -> Result<()> {
+    pub async fn standalone_goodness_and_rescoring(config_file_path: PathBuf) -> Result<()> {
         let config: StandaloneGoodnessAndRescoringConfiguration =
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
@@ -2132,7 +2237,6 @@ impl Pipeline {
                 .into_iter()
                 .map(|_| {
                     tokio::spawn(Self::goodness_and_rescoring_task(
-                        work_dir.clone(),
                         storage.clone(),
                         input_queue.clone(),
                         output_queue.clone(),

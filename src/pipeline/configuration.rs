@@ -212,6 +212,16 @@ impl PipelineConfiguration {
 pub struct RemoteEntypointConfiguration {
     /// Index task configuration
     pub index: TaskConfiguration,
+    /// Preparation task configuration
+    pub preparation: TaskConfiguration,
+    /// Search space generation task configuration
+    pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
+    /// Comet search task configuration
+    pub comet_search: CometSearchTaskConfiguration,
+    /// Goodness and rescoring task configuration
+    pub goodness_and_rescoring: TaskConfiguration,
+    /// Cleanup task configuration
+    pub cleanup: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
 }

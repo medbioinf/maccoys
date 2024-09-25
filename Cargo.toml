@@ -33,10 +33,11 @@ futures = "0.3.28"
 glob = "0.3.1"
 indicatif = "0.17.7"
 lazy_static = "1.4.0"
+lzma-rs = "0.3.0"
 # macpepdb = { path = "../../macpepdb" }
 macpepdb = { git = "https://github.com/medbioinf/macpepdb.git", rev = "fcf52f9009fbf049258428e9aad058b3985b6221" }
 paste = "1.0.15"
-polars = { version = "0.35.4", features = ["csv", "cum_agg", "lazy", "strings"] }
+polars = { version = "0.35.4", features = ["csv", "cum_agg", "lazy", "strings", "serde"] }
 pyo3 = { version = "0.22.0", features = ["auto-initialize"] }
 rand = "0.8.5"
 reqwest = { version = "0.11.22", features = ["blocking", "json", "stream", "multipart"] }

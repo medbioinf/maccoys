@@ -1,6 +1,6 @@
 // std imports
 use std::collections::HashSet;
-use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 // 3rd party imports
@@ -25,8 +25,7 @@ use macpepdb::{
 };
 use reqwest::Client as HttpClient;
 use serde_json::json;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::error;
 
 // internal imports
@@ -104,7 +103,7 @@ impl SearchSpaceGenerator {
     ///
     /// # Arguments
     /// * `is_target` - Whether the peptides are target or decoy peptides
-    /// * `fasta_file` - The FASTA file to write the peptides to
+    /// * `fasta` - The FASTA file to write the peptides to
     /// * `mass` - The mass of the peptides
     /// * `lower_mass_tolerance` - The lower mass tolerance
     /// * `upper_mass_tolerance` - The upper mass tolerance
@@ -117,7 +116,7 @@ impl SearchSpaceGenerator {
     async fn add_peptides(
         &self,
         is_target: bool,
-        fasta_file: &mut File,
+        fasta: &mut Pin<Box<impl AsyncWrite>>,
         mass: i64,
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
@@ -182,7 +181,7 @@ impl SearchSpaceGenerator {
                 .await?;
                 pin_mut!(target_stream);
                 while let Some(peptide) = target_stream.next().await {
-                    fasta_file
+                    fasta
                         .write(
                             gen_fasta_entry(
                                 peptide?.get_sequence(),
@@ -195,7 +194,7 @@ impl SearchSpaceGenerator {
                         .await?;
                     peptide_ctr += 1;
                     if peptide_ctr % 1000 == 0 {
-                        fasta_file.flush().await?;
+                        fasta.flush().await?;
                     }
                     if let Some(limit) = limit {
                         if peptide_ctr >= limit {
@@ -226,7 +225,7 @@ impl SearchSpaceGenerator {
                 while let Some(chunk) = peptide_stream.next().await {
                     chunk?.iter().for_each(|byte| buffer.push(*byte));
                     if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
-                        fasta_file
+                        fasta
                             .write(
                                 gen_fasta_entry(
                                     std::str::from_utf8(&buffer[..newline_pos])?,
@@ -239,7 +238,7 @@ impl SearchSpaceGenerator {
                             .await?;
                         peptide_ctr += 1;
                         if peptide_ctr % 1000 == 0 {
-                            fasta_file.flush().await?;
+                            fasta.flush().await?;
                         }
                         if let Some(limit) = limit {
                             if peptide_ctr >= limit {
@@ -255,7 +254,7 @@ impl SearchSpaceGenerator {
                     if peptide_ctr < limit {
                         let sequence = std::str::from_utf8(&buffer)?.trim().to_string();
                         if sequence.len() > 0 {
-                            fasta_file
+                            fasta
                                 .write(
                                     gen_fasta_entry(
                                         std::str::from_utf8(&buffer).unwrap(),
@@ -277,7 +276,7 @@ impl SearchSpaceGenerator {
 
     async fn generate_missing_decoys(
         &self,
-        fasta_file: &mut File,
+        fasta: &mut Pin<Box<impl AsyncWrite>>,
         needed_decoys: usize,
         decoy_ctr: usize,
         mass: i64,
@@ -401,7 +400,7 @@ impl SearchSpaceGenerator {
             if let Some(ref decoy_cache) = decoy_cache {
                 decoy_cache.cache(vec![(sequence.clone(), 0)]).await?;
             }
-            fasta_file
+            fasta
                 .write(
                     gen_fasta_entry(
                         sequence.as_str(),
@@ -414,7 +413,7 @@ impl SearchSpaceGenerator {
                 .await?;
             decoy_ctr += 1;
             if decoy_ctr % 1000 == 0 {
-                fasta_file.flush().await?;
+                fasta.flush().await?;
             }
             if decoy_ctr == needed_decoys {
                 break;
@@ -425,7 +424,7 @@ impl SearchSpaceGenerator {
 
     pub async fn create(
         &self,
-        fasta_path: &Path,
+        fasta: &mut Pin<Box<impl AsyncWrite>>,
         mass: i64,
         lower_mass_tolerance: i64,
         upper_mass_tolerance: i64,
@@ -433,7 +432,6 @@ impl SearchSpaceGenerator {
         ptms: Vec<PTM>,
         decoys_per_peptide: usize,
     ) -> Result<(usize, usize)> {
-        let mut fasta_file = File::create(fasta_path).await?;
         #[allow(unused_assignments)]
         let mut target_ctr = 0;
         let mut decoy_ctr = 0;
@@ -442,7 +440,7 @@ impl SearchSpaceGenerator {
             let target_result = self
                 .add_peptides(
                     true,
-                    &mut fasta_file,
+                    fasta,
                     mass,
                     lower_mass_tolerance,
                     upper_mass_tolerance,
@@ -475,7 +473,7 @@ impl SearchSpaceGenerator {
                 let cached_decoy_result = self
                     .add_peptides(
                         false,
-                        &mut fasta_file,
+                        fasta,
                         mass,
                         lower_mass_tolerance,
                         upper_mass_tolerance,
@@ -501,7 +499,7 @@ impl SearchSpaceGenerator {
                 if decoy_ctr < needed_decoys {
                     let decoy_result = self
                         .generate_missing_decoys(
-                            &mut fasta_file,
+                            fasta,
                             needed_decoys,
                             needed_decoys - decoy_ctr,
                             mass,
@@ -526,7 +524,7 @@ impl SearchSpaceGenerator {
             }
         }
 
-        fasta_file.flush().await?;
+        fasta.flush().await?;
         Ok((target_ctr, decoy_ctr))
     }
 }
