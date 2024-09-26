@@ -1,6 +1,6 @@
 /// A record for the goodness of fit test results
 ///
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct GoodnessOfFitRecord {
     /// The name of the goodness of fit test
     test_name: String,

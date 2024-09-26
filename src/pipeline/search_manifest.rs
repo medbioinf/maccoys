@@ -1,8 +1,16 @@
 // std imports
-use std::path::PathBuf;
+use std::{
+    fs::File,
+    io::{BufRead, Cursor},
+    path::PathBuf,
+};
+
+// external imports
+use anyhow::{Context, Result};
+use polars::{frame::DataFrame, io::SerWriter, prelude::CsvWriter};
 
 // local imports
-use crate::functions::sanatize_string;
+use crate::{functions::sanatize_string, goodness_of_fit_record::GoodnessOfFitRecord};
 
 /// Manifest for a search, storing the current state of the search
 /// and serving as the message between the different tasks
@@ -17,26 +25,21 @@ pub struct SearchManifest {
     /// Spectrum ID of the spectrum to be searched
     pub spectrum_id: String,
 
-    /// mzML with the spectrum to be searched
-    pub spectrum_mzml: Vec<u8>,
+    /// Compressed mzML with the spectrum to be searched
+    /// use the relared functions to get or store the uncompressed version
+    spectrum_mzml: Vec<u8>,
 
     /// Precursors for the spectrum (mz, charge)
-    pub precursors: Vec<(f64, Vec<u8>)>,
+    pub precursors: Vec<(f64, u8)>,
 
-    /// Flag indicating if the indexing has been done
-    pub is_indexing_done: bool,
+    /// Compressed FASTA files, one for each precursor
+    fastas: Vec<Vec<u8>>,
 
-    /// Flag indicating if the preparation has been done
-    pub is_preparation_done: bool,
+    /// PSMs dataframe
+    pub psms_dataframes: Vec<DataFrame>,
 
-    /// Flag indicating if the search space has been generated
-    pub is_search_space_generated: bool,
-
-    /// Flag indicating if the Comet search has been performed
-    pub is_comet_search_done: bool,
-
-    /// Flag indicating if the goodness and rescoring has been performed
-    pub is_goodness_and_rescoring_done: bool,
+    /// Goodness of fit test results for each precursor
+    pub goodness: Vec<Vec<GoodnessOfFitRecord>>,
 }
 
 impl SearchManifest {
@@ -59,13 +62,11 @@ impl SearchManifest {
             uuid,
             ms_run_name,
             spectrum_id: String::new(),
-            spectrum_mzml: Vec::new(),
-            precursors: Vec::new(),
-            is_indexing_done: true,
-            is_preparation_done: true,
-            is_search_space_generated: true,
-            is_comet_search_done: true,
-            is_goodness_and_rescoring_done: true,
+            spectrum_mzml: Vec::with_capacity(0),
+            precursors: Vec::with_capacity(0),
+            fastas: Vec::with_capacity(0),
+            psms_dataframes: Vec::with_capacity(0),
+            goodness: Vec::with_capacity(0),
         }
     }
 
@@ -174,7 +175,7 @@ impl SearchManifest {
         precursor_charge: u8,
     ) -> PathBuf {
         self.get_spectrum_dir_path(work_dir)
-            .join(format!("{}_{}.tsv", precursor_mz, precursor_charge))
+            .join(format!("{}_{}.psms.tsv", precursor_mz, precursor_charge))
     }
 
     /// Returns the path to the goodness TSV file for the spectrum's precursor
@@ -194,5 +195,182 @@ impl SearchManifest {
             "{}_{}.goodness.tsv",
             precursor_mz, precursor_charge
         ))
+    }
+
+    /// Compress a given file
+    ///
+    /// # Arguments
+    /// * `file` - File to be compressed
+    ///
+    fn compress_file(mut file: impl BufRead) -> Result<Vec<u8>> {
+        let mut compressed_file = Vec::new();
+        let mut compressed_file_cursor = Cursor::new(&mut compressed_file);
+        lzma_rs::lzma2_compress(&mut file, &mut compressed_file_cursor)?;
+
+        Ok(compressed_file)
+    }
+
+    fn decompress_file(file: &Vec<u8>) -> Result<Vec<u8>> {
+        let mut file_cursor = Cursor::new(file);
+        let mut uncompressed_file = Vec::with_capacity(file.len());
+        let mut uncompressed_file_cursor = Cursor::new(&mut uncompressed_file);
+        lzma_rs::lzma2_decompress(&mut file_cursor, &mut uncompressed_file_cursor)?;
+
+        Ok(uncompressed_file)
+    }
+
+    /// Set the spectrum mzML
+    ///
+    /// # Arguments
+    /// * `spectrum_mzml` - Spectrum mzML as a BufRead
+    ///
+    pub fn set_spectrum_mzml(&mut self, spectrum_mzml: impl BufRead) -> Result<()> {
+        self.spectrum_mzml = Self::compress_file(spectrum_mzml)?;
+
+        Ok(())
+    }
+
+    /// Get the spectrum mzML
+    ///
+    pub fn get_spectrum_mzml(&self) -> Result<Vec<u8>> {
+        Ok(Self::decompress_file(&self.spectrum_mzml)?)
+    }
+
+    /// Get the spectrum mzML and write it to a file
+    ///
+    /// # Arguments
+    /// * `mzml_file_path` - Path to the file where the spectrum mzML will be written
+    ///
+    pub async fn spectrum_mzml_to_file(&self, mzml_file_path: &PathBuf) -> Result<()> {
+        let spectrum_mzml = self.get_spectrum_mzml()?;
+        tokio::fs::write(mzml_file_path, spectrum_mzml).await?;
+        Ok(())
+    }
+
+    /// Unset the spectrum mzML
+    ///
+    pub fn unset_spectrum_mzml(&mut self) {
+        self.spectrum_mzml = Vec::with_capacity(0);
+    }
+
+    /// Check if the spectrum mzML is set
+    ///
+    pub fn is_spectrum_mzml_set(&self) -> bool {
+        !self.spectrum_mzml.is_empty()
+    }
+
+    /// Set the FASTA
+    ///
+    /// # Arguments
+    /// * `fasta` - FASTA as a BufRead
+    ///
+    pub fn push_fasta(&mut self, fasta: impl BufRead) -> Result<()> {
+        self.fastas.push(Self::compress_file(fasta)?);
+        Ok(())
+    }
+
+    /// Get the FASTA
+    ///
+    pub fn pop_fasta(&mut self) -> Result<Vec<u8>> {
+        match self.fastas.pop() {
+            Some(fasta) => Ok(Self::decompress_file(&fasta)?),
+            None => Err(anyhow::anyhow!("No FASTA files available")),
+        }
+    }
+
+    /// Get FASTA and write it to a file. If you do not pop
+    ///
+    /// # Arguments
+    /// * `fasta_file_path` - Path to the file where the FASTA will be written
+    ///
+    pub async fn pop_fasta_to_file(&mut self, fasta_file_path: &PathBuf) -> Result<()> {
+        let fasta = self.pop_fasta()?;
+        tokio::fs::write(fasta_file_path, fasta).await?;
+        Ok(())
+    }
+
+    /// Get fasta at position `idx`
+    ///
+    /// # Arguments
+    /// * `idx` - Index of the fasta file
+    ///
+    pub fn get_fasta(&self, idx: usize) -> Result<Vec<u8>> {
+        Ok(Self::decompress_file(&self.fastas[idx])?)
+    }
+
+    /// Get fasta at position `idx` and write it to a file
+    ///
+    /// # Arguments
+    /// * `idx` - Index of the fasta file
+    /// * `fasta_file_path` - Path to the file where the FASTA will be written
+    ///
+    pub async fn get_fasta_to_file(&self, idx: usize, fasta_file_path: &PathBuf) -> Result<()> {
+        let fasta = self.get_fasta(idx)?;
+        tokio::fs::write(fasta_file_path, fasta).await?;
+        Ok(())
+    }
+
+    /// Unset the FASTA
+    ///
+    pub fn unset_fasta(&mut self) {
+        self.fastas = Vec::with_capacity(0);
+    }
+
+    /// Check if the FASTA is set
+    ///
+    pub fn is_fasta_set(&self) -> bool {
+        !self.fastas.is_empty()
+    }
+
+    /// Get the number of FASTA files
+    ///
+    pub fn fastas_len(&self) -> usize {
+        self.fastas.len()
+    }
+
+    /// Get FASTA and write it to a file. If you do not pop
+    ///
+    /// # Arguments
+    /// * `fasta_file_path` - Path to the file where the FASTA will be written
+    ///
+    pub async fn pop_psms_to_file(&mut self, psms_file_path: &PathBuf) -> Result<()> {
+        let mut psms = match self.psms_dataframes.pop() {
+            Some(psms) => psms,
+            None => return Err(anyhow::anyhow!("No PSMs available")),
+        };
+
+        let mut psms_file = std::fs::File::create(psms_file_path)?;
+
+        CsvWriter::new(&mut psms_file)
+            .include_header(true)
+            .with_separator("\t".as_bytes()[0])
+            .finish(&mut psms)
+            .context("Error when writing PSM dataframe")?;
+
+        Ok(())
+    }
+
+    /// Get goodness of fit and write it to a file
+    ///
+    /// # Arguments
+    /// * `goodness_file_path` - Path to the file where the goodness of fit will be written
+    ///
+    pub fn pop_goodness_of_fit_to_file(&mut self, goodness_file_path: &PathBuf) -> Result<()> {
+        let goodness_of_fits = match self.goodness.pop() {
+            Some(goodness) => goodness,
+            None => return Err(anyhow::anyhow!("No goodness of fit available")),
+        };
+        let goodness_of_fit_file = File::create(goodness_file_path)?;
+
+        let mut writer = csv::WriterBuilder::new()
+            .delimiter(b'\t')
+            .has_headers(true)
+            .from_writer(goodness_of_fit_file);
+
+        for goodness_row in goodness_of_fits {
+            writer.serialize(goodness_row)?;
+        }
+
+        Ok(())
     }
 }

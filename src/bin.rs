@@ -1,5 +1,6 @@
 // std imports
 use std::collections::HashMap;
+use std::env;
 use std::fs::{read_to_string, write as write_file};
 use std::path::{Path, PathBuf};
 
@@ -18,7 +19,7 @@ use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointCon
 use maccoys::pipeline::pipeline::Pipeline;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
-use tracing::{error, info, Level};
+use tracing::{debug, error, info, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -63,11 +64,14 @@ enum PipelineCommand {
         /// (makes only sense for debugging and testing when running locally)
         #[arg(short, long, default_value = "false")]
         use_redis: bool,
+        /// Optional temp folder for intermediate files, default: `<system temp folder>/maccoys`
+        #[arg(short, long)]
+        tmp_dir: Option<PathBuf>,
         /// PTM file path
         #[arg(short, long)]
         ptms_file: Option<PathBuf>,
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
+        /// Result directroy where each MS run will get a subdirectory
+        result_dir: PathBuf,
         /// Path to the configuration file
         config: PathBuf,
         /// Default comet params
@@ -122,32 +126,27 @@ enum PipelineCommand {
     },
     /// Standalone preparation for distributed processing
     Preparation {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
         /// Path to the indexing configuration file.
         /// Contains `preparation`-, `search_space_generation`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
     /// Standalone search space generation for distributed processing
     SearchSpaceGeneration {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
         /// Path to the indexing configuration file.
         /// Contains `search_space_generation`-, `comet_search`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
     /// Standalone comet search for distributed processing
     CometSearch {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
+        /// Optional temp folder for intermediate files, default: `<system temp folder>/maccoys`
+        #[arg(short, long)]
+        tmp_dir: Option<PathBuf>,
         /// Path to the indexing configuration file.
         /// Contains `comet_search`-, `goodness_and_rescoring`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
     /// Standalone goodness and rescoring for distributed processing
     GoodnessAndRescoring {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
         /// Path to the indexing configuration file.
         /// Contains `comet_search`-, `goodness_and_rescoring`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
@@ -368,8 +367,11 @@ async fn main() -> Result<()> {
             decoy_cache_url,
         } => {
             let ptms = PtmReader::read(Path::new(&ptm_file_path))?;
+            let mut fasta_file =
+                Box::pin(tokio::fs::File::open(Path::new(&fasta_file_path)).await?);
+
             create_search_space(
-                Path::new(&fasta_file_path),
+                &mut fasta_file,
                 &ptms,
                 mass_to_int(mass),
                 lower_mass_tolerance_ppm,
@@ -448,12 +450,20 @@ async fn main() -> Result<()> {
             }
             PipelineCommand::LocalRun {
                 use_redis,
+                tmp_dir,
                 ptms_file,
-                work_dir,
+                result_dir,
                 config,
                 default_comet_params_file,
                 mzml_file_paths,
             } => {
+                let tmp_dir = match tmp_dir {
+                    Some(tmp_dir) => tmp_dir,
+                    None => PathBuf::from(env::temp_dir()).join("maccoys"),
+                };
+
+                debug!("Temp folder: {}", tmp_dir.display());
+
                 let config: PipelineConfiguration =
                     toml::from_str(&read_to_string(&config).context("Reading config file")?)
                         .context("Deserialize config")?;
@@ -474,7 +484,8 @@ async fn main() -> Result<()> {
                 if !use_redis {
                     info!("Running local pipeline");
                     Pipeline::run_locally::<LocalPipelineQueue, LocalPipelineStorage>(
-                        work_dir,
+                        result_dir,
+                        tmp_dir,
                         config,
                         comet_config,
                         ptms,
@@ -484,7 +495,8 @@ async fn main() -> Result<()> {
                 } else {
                     info!("Running redis pipeline");
                     Pipeline::run_locally::<RedisPipelineQueue, RedisPipelineStorage>(
-                        work_dir,
+                        result_dir,
+                        tmp_dir,
                         config,
                         comet_config,
                         ptms,
@@ -530,6 +542,10 @@ async fn main() -> Result<()> {
                 info!("Running search monitor");
                 Pipeline::start_remote_search_monitor(base_url, &uuid).await?;
             }
+            // PipelineCommand::QueueMonitor { base_url } => {
+            //     info!("Running queue monitor");
+            //     Pipeline::start_remote_queue_monitor(base_url).await?;
+            // }
             // TODO: Is there a more generic way to implment the standalone tasks?
             // Only thing which changes is the configuration type and config attributes to call for the input and output queues
             // Except the cleanup task, which does not have an output queue
@@ -537,22 +553,25 @@ async fn main() -> Result<()> {
                 work_dir,
                 config_file_path,
             } => Pipeline::standalone_indexing(work_dir, config_file_path).await?,
-            PipelineCommand::Preparation {
-                work_dir,
-                config_file_path,
-            } => Pipeline::standalone_preparation(work_dir, config_file_path).await?,
-            PipelineCommand::SearchSpaceGeneration {
-                work_dir,
-                config_file_path,
-            } => Pipeline::standalone_search_space_generation(work_dir, config_file_path).await?,
+            PipelineCommand::Preparation { config_file_path } => {
+                Pipeline::standalone_preparation(config_file_path).await?
+            }
+            PipelineCommand::SearchSpaceGeneration { config_file_path } => {
+                Pipeline::standalone_search_space_generation(config_file_path).await?
+            }
             PipelineCommand::CometSearch {
-                work_dir,
+                tmp_dir,
                 config_file_path,
-            } => Pipeline::standalone_comet_search(work_dir, config_file_path).await?,
-            PipelineCommand::GoodnessAndRescoring {
-                work_dir,
-                config_file_path,
-            } => Pipeline::standalone_goodness_and_rescoring(work_dir, config_file_path).await?,
+            } => {
+                let tmp_dir = match tmp_dir {
+                    Some(tmp_dir) => tmp_dir,
+                    None => PathBuf::from(env::temp_dir()).join("maccoys"),
+                };
+                Pipeline::standalone_comet_search(tmp_dir, config_file_path).await?
+            }
+            PipelineCommand::GoodnessAndRescoring { config_file_path } => {
+                Pipeline::standalone_goodness_and_rescoring(config_file_path).await?
+            }
             PipelineCommand::Cleanup {
                 work_dir,
                 config_file_path,

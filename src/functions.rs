@@ -2,6 +2,7 @@
 use std::cmp::{max, min};
 use std::fs::{read_to_string, write as write_file};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 // 3rd party imports
 use anyhow::{bail, Context, Result};
@@ -22,6 +23,8 @@ use lazy_static::lazy_static;
 use macpepdb::functions::post_translational_modification::validate_ptm_vec;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use polars::prelude::*;
+use tokio::fs::File;
+use tokio::io::AsyncWrite;
 use tracing::{debug, error, trace};
 
 use crate::constants::{
@@ -151,7 +154,7 @@ pub fn gen_fasta_entry(
 /// Returns the number of targets and decoys.
 ///
 /// # Arguments
-/// * `fasta_file_path` - Path to search space FASTA file.
+/// * `fasta` - AsyncWrite to a FASTA (file)
 /// * `mass` - Mass
 /// * `ptm_file_path` - Path to PTM file
 /// * `lower_mass_tolerance_ppm` - Lower mass tolerance in PPM
@@ -164,7 +167,7 @@ pub fn gen_fasta_entry(
 /// * `decoy_cache_url` - URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
 ///
 pub async fn create_search_space(
-    fasta_file_path: &Path,
+    fasta: &mut Pin<Box<impl AsyncWrite>>,
     ptms: &Vec<PostTranslationalModification>,
     mass: i64,
     lower_mass_tolerance_ppm: i64,
@@ -186,7 +189,7 @@ pub async fn create_search_space(
     .await?;
     Ok(search_space_generator
         .create(
-            Path::new(&fasta_file_path),
+            fasta,
             mass,
             lower_mass_tolerance_ppm,
             upper_mass_tolerance_ppm,
@@ -275,13 +278,14 @@ pub async fn search_preparation(
                 let file_base_name = format!("{}", precursor_charge);
                 let mass = mass_to_int(mass_to_charge_to_dalton(*precursor_mz, precursor_charge));
                 let fasta_file_path = work_dir.join(format!("{}.fasta", file_base_name));
+                let mut fasta_file = Box::pin(File::open(&fasta_file_path).await?);
                 let comet_config_path = work_dir.join(format!("{}.comet.params", file_base_name));
                 comet_config.set_charge(precursor_charge)?;
                 comet_config
                     .to_file(&comet_config_path)
                     .context("Could not write adjusted Comet parameter file.")?;
                 create_search_space(
-                    &fasta_file_path,
+                    &mut fasta_file,
                     ptms,
                     mass,
                     lower_mass_tolerance_ppm,
