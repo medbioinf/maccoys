@@ -31,6 +31,7 @@ use maccoys::io::comet::configuration::Configuration as CometConfiguration;
 use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
 use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use maccoys::web::decoy_api::Server as DecoyApiServer;
+use maccoys::web::results_api::Server as ResultApiServer;
 
 /// Log rotation values for CLI
 ///
@@ -63,8 +64,12 @@ enum WebCommand {
         port: u16,
         /// Database URL for a MaCPepDB-like database for just for decoys
         database_url: String,
+    },
+    /// API for accessing the search results
+    ResultApi {
         interface: String,
         port: u16,
+        result_dir: PathBuf,
     },
 }
 
@@ -358,10 +363,15 @@ async fn main() -> Result<()> {
                 interface,
                 port,
                 database_url,
-                interface,
-                port,
             } => {
                 DecoyApiServer::start(&database_url, interface, port).await?;
+            }
+            WebCommand::ResultApi {
+                interface,
+                port,
+                result_dir,
+            } => {
+                ResultApiServer::start(interface, port, result_dir).await?;
             }
         },
         Commands::DatabaseBuild {
