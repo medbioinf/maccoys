@@ -35,6 +35,9 @@ pub struct SearchManifest {
     /// Compressed FASTA files, one for each precursor
     fastas: Vec<Vec<u8>>,
 
+    /// Comet parameter files for each precursor
+    comet_configs: Vec<Vec<u8>>,
+
     /// PSMs dataframe
     pub psms_dataframes: Vec<DataFrame>,
 
@@ -65,6 +68,7 @@ impl SearchManifest {
             spectrum_mzml: Vec::with_capacity(0),
             precursors: Vec::with_capacity(0),
             fastas: Vec::with_capacity(0),
+            comet_configs: Vec::with_capacity(0),
             psms_dataframes: Vec::with_capacity(0),
             goodness: Vec::with_capacity(0),
         }
@@ -197,6 +201,15 @@ impl SearchManifest {
         ))
     }
 
+    /// Returns the path to the spectrum ID file
+    ///
+    /// # Argumentss
+    /// * `work_dir` - Work directory where the results are stored
+    ///
+    pub fn get_spectrum_id_path(&self, work_dir: &PathBuf) -> PathBuf {
+        self.get_spectrum_dir_path(work_dir).join("spectrum_id.txt")
+    }
+
     /// Compress a given file
     ///
     /// # Arguments
@@ -286,6 +299,39 @@ impl SearchManifest {
     pub async fn pop_fasta_to_file(&mut self, fasta_file_path: &PathBuf) -> Result<()> {
         let fasta = self.pop_fasta()?;
         tokio::fs::write(fasta_file_path, fasta).await?;
+        Ok(())
+    }
+
+    /// Set the Comet parameter file
+    ///
+    /// # Arguments
+    /// * `comet_config` - Comet parameter file as a BufRead
+    ///
+    pub fn push_comet_config(&mut self, comet_config: impl BufRead) -> Result<()> {
+        self.comet_configs.push(Self::compress_file(comet_config)?);
+        Ok(())
+    }
+
+    /// Get the Comet parameter file
+    ///
+    pub fn pop_comet_config(&mut self) -> Result<Vec<u8>> {
+        match self.comet_configs.pop() {
+            Some(comet_config) => Ok(Self::decompress_file(&comet_config)?),
+            None => Err(anyhow::anyhow!("No Comet parameter files available")),
+        }
+    }
+
+    /// Get Comet parameter file and write it to a file. If you do not pop
+    ///
+    /// # Arguments
+    /// * `comet_parameter_content_file_path` - Path to the file where the Comet parameter file will be written
+    ///
+    pub async fn pop_comet_config_to_file(
+        &mut self,
+        comet_config_file_path: &PathBuf,
+    ) -> Result<()> {
+        let comet_parameter_content = self.pop_comet_config()?;
+        tokio::fs::write(comet_config_file_path, comet_parameter_content).await?;
         Ok(())
     }
 
