@@ -207,14 +207,12 @@ impl Configuration {
                                 non_canonical_amino_acid.get_code()
                                     == ptm.get_amino_acid().get_code()
                             }) {
-                            Some(_) => format!(
+                            Some(_) => format!("add_{}_user_amino_acid", ptm.get_amino_acid().get_code()),
+                            None => format!(
                                 "add_{}_{}",
                                 ptm.get_amino_acid().get_code(),
                                 ptm.get_amino_acid().get_name().to_lowercase()
-                            ),
-                            None => {
-                                format!("add_{}_user_amino_acid", ptm.get_amino_acid().get_code(),)
-                            }
+                            )
                         };
                     self.set_option(&option_name, &ptm.get_mass_delta().to_string())?;
                     self.used_static_modifications
@@ -286,6 +284,12 @@ impl Configuration {
         tokio::fs::write(path, &self.content).await?;
         Ok(())
     }
+
+    /// Returns the content of the configuration.
+    ///
+    pub fn get_content(&self) -> &str {
+        &self.content
+    }
 }
 
 impl TryFrom<&PathBuf> for Configuration {
@@ -305,6 +309,7 @@ impl ToString for Configuration {
 
 #[cfg(test)]
 mod test {
+    /// Test reading and cleanup of the configuration file
     #[test]
     fn test_configuration() {
         use super::*;
@@ -313,6 +318,29 @@ mod test {
             Configuration::try_from(&Path::new("test_files/comet.params").to_path_buf()).unwrap();
         let expected_content =
             read_to_string(Path::new("test_files/expected.comet.params")).unwrap();
+        let conf_split = conf.content.split("\n").collect::<Vec<&str>>();
+        let expected_split = expected_content.split("\n").collect::<Vec<&str>>();
+        assert_eq!(conf_split.len(), expected_split.len());
+        for (line, expected_line) in conf_split.iter().zip(expected_split.iter()) {
+            assert_eq!(line, expected_line);
+        }
+    }
+
+    /// Test setting the PTMs
+    #[test]
+    fn test_configuration_with_ptms() {
+        use super::*;
+        use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
+
+        let mut conf =
+            Configuration::try_from(&Path::new("test_files/comet.params").to_path_buf()).unwrap();
+
+        let ptms = PtmReader::read(Path::new("test_files/ptms.csv")).unwrap();
+
+        conf.set_ptms(&ptms, 3).unwrap();
+
+        let expected_content =
+            read_to_string(Path::new("test_files/expected.ptms.comet.params")).unwrap();
         let conf_split = conf.content.split("\n").collect::<Vec<&str>>();
         let expected_split = expected_content.split("\n").collect::<Vec<&str>>();
         assert_eq!(conf_split.len(), expected_split.len());

@@ -43,7 +43,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{mpsc::error::TryRecvError, RwLock},
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // local imports
@@ -64,10 +64,12 @@ use crate::{
     errors::axum::web_error::AnyhowWebError,
     functions::{create_search_space, run_comet_search},
     goodness_of_fit_record::GoodnessOfFitRecord,
-    io::axum::multipart::write_streamed_file,
-    io::comet::{
-        configuration::Configuration as CometConfiguration,
-        peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
+    io::{
+        axum::multipart::write_streamed_file,
+        comet::{
+            configuration::Configuration as CometConfiguration,
+            peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
+        },
     },
     pipeline::{
         queue::PipelineQueueArc,
@@ -1132,6 +1134,20 @@ impl Pipeline {
                             }
                         }
 
+                        if current_search_params.keep_fasta_files {
+                            let comet_config_content = comet_config.get_content().as_bytes();
+                            match manifest.push_comet_config(comet_config_content) {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error pushing comet config to manifest: {:?}",
+                                        &manifest.uuid, &manifest.spectrum_id, e
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
                         match run_comet_search(
                             &config.comet_exe_path,
                             &comet_params_file_path,
@@ -1548,6 +1564,24 @@ impl Pipeline {
                                     continue;
                                 }
                             }
+                            let comet_config_file_path =
+                                fasta_file_path.with_extension("comet.params");
+                            match manifest
+                                .pop_comet_config_to_file(&comet_config_file_path)
+                                .await
+                            {
+                                Ok(_) => (),
+                                Err(e) => {
+                                    error!(
+                                        "[{} / {}] Error writing Comet config to `{}`: {:?}",
+                                        &manifest.uuid,
+                                        &manifest.spectrum_id,
+                                        comet_config_file_path.display(),
+                                        e
+                                    );
+                                    continue;
+                                }
+                            }
                         }
                     }
 
@@ -1919,9 +1953,21 @@ impl Pipeline {
                         Err(e) => Err(anyhow::Error::new(e)),
                     })
                     .collect::<Result<Vec<PostTranslationalModification>>>()?;
-
-                debug!("PTMs: {}", &ptms.len());
             }
+        }
+
+        if ptms.is_empty() {
+            warn!("Not PTMs submitted, which is unusual")
+        }
+
+        for ptm in ptms.iter() {
+            debug!(
+                "PTM: {}, {}, {:?}, {:?}",
+                ptm.get_amino_acid().get_code(),
+                ptm.get_mass_delta(),
+                ptm.get_position(),
+                ptm.get_mod_type()
+            );
         }
 
         if manifests.is_empty() {
@@ -1936,13 +1982,16 @@ impl Pipeline {
             }
         };
 
-        let comet_params = match comet_params {
+        let mut comet_params = match comet_params {
             Some(comet_params) => comet_params,
             None => {
                 tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
                 return Err(anyhow!("Comet parameters not uploaded").into());
             }
         };
+
+        comet_params.set_num_results(10000)?;
+        comet_params.set_ptms(&ptms, search_params.max_variable_modifications)?;
 
         // Init new search
         match state
