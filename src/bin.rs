@@ -19,7 +19,7 @@ use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointCon
 use maccoys::pipeline::pipeline::Pipeline;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
-use tracing::{debug, error, info, Level};
+use tracing::{debug, info, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_indicatif::IndicatifLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -30,7 +30,8 @@ use maccoys::functions::{create_search_space, post_process};
 use maccoys::io::comet::configuration::Configuration as CometConfiguration;
 use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
 use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
-use maccoys::web::server::start as start_web_server;
+use maccoys::web::decoy_api::Server as DecoyApiServer;
+use maccoys::web::results_api::Server as ResultApiServer;
 
 /// Log rotation values for CLI
 ///
@@ -51,6 +52,32 @@ impl Into<Rotation> for LogRotation {
             LogRotation::Never => Rotation::NEVER,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum WebCommand {
+    /// API for caching generated decoys
+    DecoyApi {
+        /// Interface where the service is spawned
+        interface: String,
+        /// Port where the service is spawned
+        port: u16,
+        /// Database URL for a MaCPepDB-like database for just for decoys
+        database_url: String,
+    },
+    /// API for accessing the search results
+    ResultApi {
+        interface: String,
+        port: u16,
+        result_dir: PathBuf,
+    },
+}
+
+/// CLI for the different web APIs
+#[derive(Debug, Parser)]
+struct WebCLI {
+    #[command(subcommand)]
+    command: WebCommand,
 }
 
 #[derive(Debug, Subcommand)]
@@ -169,11 +196,8 @@ struct PipelineCLI {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Web {
-        database_url: String,
-        interface: String,
-        port: u16,
-    },
+    /// Starts one of the various web APIs
+    Web(WebCLI),
     /// Build a MaCPepDB database for decoy caching.
     ///
     DatabaseBuild {
@@ -334,17 +358,22 @@ async fn main() -> Result<()> {
     info!("Welcome to MaCoyS - The `S` is silent!");
 
     match args.command {
-        Commands::Web {
-            database_url,
-            interface,
-            port,
-        } => {
-            if database_url.starts_with("scylla://") {
-                start_web_server(&database_url, interface, port).await?;
-            } else {
-                error!("Unsupported database protocol: {}", database_url);
+        Commands::Web(web_command) => match web_command.command {
+            WebCommand::DecoyApi {
+                interface,
+                port,
+                database_url,
+            } => {
+                DecoyApiServer::start(&database_url, interface, port).await?;
             }
-        }
+            WebCommand::ResultApi {
+                interface,
+                port,
+                result_dir,
+            } => {
+                ResultApiServer::start(interface, port, result_dir).await?;
+            }
+        },
         Commands::DatabaseBuild {
             database_url,
             configuration_resource,
