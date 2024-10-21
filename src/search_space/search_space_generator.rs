@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
 use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::{
@@ -266,13 +266,72 @@ impl SearchSpaceGenerator {
                             peptide_ctr += 1;
                         }
                     }
+                    // Write peptides to FASTA
+                    peptide_ctr += Self::next_peptide_in_http_buffer_to_fasta(
+                        fasta,
+                        &mut buffer,
+                        peptide_ctr,
+                        entry_prefix,
+                        entry_name_prefix,
+                        limit,
+                    )
+                    .await
+                    .context("Writing peptide buffer to FASTA")?;
                 }
+                // Write remaining buffer
+                peptide_ctr += Self::next_peptide_in_http_buffer_to_fasta(
+                    fasta,
+                    &mut buffer,
+                    peptide_ctr,
+                    entry_prefix,
+                    entry_name_prefix,
+                    limit,
+                )
+                .await?;
             }
         }
         Ok(peptide_ctr)
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn next_peptide_in_http_buffer_to_fasta(
+        fasta: &mut Pin<Box<impl AsyncWrite>>,
+        buffer: &mut Vec<u8>,
+        peptide_ctr: usize,
+        entry_prefix: &str,
+        entry_name_prefix: &str,
+        limit: Option<usize>,
+    ) -> Result<usize> {
+        let mut new_peptide_ctr: usize = 0;
+        loop {
+            // Break if limit is reached
+            if let Some(limit) = limit {
+                if peptide_ctr + new_peptide_ctr >= limit {
+                    break;
+                }
+            }
+            if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                new_peptide_ctr += 1;
+                fasta
+                    .write(
+                        gen_fasta_entry(
+                            std::str::from_utf8(&buffer[..newline_pos])?,
+                            peptide_ctr + new_peptide_ctr,
+                            entry_prefix,
+                            entry_name_prefix,
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                *buffer = buffer[newline_pos + 1..].to_vec();
+            } else {
+                // Break if no newline is found
+                break;
+            }
+        }
+        Ok(new_peptide_ctr)
+    }
+
     async fn generate_missing_decoys(
         &self,
         fasta: &mut Pin<Box<impl AsyncWrite>>,
