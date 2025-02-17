@@ -13,6 +13,9 @@ logs/
 !Cargo.toml
 !rust-toolchain.toml
 
+# OS
+.DS_Store
+
 #### Python files
 !pyproject.toml
 
