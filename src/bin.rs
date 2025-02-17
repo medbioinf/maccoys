@@ -16,7 +16,10 @@ use dihardts_omicstools::proteomics::post_translational_modifications::PostTrans
 use glob::glob;
 use indicatif::ProgressStyle;
 use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
+use maccoys::pipeline::local_pipeline::LocalPipeline;
 use maccoys::pipeline::pipeline::Pipeline;
+use maccoys::pipeline::remote_pipeline::RemotePipeline;
+use maccoys::pipeline::remote_pipeline_web_api::RemotePipelineWebApi;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{debug, info, Level};
@@ -509,7 +512,7 @@ async fn main() -> Result<()> {
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
                 if !use_redis {
                     info!("Running local pipeline");
-                    Pipeline::run_locally::<LocalPipelineQueue, LocalPipelineStorage>(
+                    LocalPipeline::<LocalPipelineQueue, LocalPipelineStorage>::run(
                         result_dir,
                         tmp_dir,
                         config,
@@ -520,7 +523,7 @@ async fn main() -> Result<()> {
                     .await?;
                 } else {
                     info!("Running redis pipeline");
-                    Pipeline::run_locally::<RedisPipelineQueue, RedisPipelineStorage>(
+                    LocalPipeline::<RedisPipelineQueue, RedisPipelineStorage>::run(
                         result_dir,
                         tmp_dir,
                         config,
@@ -541,7 +544,7 @@ async fn main() -> Result<()> {
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
 
                 info!("Enqueue into remote pipeline");
-                let uuid = Pipeline::run_remotely(
+                let uuid = RemotePipeline::run(
                     base_url,
                     search_parameters_file,
                     comet_params_file,
@@ -562,11 +565,11 @@ async fn main() -> Result<()> {
                 )
                 .context("Deserialize config")?;
 
-                Pipeline::start_remote_entrypoint(interface, port, work_dir, config).await?;
+                RemotePipelineWebApi::start(interface, port, work_dir, config).await?;
             }
             PipelineCommand::SearchMonitor { base_url, uuid } => {
                 info!("Running search monitor");
-                Pipeline::start_remote_search_monitor(base_url, &uuid).await?;
+                RemotePipeline::start_remote_search_monitor(base_url, &uuid).await?;
             }
             // PipelineCommand::QueueMonitor { base_url } => {
             //     info!("Running queue monitor");

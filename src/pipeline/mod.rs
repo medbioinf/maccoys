@@ -16,5 +16,11 @@ pub mod search_manifest;
 
 /// Type conversion
 pub mod convert;
+/// Local pipeline for debugging and testing
+pub mod local_pipeline;
+/// Pipeline running remotely
+pub mod remote_pipeline;
+/// Web api to enqueue search in remote pipeline and receive results
+pub mod remote_pipeline_web_api;
 /// Separate tasks of the pipeline
 pub mod tasks;
