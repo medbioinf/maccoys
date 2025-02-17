@@ -33,11 +33,8 @@ impl DatabaseBuild {
         // Run migrations
         run_migrations(&client).await?;
 
-        match ConfigurationTable::select(&mut client).await {
-            Ok(_) => {
-                tracing::error!("Configuration already exists in database. Nothing to do.");
-            }
-            _ => {}
+        if ConfigurationTable::select(&client).await.is_ok() {
+            tracing::error!("Configuration already exists in database. Nothing to do.");
         }
 
         if configuration_resource.starts_with("http://")

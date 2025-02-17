@@ -19,7 +19,7 @@ use reqwest::Client as HttpClient;
 use serde_json::json;
 
 /// Path to MaCCoyS web API for decoy caching
-const MACCOYS_WEB_API_PATH: &'static str = "/api/decoys/insert";
+const MACCOYS_WEB_API_PATH: &str = "/api/decoys/insert";
 
 /// Path for MaCPepDB web API, with `:sequence:` as placeholder for the sequence
 ///

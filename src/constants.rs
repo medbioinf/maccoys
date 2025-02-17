@@ -1,18 +1,18 @@
 /// Prefix for targets in FASTA files
 ///
-pub const FASTA_TARGET_ENTRY_PREFIX: &'static str = "mdb";
+pub const FASTA_TARGET_ENTRY_PREFIX: &str = "mdb";
 
 /// Prefix for target names in FASTA files
 ///
-pub const FASTA_TARGET_ENTRY_NAME_PREFIX: &'static str = "T";
+pub const FASTA_TARGET_ENTRY_NAME_PREFIX: &str = "T";
 
 /// Prefix for deciys in FASTA files
 ///
-pub const FASTA_DECOY_ENTRY_PREFIX: &'static str = "moy";
+pub const FASTA_DECOY_ENTRY_PREFIX: &str = "moy";
 
 /// Prefix for decoy names in FASTA files
 ///
-pub const FASTA_DECOY_ENTRY_NAME_PREFIX: &'static str = "D";
+pub const FASTA_DECOY_ENTRY_NAME_PREFIX: &str = "D";
 
 /// Max length for sequence lines in FASTA files
 ///
@@ -28,24 +28,24 @@ pub const COMET_HEADER_ROW: u8 = 1;
 
 /// Comet PSMs file cell separator
 ///
-pub const COMET_SEPARATOR: &'static str = "\t";
+pub const COMET_SEPARATOR: &str = "\t";
 
 /// Comet base score for exponential score
 ///
-pub const COMET_EXP_BASE_SCORE: &'static str = "xcorr";
+pub const COMET_EXP_BASE_SCORE: &str = "xcorr";
 
 /// Name for new exponential score
 ///
-pub const EXP_SCORE_NAME: &'static str = "exp_score";
+pub const EXP_SCORE_NAME: &str = "exp_score";
 
 /// Comet base score for distance score
 ///
-pub const COMET_DIST_BASE_SCORE: &'static str = COMET_EXP_BASE_SCORE;
+pub const COMET_DIST_BASE_SCORE: &str = COMET_EXP_BASE_SCORE;
 
 /// Name for new distance score
 ///
-pub const DIST_SCORE_NAME: &'static str = "dist_score";
+pub const DIST_SCORE_NAME: &str = "dist_score";
 
 /// FDR col name
 ///
-pub const FDR_COL_NAME: &'static str = "fdr";
+pub const FDR_COL_NAME: &str = "fdr";

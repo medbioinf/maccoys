@@ -84,10 +84,10 @@ pub async fn create_spectrum_workdir(work_dir: &Path, spectrum_id: &str) -> Resu
 /// * `mzml_path` - Path to mzML file
 pub async fn run_comet_search(
     comet_exe: &PathBuf,
-    comet_params_path: &PathBuf,
-    fasta_path: &PathBuf,
-    prefix_of_psm_file: &PathBuf,
-    mzml_path: &PathBuf,
+    comet_params_path: &Path,
+    fasta_path: &Path,
+    prefix_of_psm_file: &Path,
+    mzml_path: &Path,
 ) -> Result<()> {
     let comet_args = vec![
         format!("-P{}", comet_params_path.to_str().unwrap()),
@@ -147,7 +147,7 @@ pub fn gen_fasta_entry(
         entry.push_str(&sequence[start..stop]);
         entry.push('\n');
     }
-    return entry;
+    entry
 }
 
 /// Creates a search space for the given mass, mass tolerance and PTMs.
@@ -166,6 +166,7 @@ pub fn gen_fasta_entry(
 /// * `target_lookup_url` - Optional URL for checking generated decoy against targets.
 /// * `decoy_cache_url` - URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
 ///
+#[allow(clippy::too_many_arguments)]
 pub async fn create_search_space(
     fasta: &mut Pin<Box<impl AsyncWrite>>,
     ptms: &Vec<PostTranslationalModification>,
@@ -187,7 +188,7 @@ pub async fn create_search_space(
         decoy_cache_url,
     )
     .await?;
-    Ok(search_space_generator
+    search_space_generator
         .create(
             fasta,
             mass,
@@ -197,7 +198,7 @@ pub async fn create_search_space(
             ptms.clone(),
             decoys_per_peptide,
         )
-        .await?)
+        .await
 }
 
 /// Prepares the search by extracting the spectrum from the original spectrum file and creates a search space and comet params file for each charge state.
@@ -218,6 +219,7 @@ pub async fn create_search_space(
 /// * `target_lookup_url` - Optional URL for checking generated decoy against targets.
 /// * `decoy_cache_url` - URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
 ///
+#[allow(clippy::too_many_arguments)]
 pub async fn search_preparation(
     original_spectrum_file_path: &Path,
     index_file_path: &Path,
@@ -239,28 +241,28 @@ pub async fn search_preparation(
 ) -> Result<()> {
     let extracted_spectrum_file_path = work_dir.join("extracted.mzML");
     // Extract the spectrum from the original spectrum file
-    let index = Index::from_json(&read_to_string(&index_file_path)?)?;
+    let index = Index::from_json(&read_to_string(index_file_path)?)?;
     let mut extractor = IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;
     write_file(
         &extracted_spectrum_file_path,
-        extractor.extract_spectrum(&spectrum_id)?,
+        extractor.extract_spectrum(spectrum_id)?,
     )
     .context("Could not write extracted spectrum.")?;
-    let spectrum =
-        match MzmlReader::parse_spectrum_xml(extractor.get_raw_spectrum(&spectrum_id)?.as_slice())?
-        {
-            Spectrum::MsNSpectrum(spec) => spec,
-            _ => {
-                bail!("Extracted spectrum is not a MS2 spectrum");
-            }
-        };
+    let spectrum = match MzmlReader::parse_spectrum_xml(
+        extractor.get_raw_spectrum(spectrum_id)?.as_slice(),
+    )? {
+        Spectrum::MsNSpectrum(spec) => spec,
+        _ => {
+            bail!("Extracted spectrum is not a MS2 spectrum");
+        }
+    };
     let mut comet_config =
         CometConfiguration::try_from(&Path::new(default_comet_file_path).to_path_buf())?;
 
     // Set general information
     comet_config.set_mass_tolerance(max(lower_mass_tolerance_ppm, upper_mass_tolerance_ppm))?;
     comet_config.set_max_variable_mods(max_variable_modifications)?;
-    comet_config.set_ptms(&ptms, max_variable_modifications)?;
+    comet_config.set_ptms(ptms, max_variable_modifications)?;
     comet_config.set_num_results(COMET_MAX_PSMS)?;
     comet_config.set_fragment_bin_tolerance(fragment_tolerance)?;
     comet_config.set_fragment_bin_offset(fragment_bin_offset)?;

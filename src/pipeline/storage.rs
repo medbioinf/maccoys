@@ -105,7 +105,7 @@ macro_rules! build_key__init__get__increment__remove__ctr_functions {
             ///
             fn [< get_ $name _ctr >](&self, uuid: &str) -> impl Future<Output=Result<usize>> + Send {
                 async {
-                    Ok(self.get_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await?)
+                    self.get_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await
                 }
             }
 
@@ -116,7 +116,7 @@ macro_rules! build_key__init__get__increment__remove__ctr_functions {
             ///
             fn [< increment_ $name _ctr >](&self, uuid: &str) -> impl Future<Output=Result<usize>> + Send {
                 async {
-                    Ok(self.increment_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await?)
+                    self.increment_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await
                 }
             }
 
@@ -178,7 +178,7 @@ pub trait PipelineStorage: Send + Sync + Sized {
     fn set_ptms(
         &mut self,
         uuid: &str,
-        ptms: &Vec<PostTranslationalModification>,
+        ptms: &[PostTranslationalModification],
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Remove PTMs
@@ -276,7 +276,7 @@ pub trait PipelineStorage: Send + Sync + Sized {
         &mut self,
         uuid: &str,
         search_parameters: SearchParameters,
-        ptms: &Vec<PostTranslationalModification>,
+        ptms: &[PostTranslationalModification],
         comet_config: &CometConfiguration,
     ) -> impl Future<Output = Result<()>> {
         async {
@@ -430,13 +430,9 @@ impl PipelineStorage for LocalPipelineStorage {
             .cloned())
     }
 
-    async fn set_ptms(
-        &mut self,
-        uuid: &str,
-        ptms: &Vec<PostTranslationalModification>,
-    ) -> Result<()> {
+    async fn set_ptms(&mut self, uuid: &str, ptms: &[PostTranslationalModification]) -> Result<()> {
         self.ptms_collections
-            .insert(Self::get_ptms_key(uuid), ptms.clone());
+            .insert(Self::get_ptms_key(uuid), ptms.to_vec());
         Ok(())
     }
 
@@ -517,10 +513,7 @@ impl PipelineStorage for LocalPipelineStorage {
     }
 
     async fn remove_ctr(&mut self, ctr_key: &str) -> Result<()> {
-        match self.counters.remove(ctr_key) {
-            Some(_) => (),
-            None => (),
-        };
+        let _ = self.counters.remove(ctr_key);
 
         Ok(())
     }
@@ -606,11 +599,7 @@ impl PipelineStorage for RedisPipelineStorage {
         Ok(Some(ptms))
     }
 
-    async fn set_ptms(
-        &mut self,
-        uuid: &str,
-        ptms: &Vec<PostTranslationalModification>,
-    ) -> Result<()> {
+    async fn set_ptms(&mut self, uuid: &str, ptms: &[PostTranslationalModification]) -> Result<()> {
         let ptms_json = serde_json::to_string(ptms).context("[STORAGE] Error serializing PTMs")?;
 
         self.client
@@ -664,19 +653,17 @@ impl PipelineStorage for RedisPipelineStorage {
 
     async fn init_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
         let key = Self::get_is_completely_enqueued_key(uuid);
-        Ok(self
-            .client
+        self.client
             .set(key, false)
             .await
-            .context("[STORAGE] Error initialize is completely enqueued ")?)
+            .context("[STORAGE] Error initialize is completely enqueued ")
     }
     async fn set_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
         let key = Self::get_is_completely_enqueued_key(uuid);
-        Ok(self
-            .client
+        self.client
             .set(key, true)
             .await
-            .context("[STORAGE] Error setting is completely enqueued")?)
+            .context("[STORAGE] Error setting is completely enqueued")
     }
 
     async fn remove_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
@@ -698,11 +685,10 @@ impl PipelineStorage for RedisPipelineStorage {
     }
 
     async fn get_ctr(&self, ctr_key: &str) -> Result<usize> {
-        Ok(self
-            .client
+        self.client
             .get(ctr_key)
             .await
-            .context("[STORAGE] Error getting counter")?)
+            .context("[STORAGE] Error getting counter")
     }
 
     async fn remove_ctr(&mut self, ctr_key: &str) -> Result<()> {

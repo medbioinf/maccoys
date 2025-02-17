@@ -41,7 +41,6 @@ impl ResultController {
 
         let ms_runs: Vec<String> = search_dir
             .read_dir()?
-            .into_iter()
             .filter_map(|entry| {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -60,11 +59,11 @@ impl ResultController {
             })
             .collect::<Result<Vec<String>>>()?;
 
-        return Ok((
+        Ok((
             StatusCode::NOT_FOUND,
             serde_json::to_string(&SearchResponse::new(uuid, ms_runs))?,
         )
-            .into_response());
+            .into_response())
     }
 
     pub async fn show_ms_run(
@@ -93,7 +92,7 @@ impl ResultController {
 
         let ms_run_index = Index::from_json(&read_to_string(ms_run_dir.join("index.json")).await?)?;
 
-        return Ok((
+        Ok((
             StatusCode::NOT_FOUND,
             serde_json::to_string(&MsRunResponse::new(
                 uuid,
@@ -101,7 +100,7 @@ impl ResultController {
                 ms_run_index.get_spectra().keys().into_vec(),
             ))?,
         )
-            .into_response());
+            .into_response())
     }
 
     pub async fn show_spectrum(
@@ -149,7 +148,7 @@ impl ResultController {
         // Get spectrum from mzML file
         let ms_run_index = Index::from_json(&read_to_string(ms_run_dir.join("index.json")).await?)?;
         let run_mzml_path = &ms_run_dir.join("run.mzML");
-        let mut reader = IndexedReader::new(&run_mzml_path, &ms_run_index)?;
+        let mut reader = IndexedReader::new(run_mzml_path, &ms_run_index)?;
         let xml_spectrum = match reader.get_raw_spectrum(&spectrum_id) {
             Ok(spectrum) => spectrum,
             Err(_) => {

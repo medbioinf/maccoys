@@ -2,7 +2,7 @@
 use std::{
     fs::File,
     io::{BufRead, Cursor},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 // external imports
@@ -79,7 +79,7 @@ impl SearchManifest {
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_search_dir(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_search_dir(&self, work_dir: &Path) -> PathBuf {
         work_dir.join(&self.uuid)
     }
 
@@ -88,7 +88,7 @@ impl SearchManifest {
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_ms_run_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_ms_run_dir_path(&self, work_dir: &Path) -> PathBuf {
         self.get_search_dir(work_dir).join(&self.ms_run_name)
     }
 
@@ -97,7 +97,7 @@ impl SearchManifest {
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_ms_run_mzml_path(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_ms_run_mzml_path(&self, work_dir: &Path) -> PathBuf {
         self.get_ms_run_dir_path(work_dir).join("run.mzML")
     }
 
@@ -106,7 +106,7 @@ impl SearchManifest {
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_index_path(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_index_path(&self, work_dir: &Path) -> PathBuf {
         self.get_ms_run_dir_path(work_dir).join("index.json")
     }
 
@@ -115,7 +115,7 @@ impl SearchManifest {
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_spectrum_dir_path(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_spectrum_dir_path(&self, work_dir: &Path) -> PathBuf {
         self.get_ms_run_dir_path(work_dir)
             .join(sanatize_string(&self.spectrum_id))
     }
@@ -125,7 +125,7 @@ impl SearchManifest {
     /// # Arguments
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_spectrum_mzml_path(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_spectrum_mzml_path(&self, work_dir: &Path) -> PathBuf {
         self.get_spectrum_dir_path(work_dir).join("spectrum.mzML")
     }
 
@@ -138,7 +138,7 @@ impl SearchManifest {
     ///
     pub fn get_fasta_file_path(
         &self,
-        work_dir: &PathBuf,
+        work_dir: &Path,
         precursor_mz: f64,
         precursor_charge: u8,
     ) -> PathBuf {
@@ -155,7 +155,7 @@ impl SearchManifest {
     ///
     pub fn get_comet_params_path(
         &self,
-        work_dir: &PathBuf,
+        work_dir: &Path,
         precursor_mz: f64,
         precursor_charge: u8,
     ) -> PathBuf {
@@ -174,7 +174,7 @@ impl SearchManifest {
     ///
     pub fn get_psms_file_path(
         &self,
-        work_dir: &PathBuf,
+        work_dir: &Path,
         precursor_mz: f64,
         precursor_charge: u8,
     ) -> PathBuf {
@@ -191,7 +191,7 @@ impl SearchManifest {
     ///
     pub fn get_goodness_file_path(
         &self,
-        work_dir: &PathBuf,
+        work_dir: &Path,
         precursor_mz: f64,
         precursor_charge: u8,
     ) -> PathBuf {
@@ -206,7 +206,7 @@ impl SearchManifest {
     /// # Argumentss
     /// * `work_dir` - Work directory where the results are stored
     ///
-    pub fn get_spectrum_id_path(&self, work_dir: &PathBuf) -> PathBuf {
+    pub fn get_spectrum_id_path(&self, work_dir: &Path) -> PathBuf {
         self.get_spectrum_dir_path(work_dir).join("spectrum_id.txt")
     }
 
@@ -246,7 +246,7 @@ impl SearchManifest {
     /// Get the spectrum mzML
     ///
     pub fn get_spectrum_mzml(&self) -> Result<Vec<u8>> {
-        Ok(Self::decompress_file(&self.spectrum_mzml)?)
+        Self::decompress_file(&self.spectrum_mzml)
     }
 
     /// Get the spectrum mzML and write it to a file
@@ -341,7 +341,7 @@ impl SearchManifest {
     /// * `idx` - Index of the fasta file
     ///
     pub fn get_fasta(&self, idx: usize) -> Result<Vec<u8>> {
-        Ok(Self::decompress_file(&self.fastas[idx])?)
+        Self::decompress_file(&self.fastas[idx])
     }
 
     /// Get fasta at position `idx` and write it to a file

@@ -43,9 +43,9 @@ enum LogRotation {
     Never,
 }
 
-impl Into<Rotation> for LogRotation {
-    fn into(self) -> Rotation {
-        match self {
+impl From<LogRotation> for Rotation {
+    fn from(rotation: LogRotation) -> Self {
+        match rotation {
             LogRotation::Minutely => Rotation::MINUTELY,
             LogRotation::Hourly => Rotation::HOURLY,
             LogRotation::Daily => Rotation::DAILY,
@@ -420,19 +420,16 @@ async fn main() -> Result<()> {
             chunks_size,
         } => {
             let spectra_file = Path::new(&spectrum_file_path);
-            let index = Indexer::create_index(&spectra_file, chunks_size)?;
-            let mut indexed_reader = IndexedReader::new(&spectra_file, &index)?;
+            let index = Indexer::create_index(spectra_file, chunks_size)?;
+            let mut indexed_reader = IndexedReader::new(spectra_file, &index)?;
             let mut ms2_spectra_map: HashMap<String, (usize, usize)> = HashMap::new();
             for (spec_id, spec_offsets) in index.get_spectra() {
-                match MzmlReader::parse_spectrum_xml(
+                if let Spectrum::MsNSpectrum(spec) = MzmlReader::parse_spectrum_xml(
                     indexed_reader.get_raw_spectrum(spec_id)?.as_slice(),
                 )? {
-                    Spectrum::MsNSpectrum(spec) => {
-                        if spec.get_ms_level() == 2 {
-                            ms2_spectra_map.insert(spec_id.clone(), spec_offsets.clone());
-                        }
+                    if spec.get_ms_level() == 2 {
+                        ms2_spectra_map.insert(spec_id.to_owned(), *spec_offsets);
                     }
-                    _ => {}
                 }
             }
             let ms2_filtered_index = Index::new(
@@ -454,11 +451,11 @@ async fn main() -> Result<()> {
             spectrum_id,
             output_file_path,
         } => {
-            let index = Index::from_json(&read_to_string(&Path::new(&index_file_path))?)?;
+            let index = Index::from_json(&read_to_string(Path::new(&index_file_path))?)?;
             let mut extractor =
                 IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;
             write_file(
-                &Path::new(&output_file_path),
+                Path::new(&output_file_path),
                 extractor.extract_spectrum(&spectrum_id)?,
             )?;
         }
@@ -467,8 +464,8 @@ async fn main() -> Result<()> {
             goodness_of_fit_file_path,
         } => {
             post_process(
-                &Path::new(&psm_file_path),
-                &Path::new(&goodness_of_fit_file_path),
+                Path::new(&psm_file_path),
+                Path::new(&goodness_of_fit_file_path),
             )
             .await?
         }
@@ -488,7 +485,7 @@ async fn main() -> Result<()> {
             } => {
                 let tmp_dir = match tmp_dir {
                     Some(tmp_dir) => tmp_dir,
-                    None => PathBuf::from(env::temp_dir()).join("maccoys"),
+                    None => env::temp_dir().join("maccoys"),
                 };
 
                 debug!("Temp folder: {}", tmp_dir.display());
@@ -594,7 +591,7 @@ async fn main() -> Result<()> {
             } => {
                 let tmp_dir = match tmp_dir {
                     Some(tmp_dir) => tmp_dir,
-                    None => PathBuf::from(env::temp_dir()).join("maccoys"),
+                    None => env::temp_dir().join("maccoys"),
                 };
                 Pipeline::standalone_comet_search(tmp_dir, config_file_path).await?
             }

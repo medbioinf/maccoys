@@ -14,9 +14,10 @@ use macpepdb::{
 use reqwest::Client as HttpClient;
 
 /// Path for MaCPepDB web API, with `:sequence:` as placeholder for the sequence
-const MACPEPDB_WEB_API_PATH: &'static str = "/api/peptides/:sequence:/exists";
+const MACPEPDB_WEB_API_PATH: &str = "/api/peptides/:sequence:/exists";
+
 /// Path for MaCPepDB BloomFilter web API, with `:sequence:` as placeholder for the sequence
-const MACPEPDB_BLOOM_FILTER_WEB_API_PATH: &'static str = "/lookup/everywhere/:sequence:";
+const MACPEPDB_BLOOM_FILTER_WEB_API_PATH: &str = "/lookup/everywhere/:sequence:";
 
 /// Enum for storing the client for the target lookup
 ///
@@ -71,7 +72,7 @@ impl TargetLookup {
             }
             Client::Http(client) => {
                 let response = client
-                    .get(&self.url.replace(":sequence:", sequence))
+                    .get(self.url.replace(":sequence:", sequence))
                     .send()
                     .await?;
 

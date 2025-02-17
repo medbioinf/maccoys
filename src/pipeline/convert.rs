@@ -16,16 +16,16 @@ use super::{
 /// Trait to convert a configuration into input and output queues
 /// and storages
 ///
-pub trait IntoInputOutputQueueAndStorage {
+pub trait AsInputOutputQueueAndStorage {
     /// Convert the configuration into input and output queues
     ///
-    fn into_input_output_queue_and_storage(
+    fn as_input_output_queue_and_storage(
         &self,
     ) -> impl Future<Output = Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)>>;
 }
 
-impl IntoInputOutputQueueAndStorage for StandaloneIndexingConfiguration {
-    async fn into_input_output_queue_and_storage(
+impl AsInputOutputQueueAndStorage for StandaloneIndexingConfiguration {
+    async fn as_input_output_queue_and_storage(
         &self,
     ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
         let storage = RedisPipelineStorage::new(&self.storage).await?;
@@ -36,8 +36,8 @@ impl IntoInputOutputQueueAndStorage for StandaloneIndexingConfiguration {
     }
 }
 
-impl IntoInputOutputQueueAndStorage for StandalonePreparationConfiguration {
-    async fn into_input_output_queue_and_storage(
+impl AsInputOutputQueueAndStorage for StandalonePreparationConfiguration {
+    async fn as_input_output_queue_and_storage(
         &self,
     ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
         let storage = RedisPipelineStorage::new(&self.storage).await?;
@@ -48,8 +48,8 @@ impl IntoInputOutputQueueAndStorage for StandalonePreparationConfiguration {
     }
 }
 
-impl IntoInputOutputQueueAndStorage for StandaloneSearchSpaceGenerationConfiguration {
-    async fn into_input_output_queue_and_storage(
+impl AsInputOutputQueueAndStorage for StandaloneSearchSpaceGenerationConfiguration {
+    async fn as_input_output_queue_and_storage(
         &self,
     ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
         let storage = RedisPipelineStorage::new(&self.storage).await?;
@@ -60,8 +60,8 @@ impl IntoInputOutputQueueAndStorage for StandaloneSearchSpaceGenerationConfigura
     }
 }
 
-impl IntoInputOutputQueueAndStorage for StandaloneCometSearchConfiguration {
-    async fn into_input_output_queue_and_storage(
+impl AsInputOutputQueueAndStorage for StandaloneCometSearchConfiguration {
+    async fn as_input_output_queue_and_storage(
         &self,
     ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
         let storage = RedisPipelineStorage::new(&self.storage).await?;
@@ -72,8 +72,8 @@ impl IntoInputOutputQueueAndStorage for StandaloneCometSearchConfiguration {
     }
 }
 
-impl IntoInputOutputQueueAndStorage for StandaloneGoodnessAndRescoringConfiguration {
-    async fn into_input_output_queue_and_storage(
+impl AsInputOutputQueueAndStorage for StandaloneGoodnessAndRescoringConfiguration {
+    async fn as_input_output_queue_and_storage(
         &self,
     ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
         let storage = RedisPipelineStorage::new(&self.storage).await?;

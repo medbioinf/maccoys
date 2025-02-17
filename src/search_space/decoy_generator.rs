@@ -88,7 +88,7 @@ impl DecoyGenerator {
     /// # Arguments
     /// * `decoy_parts` - A vector of tuples containing the amino acid one letter code and mass
     ///
-    fn build_mass_distance_matrix(decoy_parts: &Vec<DecoyPart>) -> Vec<Vec<i64>> {
+    fn build_mass_distance_matrix(decoy_parts: &[DecoyPart]) -> Vec<Vec<i64>> {
         let mut matrix = vec![vec![0; decoy_parts.len()]; decoy_parts.len()];
         for i in 0..decoy_parts.len() {
             for j in 0..decoy_parts.len() {
@@ -110,6 +110,7 @@ impl DecoyGenerator {
     /// * `timeout` - Timeout in seconds
     /// * `annotate_modifications` - Whether to annotate the modifications in the sequence
     ///
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate(
         &self,
         target_mass: i64,
@@ -287,6 +288,7 @@ impl DecoyGenerator {
     /// * `annotate_modifications` - Whether to annotate the modifications in the sequence
     /// * `decoy_amount` - The amount of decoys to generate
     ///
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate_multiple(
         &mut self,
         target_mass: i64,
@@ -321,7 +323,7 @@ impl DecoyGenerator {
                 None => break,
             }
         }
-        return Ok(decoys);
+        Ok(decoys)
     }
 
     /// Returns a decoy generator stream which generates decoys within the given mass range and parameters.
@@ -337,9 +339,10 @@ impl DecoyGenerator {
     /// * `max_number_of_missed_cleavages` - The maximum number of missed cleavages
     /// * `timeout` - Timeout in seconds
     /// * `annotate_modifications` - Whether to annotate the modifications in the sequence
-    ///     
-    pub async fn stream<'a>(
-        &'a self,
+    ///
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream(
+        &self,
         target_mass: i64,
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
@@ -349,7 +352,7 @@ impl DecoyGenerator {
         max_number_of_missed_cleavages: i8,
         timeout: f64,
         annotate_modifications: bool,
-    ) -> Result<impl Stream<Item = Result<String>> + 'a> {
+    ) -> Result<impl Stream<Item = Result<String>> + '_> {
         Ok(try_stream! {
             let mut remaining_time = timeout;
             loop {
@@ -378,7 +381,7 @@ impl DecoyGenerator {
     /// Asynchronous clone of the decoy generator
     ///
     pub async fn async_clone(&self) -> Result<Self> {
-        Ok(Self::new(
+        Self::new(
             self.cleavage_terminus.clone(),
             self.allowed_cleavage_amino_acids.clone(),
             self.missed_cleavage_regex.clone(),
@@ -387,6 +390,6 @@ impl DecoyGenerator {
             self.static_n_terminus_modification,
             self.static_c_terminus_modification,
         )
-        .await?)
+        .await
     }
 }

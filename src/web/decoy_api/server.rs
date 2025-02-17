@@ -28,7 +28,7 @@ impl Server {
         // Create a database client
         // Session maintains it own connection pool internally: https://github.com/scylladb/scylla-rust-driver/issues/724
         // A single client with a session should be sufficient for the entire application
-        let db_client = Client::new(&database_url).await?;
+        let db_client = Client::new(database_url).await?;
         let db_client = Arc::new(db_client);
 
         // Load configuration

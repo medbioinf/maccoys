@@ -83,8 +83,8 @@ impl SearchSpaceGenerator {
             decoy_client,
             target_lookup_url,
             decoy_cache_url,
+            decoy_url,
             target_url: target_url.to_owned(),
-            decoy_url: decoy_url,
         })
     }
 
@@ -113,6 +113,7 @@ impl SearchSpaceGenerator {
     /// * `is_reviewed` - Whether the peptides are reviewed or not
     /// * `ptms` - The post-translational modifications of the peptides
     ///
+    #[allow(clippy::too_many_arguments)]
     async fn add_peptides(
         &self,
         is_target: bool,
@@ -127,10 +128,7 @@ impl SearchSpaceGenerator {
         ptms: &Vec<PTM>,
         limit: Option<usize>,
     ) -> Result<usize> {
-        let proteome_ids = match proteome_id {
-            Some(proteome_id) => Some(vec![proteome_id]),
-            None => None,
-        };
+        let proteome_ids = proteome_id.map(|proteome_id| vec![proteome_id]);
 
         // Determine the client
         let client = if is_target {
@@ -182,7 +180,7 @@ impl SearchSpaceGenerator {
                 pin_mut!(target_stream);
                 while let Some(peptide) = target_stream.next().await {
                     fasta
-                        .write(
+                        .write_all(
                             gen_fasta_entry(
                                 peptide?.get_sequence(),
                                 peptide_ctr,
@@ -226,7 +224,7 @@ impl SearchSpaceGenerator {
                     chunk?.iter().for_each(|byte| buffer.push(*byte));
                     if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
                         fasta
-                            .write(
+                            .write_all(
                                 gen_fasta_entry(
                                     std::str::from_utf8(&buffer[..newline_pos])?,
                                     peptide_ctr,
@@ -253,9 +251,9 @@ impl SearchSpaceGenerator {
                 if let Some(limit) = limit {
                     if peptide_ctr < limit {
                         let sequence = std::str::from_utf8(&buffer)?.trim().to_string();
-                        if sequence.len() > 0 {
+                        if !sequence.is_empty() {
                             fasta
-                                .write(
+                                .write_all(
                                     gen_fasta_entry(
                                         std::str::from_utf8(&buffer).unwrap(),
                                         peptide_ctr,
@@ -274,6 +272,7 @@ impl SearchSpaceGenerator {
         Ok(peptide_ctr)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn generate_missing_decoys(
         &self,
         fasta: &mut Pin<Box<impl AsyncWrite>>,
@@ -401,7 +400,7 @@ impl SearchSpaceGenerator {
                 decoy_cache.cache(vec![(sequence.clone(), 0)]).await?;
             }
             fasta
-                .write(
+                .write_all(
                     gen_fasta_entry(
                         sequence.as_str(),
                         decoy_ctr,
@@ -422,6 +421,7 @@ impl SearchSpaceGenerator {
         Ok(decoy_ctr)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         fasta: &mut Pin<Box<impl AsyncWrite>>,

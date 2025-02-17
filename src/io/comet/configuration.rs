@@ -1,5 +1,6 @@
 // std import
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::fs::{read_to_string, write as write_to_file};
 use std::path::{Path, PathBuf};
 use std::string::ToString;
@@ -75,7 +76,7 @@ impl Configuration {
         // Define mass for J
         self.set_option(
             "add_J_user_amino_acid",
-            &*ISOLEUCINE.get_mono_mass().to_string(),
+            &ISOLEUCINE.get_mono_mass().to_string(),
         )?;
 
         // Change output values
@@ -175,6 +176,7 @@ impl Configuration {
     /// * Static/n-bond will be set as `add_Nterm_peptide`
     /// * Static/c-bond will be set as `add_Cterm_peptide`
     /// * Variable will be set as `variable_mod0<index>` if it is
+    ///
     /// TODO: How to handle Static/terminal? As variable? Otherwise there is no option to set a terminal modification to a specific amino acid in comet.
     ///
     /// # Arguments
@@ -296,14 +298,13 @@ impl TryFrom<&PathBuf> for Configuration {
     type Error = anyhow::Error;
 
     fn try_from(path: &PathBuf) -> Result<Self> {
-        let content = read_to_string(path)?;
-        Ok(Self::new(content)?)
+        Self::new(read_to_string(path)?)
     }
 }
 
-impl ToString for Configuration {
-    fn to_string(&self) -> String {
-        self.content.clone()
+impl Display for Configuration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.content)
     }
 }
 

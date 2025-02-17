@@ -8,6 +8,8 @@ pub const SEARCH_SPACE_GENERATION_QUEUE_KEY: &str = "search_space_generation";
 pub const PREPARATION_QUEUE_KEY: &str = "preparation";
 pub const INDEX_QUEUE_KEY: &str = "index";
 
+/// All queue keys
+///
 pub const QUEUE_KEYS: [&str; 6] = [
     CLEANUP_QUEUE_KEY,
     GOODNESS_AND_RESCORING_QUEUE_KEY,
@@ -47,6 +49,12 @@ impl SearchParameters {
     /// Create a new default search parameter
     ///
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for SearchParameters {
+    fn default() -> Self {
         Self {
             max_charge: 6,
             lower_mass_tolerance_ppm: 10,
@@ -153,6 +161,12 @@ impl PipelineConfiguration {
     /// Create a new default configuration
     ///
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for PipelineConfiguration {
+    fn default() -> Self {
         Self {
             search_parameters: SearchParameters::new(),
             index: TaskConfiguration {
