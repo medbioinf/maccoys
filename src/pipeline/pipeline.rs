@@ -19,38 +19,20 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use dihardts_omicstools::{
-    mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
-    proteomics::io::mzml::{
-        indexed_reader::IndexedReader,
-        indexer::Indexer,
-        reader::{Reader as MzMlReader, Spectrum},
-    },
-};
-use dihardts_omicstools::{
-    mass_spectrometry::unit_conversions::mass_to_charge_to_dalton,
-    proteomics::post_translational_modifications::PostTranslationalModification,
-};
-use macpepdb::{
-    mass::convert::to_int as mass_to_int,
-    tools::{progress_monitor::ProgressMonitor, queue_monitor::QueueMonitor},
-};
-use polars::prelude::*;
-use pyo3::{prelude::*, types::PyList};
+use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
+use macpepdb::tools::{progress_monitor::ProgressMonitor, queue_monitor::QueueMonitor};
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use tokio::{
     fs::{create_dir_all, remove_dir_all},
-    io::AsyncWriteExt,
-    sync::{mpsc::error::TryRecvError, RwLock},
+    sync::RwLock,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 // local imports
 use super::{
     configuration::{
-        CometSearchTaskConfiguration, PipelineConfiguration, RemoteEntypointConfiguration,
-        SearchParameters, SearchSpaceGenerationTaskConfiguration,
+        PipelineConfiguration, RemoteEntypointConfiguration, SearchParameters,
         StandaloneCometSearchConfiguration, StandaloneGoodnessAndRescoringConfiguration,
         StandaloneIndexingConfiguration, StandalonePreparationConfiguration,
         StandaloneSearchSpaceGenerationConfiguration,
@@ -60,29 +42,22 @@ use super::{
     storage::{PipelineStorage, RedisPipelineStorage},
 };
 use crate::{
-    constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
     errors::axum::web_error::AnyhowWebError,
-    functions::{create_search_space, run_comet_search},
-    goodness_of_fit_record::GoodnessOfFitRecord,
     io::{
         axum::multipart::write_streamed_file,
-        comet::{
-            configuration::Configuration as CometConfiguration,
-            peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
-        },
+        comet::configuration::Configuration as CometConfiguration,
     },
     pipeline::{
         queue::PipelineQueueArc,
         search_manifest::SearchManifest,
         storage::{COUNTER_LABLES, NUMBER_OF_COUNTERS},
+        tasks::{
+            cleanup_task::CleanupTask, identification_task::IdentificationTask,
+            indexing_task::IndexingTask, preparation_task::PreparationTask,
+            scoring_task::ScoringTask, search_space_generation_task::SearchSpaceGenerationTask,
+        },
     },
 };
-
-/// Default start tag for a spectrum in mzML
-const SPECTRUM_START_TAG: &[u8; 10] = b"<spectrum ";
-
-/// Default stop tag for a spectrum in mzML
-const SPECTRUM_STOP_TAG: &[u8; 11] = b"</spectrum>";
 
 /// Shared state for the remote entrypoint service
 ///
@@ -249,7 +224,7 @@ impl Pipeline {
         )?;
 
         let index_handler: tokio::task::JoinHandle<()> = {
-            tokio::spawn(Self::indexing_task(
+            tokio::spawn(IndexingTask::start(
                 result_dir.clone(),
                 storage.clone(),
                 index_queue.clone(),
@@ -261,7 +236,7 @@ impl Pipeline {
         let preparation_handlers: Vec<tokio::task::JoinHandle<()>> =
             (0..config.preparation.num_tasks)
                 .map(|_| {
-                    tokio::spawn(Self::preparation_task(
+                    tokio::spawn(PreparationTask::start(
                         storage.clone(),
                         preparation_queue.clone(),
                         search_space_generation_queue.clone(),
@@ -273,7 +248,7 @@ impl Pipeline {
         let search_space_generation_handlers: Vec<tokio::task::JoinHandle<()>> =
             (0..config.search_space_generation.num_tasks)
                 .map(|_| {
-                    tokio::spawn(Self::search_space_generation_task(
+                    tokio::spawn(SearchSpaceGenerationTask::start(
                         Arc::new(config.search_space_generation.clone()),
                         storage.clone(),
                         search_space_generation_queue.clone(),
@@ -287,7 +262,7 @@ impl Pipeline {
             (0..config.comet_search.num_tasks)
                 .map(|comet_proc_idx| {
                     let comet_tmp_dir = tmp_dir.join(format!("comet_{}", comet_proc_idx));
-                    tokio::spawn(Self::comet_search_task(
+                    tokio::spawn(IdentificationTask::start(
                         comet_tmp_dir,
                         Arc::new(config.comet_search.clone()),
                         storage.clone(),
@@ -301,7 +276,7 @@ impl Pipeline {
         let goodness_and_resconfing_handlers: Vec<tokio::task::JoinHandle<()>> =
             (0..config.goodness_and_rescoring.num_tasks)
                 .map(|_| {
-                    tokio::spawn(Self::goodness_and_rescoring_task(
+                    tokio::spawn(ScoringTask::start(
                         storage.clone(),
                         goodness_and_rescoreing_queue.clone(),
                         cleanup_queue.clone(),
@@ -312,7 +287,7 @@ impl Pipeline {
 
         let cleanup_handlers: Vec<tokio::task::JoinHandle<()>> = (0..config.cleanup.num_tasks)
             .map(|_| {
-                tokio::spawn(Self::cleanup_task(
+                tokio::spawn(CleanupTask::start(
                     result_dir.clone(),
                     storage.clone(),
                     cleanup_queue.clone(),
@@ -473,1119 +448,6 @@ impl Pipeline {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
-        }
-    }
-
-    /// Task to index and split up the mzML file
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    /// * `index_queue` - Queue for the indexing task
-    /// * `preparation_queue` - Queue for the preparation task
-    /// * `stop_flag` - Flag to indicate to stop once the index queue is empty
-    ///
-    pub async fn indexing_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        work_dir: PathBuf,
-        storage: Arc<S>,
-        index_queue: Arc<Q>,
-        preparation_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        loop {
-            while let Some(manifest) = index_queue.pop().await {
-                let index =
-                    match Indexer::create_index(&manifest.get_ms_run_mzml_path(&work_dir), None) {
-                        Ok(index) => index,
-                        Err(e) => {
-                            error!("[{}] Error creating index: {:?}", &manifest.uuid, e);
-                            continue;
-                        }
-                    };
-
-                let index_file_path = manifest.get_index_path(&work_dir);
-                debug!("Writing index to: {}", index_file_path.display());
-                let index_json = match index.to_json() {
-                    Ok(json) => json,
-                    Err(e) => {
-                        error!("[{}] Error serializing index: {:?}", &manifest.uuid, e);
-                        continue;
-                    }
-                };
-                match tokio::fs::write(&index_file_path, index_json).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!("[{}] Error writing index: {:?}", &manifest.uuid, e);
-                        continue;
-                    }
-                };
-
-                let ms_run_mzml = manifest.get_ms_run_mzml_path(&work_dir);
-                let mut reader = match IndexedReader::new(&ms_run_mzml, &index) {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        error!("[{} /] Error creating reader: {:?}", &manifest.uuid, e);
-                        continue;
-                    }
-                };
-
-                for spec_id in index.get_spectra().keys() {
-                    let mzml = match reader.extract_spectrum(spec_id) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            error!("[{}] Error extracting spectrum: {:?}", &manifest.uuid, e);
-                            continue;
-                        }
-                    };
-
-                    let mut new_manifest = manifest.clone();
-                    new_manifest.spectrum_id = spec_id.clone();
-                    match new_manifest.set_spectrum_mzml(Cursor::new(mzml)) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{}] Error putting mzML to manifest spectrum mzML: {:?}",
-                                &manifest.uuid, e
-                            );
-                            continue;
-                        }
-                    };
-
-                    match storage.increment_started_searches_ctr(&manifest.uuid).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error incrementing indexing counter: {:?}",
-                                &new_manifest.uuid, &new_manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    loop {
-                        new_manifest = match preparation_queue.push(new_manifest).await {
-                            Ok(_) => break,
-                            Err(e) => {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                e
-                            }
-                        }
-                    }
-                }
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Task to prepare the spectra work directories for the search space generation and search.
-    ///
-    /// # Arguments
-    /// * `work_dir` - Work directory where the results are stored
-    /// * `preparation_queue` - Queue for the preparation task
-    /// * `search_space_generation_queue` - Queue for the search space generation task
-    /// * `stop_flag` - Flag to indicate to stop once the preparation queue is empty
-    ///
-    pub async fn preparation_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        storage: Arc<S>,
-        preparation_queue: Arc<Q>,
-        search_space_generation_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        let mut current_search_params = SearchParameters::new();
-        let mut last_search_uuid = String::new();
-
-        loop {
-            while let Some(mut manifest) = preparation_queue.pop().await {
-                debug!("[{} / {}] Preparing", &manifest.uuid, &manifest.spectrum_id);
-
-                if manifest.spectrum_id.is_empty() {
-                    error!(
-                        "[{} / {}] Spectrum ID is empty in spectra_dir_creation_thread",
-                        &manifest.uuid, &manifest.spectrum_id
-                    );
-                    continue;
-                }
-
-                if !manifest.is_spectrum_mzml_set() {
-                    error!(
-                        "[{} / {}] Spectrum mzML is empty in spectra_dir_creation_thread",
-                        &manifest.uuid, &manifest.spectrum_id
-                    );
-                    continue;
-                }
-
-                if last_search_uuid != manifest.uuid {
-                    current_search_params =
-                        match storage.get_search_parameters(&manifest.uuid).await {
-                            Ok(Some(params)) => params,
-                            Ok(None) => {
-                                error!(
-                                    "[{} / {}] Search params not found",
-                                    manifest.uuid, manifest.spectrum_id
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error getting search params from storage: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        };
-                    last_search_uuid = manifest.uuid.clone();
-                }
-
-                let spectrum_mzml = match manifest.get_spectrum_mzml() {
-                    Ok(spectrum_mzml) => spectrum_mzml,
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error getting spectrum mzML: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                };
-
-                let start = match spectrum_mzml
-                    .windows(SPECTRUM_START_TAG.len())
-                    .position(|window| window == SPECTRUM_START_TAG)
-                {
-                    Some(start) => start,
-                    None => {
-                        error!(
-                            "[{} / {}] No spectrum start",
-                            &manifest.uuid, &manifest.spectrum_id
-                        );
-                        continue;
-                    }
-                };
-
-                let stop = match spectrum_mzml
-                    .windows(SPECTRUM_STOP_TAG.len())
-                    .position(|window| window == SPECTRUM_STOP_TAG)
-                {
-                    Some(stop) => stop,
-                    None => {
-                        error!(
-                            "[{} / {}] No spectrum stop",
-                            &manifest.uuid, &manifest.spectrum_id
-                        );
-                        continue;
-                    }
-                };
-
-                // Reduce to spectrum
-                let spectrum_mzml = spectrum_mzml[start..stop].to_vec();
-
-                // As this mzML is already reduced to the spectrum of interest, we can parse it directly
-                // using MzMlReader::parse_spectrum_xml
-                let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_mzml.as_slice()) {
-                    Ok(spectrum) => spectrum,
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error parsing spectrum: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                };
-
-                let spectrum = match spectrum {
-                    Spectrum::MsNSpectrum(spectrum) => spectrum,
-                    _ => {
-                        // Ignore MS1
-                        trace!(
-                            "[{} / {}] Ignoring MS1 spectrum",
-                            &manifest.uuid,
-                            &manifest.spectrum_id
-                        );
-                        continue;
-                    }
-                };
-
-                // Ignore MS3 and higher
-                if spectrum.get_ms_level() != 2 {
-                    trace!(
-                        "[{} / {}] Ignoring MS{} spectrum",
-                        &manifest.uuid,
-                        &manifest.spectrum_id,
-                        spectrum.get_ms_level()
-                    );
-                    continue;
-                }
-
-                // Get mass to charge ratio and charges the most complicated way possible...
-                let precursors: Vec<(f64, u8)> = spectrum
-                    .get_precursors()
-                    .iter()
-                    .flat_map(|precursor| {
-                        precursor
-                            .get_ions()
-                            .iter()
-                            .flat_map(|(mz, charges)| {
-                                // If precursor has no charges, use the default charges
-                                if charges.is_empty() {
-                                    (2..=current_search_params.max_charge)
-                                        .map(|charge| (*mz, charge))
-                                        .collect::<Vec<(f64, u8)>>()
-                                } else {
-                                    charges
-                                        .iter()
-                                        .map(|charge| (*mz, *charge))
-                                        .collect::<Vec<(f64, u8)>>()
-                                }
-                            })
-                            .collect::<Vec<(f64, u8)>>()
-                    })
-                    .collect();
-
-                drop(spectrum);
-
-                match storage.increment_prepared_ctr(&manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing prepare counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
-
-                manifest.precursors = precursors;
-
-                loop {
-                    manifest = match search_space_generation_queue.push(manifest).await {
-                        Ok(_) => {
-                            break;
-                        }
-                        Err(e) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            e
-                        }
-                    }
-                }
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Task to generate the search space for the Comet search
-    ///
-    /// # Arguments
-    /// * `config` - Configuration for the search space generation task
-    /// * `search_space_generation_queue` - Queue for the search space generation task
-    /// * `comet_search_queue` - Queue for the Comet search task
-    /// * `storage` - Storage to access configuration and PTMs
-    /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
-    ///
-    pub async fn search_space_generation_task<
-        Q: PipelineQueue + 'static,
-        S: PipelineStorage + 'static,
-    >(
-        config: Arc<SearchSpaceGenerationTaskConfiguration>,
-        storage: Arc<S>,
-        search_space_generation_queue: Arc<Q>,
-        comet_search_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        let mut last_search_uuid = String::new();
-        let mut current_search_params = SearchParameters::new();
-        let mut current_ptms: Vec<PostTranslationalModification> = Vec::new();
-
-        loop {
-            while let Some(mut manifest) = search_space_generation_queue.pop().await {
-                debug!(
-                    "[{} / {}] Generating search space",
-                    &manifest.uuid, &manifest.spectrum_id
-                );
-                if manifest.precursors.is_empty() {
-                    error!(
-                        "[{} / {}] Prepartion not done in search_space_generation_task",
-                        &manifest.uuid, &manifest.spectrum_id
-                    );
-                    continue;
-                }
-
-                if last_search_uuid != manifest.uuid {
-                    current_search_params =
-                        match storage.get_search_parameters(&manifest.uuid).await {
-                            Ok(Some(params)) => params,
-                            Ok(None) => {
-                                error!(
-                                    "[{} / {}] Search params not found",
-                                    manifest.uuid, manifest.spectrum_id
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error getting search params from storage: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        };
-
-                    current_ptms = match storage.get_ptms(&manifest.uuid).await {
-                        Ok(Some(ptms)) => ptms,
-                        Ok(None) => {
-                            error!(
-                                "[{} / {}] PTMs not found",
-                                manifest.uuid, manifest.spectrum_id
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error getting PTMs from storage: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            return;
-                        }
-                    };
-                    last_search_uuid = manifest.uuid.clone();
-                }
-
-                let precursors = &manifest.precursors.clone();
-
-                for (precursor_mz, precursor_charge) in precursors.iter() {
-                    let mass =
-                        mass_to_int(mass_to_charge_to_dalton(*precursor_mz, *precursor_charge));
-
-                    let mut fasta = Box::pin(Cursor::new(Vec::new()));
-
-                    match create_search_space(
-                        &mut fasta,
-                        &current_ptms,
-                        mass,
-                        current_search_params.lower_mass_tolerance_ppm,
-                        current_search_params.upper_mass_tolerance_ppm,
-                        current_search_params.max_variable_modifications,
-                        current_search_params.decoys_per_peptide,
-                        config.target_url.to_owned(),
-                        config.decoy_url.clone(),
-                        config.target_lookup_url.clone(),
-                        config.decoy_cache_url.clone(),
-                    )
-                    .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error creating search space: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    };
-
-                    match fasta.flush().await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error flushing search space: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    };
-                    fasta.set_position(0);
-
-                    let buffered_fasta = std::io::BufReader::new(fasta.get_ref().as_slice());
-
-                    manifest.push_fasta(buffered_fasta).unwrap();
-
-                    match storage
-                        .increment_search_space_generation_ctr(&manifest.uuid)
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                    "[{} / {}] Error incrementing search space generation counter: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                            continue;
-                        }
-                    }
-                }
-
-                loop {
-                    manifest = match comet_search_queue.push(manifest).await {
-                        Ok(_) => break,
-                        Err(e) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            e
-                        }
-                    }
-                }
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Task to run the Comet search
-    ///
-    /// # Arguments
-    /// * `local_work_dir` -  Local work directory
-    /// * `config` - Configuration for the Comet search task
-    /// * `storage` - Storage to access params and PTMs
-    /// * `comet_search_queue` - Queue for the Comet search task
-    /// * `goodness_and_rescoreing_queue` - Goodness and rescoreing queue
-    /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
-    ///
-    pub async fn comet_search_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        local_work_dir: PathBuf,
-        config: Arc<CometSearchTaskConfiguration>,
-        storage: Arc<S>,
-        comet_search_queue: Arc<Q>,
-        goodness_and_rescoreing_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        match create_dir_all(&local_work_dir).await {
-            Ok(_) => (),
-            Err(e) => {
-                error!("Error creating local work directory: {:?}", e);
-                return;
-            }
-        }
-        let mut last_search_uuid = String::new();
-        let mut current_comet_config: Option<CometConfiguration> = None;
-        let mut current_search_params = SearchParameters::new();
-
-        let comet_params_file_path = local_work_dir.join("comet.params");
-        let fasta_file_path = local_work_dir.join("search_space.fasta");
-        let psms_file_path = local_work_dir.join("psms.txt");
-        let mzml_file_path = local_work_dir.join("ms_run.mzML");
-
-        loop {
-            while let Some(mut manifest) = comet_search_queue.pop().await {
-                debug!(
-                    "[{} / {}] Running Comet search",
-                    &manifest.uuid, &manifest.spectrum_id
-                );
-
-                if !manifest.is_fasta_set() {
-                    error!(
-                        "[{} / {}] Search space not generated in `comet_search_task`",
-                        &manifest.uuid, &manifest.spectrum_id
-                    );
-                    continue;
-                }
-
-                if last_search_uuid != manifest.uuid {
-                    current_comet_config = match storage.get_comet_config(&manifest.uuid).await {
-                        Ok(Some(config)) => Some(config),
-                        Ok(None) => {
-                            error!(
-                                "[{} / {}] Comet config not found",
-                                &manifest.uuid, &manifest.spectrum_id
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error getting comet config from storage: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    };
-
-                    match current_comet_config
-                        .as_mut()
-                        .unwrap()
-                        .set_option("threads", &format!("{}", config.threads))
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error setting threads in Comet configuration: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    current_search_params =
-                        match storage.get_search_parameters(&manifest.uuid).await {
-                            Ok(Some(params)) => params,
-                            Ok(None) => {
-                                error!(
-                                    "[{} / {}] Search params not found`",
-                                    manifest.uuid, manifest.spectrum_id
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error getting search params from storage: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        };
-
-                    last_search_uuid = manifest.uuid.clone();
-                }
-
-                // Unwrap the current Comet configuration for easier access
-                let comet_config = current_comet_config.as_mut().unwrap();
-
-                match manifest.spectrum_mzml_to_file(&mzml_file_path).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error writing spectrum mzML: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
-
-                // Unset the spectrum mzML to free up memory
-                manifest.unset_spectrum_mzml();
-
-                // Clone precursor so manifest is not borrowed
-                let precursor = manifest.precursors.clone();
-
-                for (precusor_idx, (_, precursor_charge)) in precursor.into_iter().enumerate() {
-                    match comet_config.set_charge(precursor_charge) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error setting charge: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    match comet_config.set_num_results(10000) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error setting num results: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    match comet_config.async_to_file(&comet_params_file_path).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error writing Comet params: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    if !current_search_params.keep_fasta_files {
-                        match manifest.pop_fasta_to_file(&fasta_file_path).await {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error writing fasta file: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        }
-                    } else {
-                        match manifest
-                            .get_fasta_to_file(precusor_idx, &fasta_file_path)
-                            .await
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error writing fasta file: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    if current_search_params.keep_fasta_files {
-                        let comet_config_content = comet_config.get_content().as_bytes();
-                        match manifest.push_comet_config(comet_config_content) {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error pushing comet config to manifest: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-
-                    match run_comet_search(
-                        &config.comet_exe_path,
-                        &comet_params_file_path,
-                        &fasta_file_path,
-                        &psms_file_path.with_extension(""),
-                        &mzml_file_path,
-                    )
-                    .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Error running Comet search: {:?}", e);
-                            continue;
-                        }
-                    }
-
-                    // Add PSM file to the manifest
-                    let psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
-                        Ok(Some(psms)) => psms,
-                        Ok(None) => DataFrame::empty(),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error reading PSMs from `{}`: {:?}",
-                                &manifest.uuid,
-                                &manifest.spectrum_id,
-                                psms_file_path.display(),
-                                e
-                            );
-                            continue;
-                        }
-                    };
-
-                    manifest.psms_dataframes.push(psms);
-
-                    debug!(
-                        "[{} / {}] Comet search done for {}",
-                        &manifest.uuid,
-                        &manifest.spectrum_id,
-                        psms_file_path.display()
-                    );
-                }
-
-                match storage.increment_comet_search_ctr(&manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing Comet search counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
-
-                loop {
-                    manifest = match goodness_and_rescoreing_queue.push(manifest).await {
-                        Ok(_) => break,
-                        Err(e) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            e
-                        }
-                    }
-                }
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    pub async fn goodness_and_rescoring_task<
-        Q: PipelineQueue + 'static,
-        S: PipelineStorage + 'static,
-    >(
-        storage: Arc<S>,
-        goodness_and_rescoreing_queue: Arc<Q>,
-        cleanup_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
-        let (to_rust, mut from_python) =
-            tokio::sync::mpsc::channel::<(Vec<GoodnessOfFitRecord>, Vec<f64>, Vec<f64>)>(1);
-        let python_stop_flag = Arc::new(AtomicBool::new(false));
-        let python_thread_stop_flag = python_stop_flag.clone(); // Getting moved in to the python thread
-
-        let python_handle: std::thread::JoinHandle<Result<()>> = std::thread::spawn(move || {
-            match Python::with_gil(|py| {
-                // maccoys imports
-                let goodness_of_fit_mod = PyModule::import_bound(py, "maccoys.goodness_of_fit")?;
-                let scoring_mod = PyModule::import_bound(py, "maccoys.scoring")?;
-
-                // Load all necessary functions
-                let calc_goodnesses_fn = goodness_of_fit_mod.getattr("calc_goodnesses")?;
-                let calculate_exp_score_fn = scoring_mod.getattr("calculate_exp_score")?;
-                let calculate_distance_score_fn =
-                    scoring_mod.getattr("calculate_distance_score")?;
-
-                loop {
-                    if python_thread_stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let psm_scores = match from_rust.try_recv() {
-                        Ok(scores) => scores,
-                        Err(TryRecvError::Empty) => {
-                            std::thread::sleep(tokio::time::Duration::from_millis(100));
-                            continue;
-                        }
-                        Err(TryRecvError::Disconnected) => {
-                            break;
-                        }
-                    };
-
-                    let psm_scores = PyList::new_bound(py, psm_scores);
-
-                    let goodness_of_fits: Vec<GoodnessOfFitRecord> = calc_goodnesses_fn
-                        .call1((&psm_scores,))?
-                        .extract::<Vec<(String, String, f64, f64)>>()?
-                        .into_iter()
-                        .map(GoodnessOfFitRecord::from)
-                        .collect();
-
-                    let exponential_score: Vec<f64> =
-                        calculate_exp_score_fn.call1((&psm_scores,))?.extract()?;
-
-                    let distance_score: Vec<f64> = calculate_distance_score_fn
-                        .call1((&psm_scores,))?
-                        .extract()?;
-
-                    to_rust.blocking_send((goodness_of_fits, exponential_score, distance_score))?;
-                }
-
-                Ok::<_, anyhow::Error>(())
-            }) {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("[PYTHON] Error running Python thread: {:?}", e);
-                }
-            }
-            debug!("[PYTHON] Python thread stopped");
-            Ok(())
-        });
-
-        loop {
-            while let Some(mut manifest) = goodness_and_rescoreing_queue.pop().await {
-                debug!(
-                    "[{} / {}] Goodness and rescoring",
-                    &manifest.uuid, &manifest.spectrum_id
-                );
-
-                if manifest.precursors.len() != manifest.psms_dataframes.len() {
-                    info!(
-                        "[{} / {}] Number of PSM dataframe and precursors do not match",
-                        &manifest.uuid, &manifest.spectrum_id
-                    );
-                    continue;
-                }
-
-                for psms in manifest.psms_dataframes.iter_mut() {
-                    if psms.is_empty() {
-                        manifest.goodness.push(Vec::with_capacity(0));
-                        continue;
-                    }
-
-                    let psms_score_series = match psms.column(COMET_EXP_BASE_SCORE) {
-                        Ok(scores) => scores,
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error selecting scores `{}` from PSMs: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, COMET_EXP_BASE_SCORE, e
-                            );
-                            continue;
-                        }
-                    };
-
-                    let psms_score: Vec<f64> = match psms_score_series.f64() {
-                        Ok(scores) => scores
-                            .to_vec()
-                            .into_iter()
-                            .map(|score| score.unwrap_or(-1.0))
-                            .collect(),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error converting scores to f64: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    };
-
-                    match to_python.send(psms_score).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error sending scores to Python: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    let (goodness_of_fits, exponential_scores, dist_scores) =
-                        match from_python.recv().await {
-                            Some(goodness_of_fit) => goodness_of_fit,
-                            None => {
-                                error!(
-                                    "[{} / {}] No goodness of fit received from Python",
-                                    &manifest.uuid, &manifest.spectrum_id
-                                );
-                                continue;
-                            }
-                        };
-
-                    match psms.with_column(Series::new(EXP_SCORE_NAME, exponential_scores)) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error adding exponential scores to PSMs: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    match psms.with_column(Series::new(DIST_SCORE_NAME, dist_scores)) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error adding distance scores to PSMs: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    manifest.goodness.push(goodness_of_fits);
-
-                    debug!(
-                        "[{} / {}] Goodness and rescoring done",
-                        &manifest.uuid, &manifest.spectrum_id
-                    );
-                }
-
-                match storage
-                    .increment_goodness_and_rescoring_ctr(&manifest.uuid)
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing goodness and rescoring counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
-
-                loop {
-                    manifest = match cleanup_queue.push(manifest).await {
-                        Ok(_) => break,
-                        Err(e) => {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            e
-                        }
-                    }
-                }
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                python_stop_flag.store(true, Ordering::Relaxed);
-                break;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        drop(to_python);
-        match python_handle.join() {
-            Ok(_) => (),
-            Err(e) => {
-                error!("Error joining Python thread: {:?}", e);
-            }
-        }
-    }
-
-    /// Task to cleanup the search
-    ///
-    /// # Arguments
-    /// * `result_dir` - Result directory where the results are stored
-    /// * `storage` - Storage to access configuration
-    /// * `cleanup_queue` - Queue for the cleanup task
-    /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
-    ///
-    pub async fn cleanup_task<Q: PipelineQueue + 'static, S: PipelineStorage + 'static>(
-        result_dir: PathBuf,
-        storage: Arc<S>,
-        cleanup_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        loop {
-            let mut last_search_uuid = String::new();
-            let mut current_search_params = SearchParameters::new();
-
-            while let Some(mut manifest) = cleanup_queue.pop().await {
-                debug!(
-                    "[{} / {}] Running cleanup",
-                    &manifest.uuid, &manifest.spectrum_id
-                );
-
-                if last_search_uuid != manifest.uuid {
-                    trace!(
-                        "[cleanup_task] Loading data from storage (UUIDs: old => {}, new=> {})",
-                        &last_search_uuid,
-                        &manifest.uuid
-                    );
-                    current_search_params =
-                        match storage.get_search_parameters(&manifest.uuid).await {
-                            Ok(Some(params)) => params,
-                            Ok(None) => {
-                                error!(
-                                    "[{} / {}] Search params not found`",
-                                    manifest.uuid, manifest.spectrum_id
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error getting search params from storage: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                                continue;
-                            }
-                        };
-                    last_search_uuid = manifest.uuid.clone();
-                }
-
-                // Clone precursor so manifest is not borrowed
-                let precursors = manifest.precursors.clone();
-
-                match create_dir_all(manifest.get_spectrum_dir_path(&result_dir)).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error creating spectrum directory: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
-
-                for (precursor_mz, precursor_charge) in precursors.iter() {
-                    let psms_file_path =
-                        manifest.get_psms_file_path(&result_dir, *precursor_mz, *precursor_charge);
-                    match manifest.pop_psms_to_file(&psms_file_path).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error writing PSMs to `{}`: {:?}",
-                                &manifest.uuid,
-                                &manifest.spectrum_id,
-                                psms_file_path.display(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
-
-                    let goodness_of_fit_file_path = manifest.get_goodness_file_path(
-                        &result_dir,
-                        *precursor_mz,
-                        *precursor_charge,
-                    );
-                    match manifest.pop_goodness_of_fit_to_file(&goodness_of_fit_file_path) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error writing goodness of fit to `{}`: {:?}",
-                                &manifest.uuid,
-                                &manifest.spectrum_id,
-                                goodness_of_fit_file_path.display(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                if current_search_params.keep_fasta_files && manifest.is_fasta_set() {
-                    for (precursor_mz, precursor_charge) in precursors.iter() {
-                        let fasta_file_path = manifest.get_fasta_file_path(
-                            &result_dir,
-                            *precursor_mz,
-                            *precursor_charge,
-                        );
-                        match manifest.pop_fasta_to_file(&fasta_file_path).await {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error writing fasta to `{}`: {:?}",
-                                    &manifest.uuid,
-                                    &manifest.spectrum_id,
-                                    fasta_file_path.display(),
-                                    e
-                                );
-                                continue;
-                            }
-                        }
-                        let comet_config_file_path = fasta_file_path.with_extension("comet.params");
-                        match manifest
-                            .pop_comet_config_to_file(&comet_config_file_path)
-                            .await
-                        {
-                            Ok(_) => (),
-                            Err(e) => {
-                                error!(
-                                    "[{} / {}] Error writing Comet config to `{}`: {:?}",
-                                    &manifest.uuid,
-                                    &manifest.spectrum_id,
-                                    comet_config_file_path.display(),
-                                    e
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                match storage.increment_cleanup_ctr(&manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing cleanup counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
-
-                debug!(
-                    "[{} / {}] Cleanup done in `{}`",
-                    &manifest.uuid,
-                    &manifest.spectrum_id,
-                    manifest.get_spectrum_dir_path(&result_dir).display()
-                );
-            }
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -2106,7 +968,7 @@ impl Pipeline {
 
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.index.num_tasks)
             .map(|_| {
-                tokio::spawn(Self::indexing_task(
+                tokio::spawn(IndexingTask::start(
                     work_dir.clone(),
                     storage.clone(),
                     input_queue.clone(),
@@ -2138,7 +1000,7 @@ impl Pipeline {
 
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.preparation.num_tasks)
             .map(|_| {
-                tokio::spawn(Self::preparation_task(
+                tokio::spawn(PreparationTask::start(
                     storage.clone(),
                     input_queue.clone(),
                     output_queue.clone(),
@@ -2172,7 +1034,7 @@ impl Pipeline {
         let handles: Vec<tokio::task::JoinHandle<()>> =
             (0..config.search_space_generation.num_tasks)
                 .map(|_| {
-                    tokio::spawn(Self::search_space_generation_task(
+                    tokio::spawn(SearchSpaceGenerationTask::start(
                         search_space_generation_config.clone(),
                         storage.clone(),
                         input_queue.clone(),
@@ -2210,7 +1072,7 @@ impl Pipeline {
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.comet_search.num_tasks)
             .map(|comet_proc_idx| {
                 let comet_tmp_dir = local_work_dir.join(format!("comet_{}", comet_proc_idx));
-                tokio::spawn(Self::comet_search_task(
+                tokio::spawn(IdentificationTask::start(
                     comet_tmp_dir,
                     comet_search_config.clone(),
                     storage.clone(),
@@ -2255,7 +1117,7 @@ impl Pipeline {
         let handles: Vec<tokio::task::JoinHandle<()>> =
             (0..config.goodness_and_rescoring.num_tasks)
                 .map(|_| {
-                    tokio::spawn(Self::goodness_and_rescoring_task(
+                    tokio::spawn(ScoringTask::start(
                         storage.clone(),
                         input_queue.clone(),
                         output_queue.clone(),
@@ -2282,7 +1144,7 @@ impl Pipeline {
 
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.cleanup.num_tasks)
             .map(|_| {
-                tokio::spawn(Self::cleanup_task(
+                tokio::spawn(CleanupTask::start(
                     work_dir.clone(),
                     storage.clone(),
                     input_queue.clone(),

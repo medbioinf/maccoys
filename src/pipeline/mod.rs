@@ -16,3 +16,5 @@ pub mod search_manifest;
 
 /// Type conversion
 pub mod convert;
+/// Separate tasks of the pipeline
+pub mod tasks;
