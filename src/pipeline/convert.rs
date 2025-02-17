@@ -5,8 +5,8 @@ use futures::Future;
 // local imports
 use super::{
     configuration::{
-        StandaloneCometSearchConfiguration, StandaloneGoodnessAndRescoringConfiguration,
-        StandaloneIndexingConfiguration, StandalonePreparationConfiguration,
+        StandaloneCometSearchConfiguration, StandaloneIndexingConfiguration,
+        StandalonePreparationConfiguration, StandaloneScoringConfiguration,
         StandaloneSearchSpaceGenerationConfiguration,
     },
     queue::{PipelineQueue, RedisPipelineQueue},
@@ -72,7 +72,7 @@ impl AsInputOutputQueueAndStorage for StandaloneCometSearchConfiguration {
     }
 }
 
-impl AsInputOutputQueueAndStorage for StandaloneGoodnessAndRescoringConfiguration {
+impl AsInputOutputQueueAndStorage for StandaloneScoringConfiguration {
     async fn as_input_output_queue_and_storage(
         &self,
     ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {

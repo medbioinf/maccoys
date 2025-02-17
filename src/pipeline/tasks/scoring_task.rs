@@ -1,18 +1,26 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use polars::{prelude::NamedFrom, series::Series};
 use pyo3::{prelude::*, types::PyList};
+use signal_hook::{consts::SIGINT, iterator::Signals};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{debug, error, info};
 
 use crate::{
     constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
     goodness_of_fit_record::GoodnessOfFitRecord,
-    pipeline::{queue::PipelineQueue, storage::PipelineStorage},
+    pipeline::{
+        configuration::StandaloneScoringConfiguration, convert::AsInputOutputQueueAndStorage,
+        queue::PipelineQueue, storage::PipelineStorage,
+    },
 };
 
 /// Task to score the PSMs.
@@ -244,5 +252,54 @@ where
                 error!("Error joining Python thread: {:?}", e);
             }
         }
+    }
+
+    /// Run the scoring task by itself
+    ///
+    /// # Arguments
+    /// * `work_dir` - Working directory
+    /// * `config_file_path` - Path to the configuration file
+    ///
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneScoringConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.as_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let mut signals = Signals::new([SIGINT])?;
+
+        let signal_stop_flag = stop_flag.clone();
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                if sig == SIGINT {
+                    info!("Gracefully stopping.");
+                    signal_stop_flag.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.goodness_and_rescoring.num_tasks)
+                .map(|_| {
+                    tokio::spawn(ScoringTask::start(
+                        storage.clone(),
+                        input_queue.clone(),
+                        output_queue.clone(),
+                        stop_flag.clone(),
+                    ))
+                })
+                .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }

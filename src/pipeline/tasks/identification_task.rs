@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -6,6 +7,7 @@ use std::{
     },
 };
 
+use anyhow::{Context, Result};
 use polars::frame::DataFrame;
 use tokio::fs::create_dir_all;
 use tracing::{debug, error};
@@ -17,7 +19,10 @@ use crate::{
         peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
     },
     pipeline::{
-        configuration::{CometSearchTaskConfiguration, SearchParameters},
+        configuration::{
+            CometSearchTaskConfiguration, SearchParameters, StandaloneCometSearchConfiguration,
+        },
+        convert::AsInputOutputQueueAndStorage,
         queue::PipelineQueue,
         storage::PipelineStorage,
     },
@@ -304,5 +309,47 @@ where
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Run the identification task by itself
+    ///
+    /// # Arguments
+    /// * `work_dir` - Working directory
+    /// * `config_file_path` - Path to the configuration file
+    ///
+    pub async fn run_standalone(local_work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneCometSearchConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.as_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let comet_search_config = Arc::new(config.comet_search.clone());
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.comet_search.num_tasks)
+            .map(|comet_proc_idx| {
+                let comet_tmp_dir = local_work_dir.join(format!("comet_{}", comet_proc_idx));
+                tokio::spawn(IdentificationTask::start(
+                    comet_tmp_dir,
+                    comet_search_config.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    output_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }

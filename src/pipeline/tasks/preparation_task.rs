@@ -1,8 +1,13 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
+use anyhow::{Context, Result};
 use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::reader::{Reader as MzMlReader, Spectrum},
@@ -10,7 +15,10 @@ use dihardts_omicstools::{
 use tracing::{debug, error, trace};
 
 use crate::pipeline::{
-    configuration::SearchParameters, queue::PipelineQueue, storage::PipelineStorage,
+    configuration::{SearchParameters, StandalonePreparationConfiguration},
+    convert::AsInputOutputQueueAndStorage,
+    queue::PipelineQueue,
+    storage::PipelineStorage,
 };
 
 /// Default start tag for a spectrum in mzML
@@ -228,5 +236,42 @@ where
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Run the preparation task by itself
+    ///
+    /// # Arguments
+    /// * `work_dir` - Working directory
+    /// * `config_file_path` - Path to the configuration file
+    ///
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<()> {
+        let config: StandalonePreparationConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.as_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.preparation.num_tasks)
+            .map(|_| {
+                tokio::spawn(PreparationTask::start(
+                    storage.clone(),
+                    input_queue.clone(),
+                    output_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }

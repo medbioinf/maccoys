@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -6,11 +7,14 @@ use std::{
     },
 };
 
+use anyhow::{Context, Result};
 use tokio::fs::create_dir_all;
 use tracing::{debug, error, trace};
 
 use crate::pipeline::{
-    configuration::SearchParameters, queue::PipelineQueue, storage::PipelineStorage,
+    configuration::{SearchParameters, StandaloneCleanupConfiguration},
+    queue::{PipelineQueue, RedisPipelineQueue},
+    storage::{PipelineStorage, RedisPipelineStorage},
 };
 
 /// Task to cleanup the search
@@ -191,5 +195,38 @@ where
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Run the cleanup task by itself
+    ///
+    /// # Arguments
+    /// * `work_dir` - Working directory
+    /// * `config_file_path` - Path to the configuration file
+    ///
+    pub async fn run_standalone(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneCleanupConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
+        let input_queue = Arc::new(RedisPipelineQueue::new(&config.cleanup).await?);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.cleanup.num_tasks)
+            .map(|_| {
+                tokio::spawn(CleanupTask::start(
+                    work_dir.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }

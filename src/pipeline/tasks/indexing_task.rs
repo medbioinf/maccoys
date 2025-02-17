@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::Cursor,
     path::PathBuf,
     sync::{
@@ -7,10 +8,14 @@ use std::{
     },
 };
 
+use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::io::mzml::{indexed_reader::IndexedReader, indexer::Indexer};
 use tracing::{debug, error};
 
-use crate::pipeline::{queue::PipelineQueue, storage::PipelineStorage};
+use crate::pipeline::{
+    configuration::StandaloneIndexingConfiguration, convert::AsInputOutputQueueAndStorage,
+    queue::PipelineQueue, storage::PipelineStorage,
+};
 
 /// Task to index and split up the mzML file
 ///
@@ -126,5 +131,43 @@ where
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Run the indexing task by itself
+    ///
+    /// # Arguments
+    /// * `work_dir` - Working directory
+    /// * `config_file_path` - Path to the configuration file
+    ///
+    pub async fn run_standalone(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneIndexingConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.as_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.index.num_tasks)
+            .map(|_| {
+                tokio::spawn(IndexingTask::start(
+                    work_dir.clone(),
+                    storage.clone(),
+                    input_queue.clone(),
+                    output_queue.clone(),
+                    stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }

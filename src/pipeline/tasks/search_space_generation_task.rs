@@ -1,11 +1,14 @@
 use std::{
+    fs,
     io::Cursor,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
 
+use anyhow::{Context, Result};
 use dihardts_omicstools::{
     mass_spectrometry::unit_conversions::mass_to_charge_to_dalton,
     proteomics::post_translational_modifications::PostTranslationalModification,
@@ -17,7 +20,11 @@ use tracing::{debug, error};
 use crate::{
     functions::create_search_space,
     pipeline::{
-        configuration::{SearchParameters, SearchSpaceGenerationTaskConfiguration},
+        configuration::{
+            SearchParameters, SearchSpaceGenerationTaskConfiguration,
+            StandaloneSearchSpaceGenerationConfiguration,
+        },
+        convert::AsInputOutputQueueAndStorage,
         queue::PipelineQueue,
         storage::PipelineStorage,
     },
@@ -189,5 +196,46 @@ where
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Run the search space generation task by itself
+    ///
+    /// # Arguments
+    /// * `work_dir` - Working directory
+    /// * `config_file_path` - Path to the configuration file
+    ///
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<()> {
+        let config: StandaloneSearchSpaceGenerationConfiguration =
+            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
+                .context("Deserialize config")?;
+
+        let (storage, input_queue, output_queue) =
+            config.as_input_output_queue_and_storage().await?;
+        let storage = Arc::new(storage);
+        let input_queue = Arc::new(input_queue);
+        let output_queue = Arc::new(output_queue);
+
+        let search_space_generation_config = Arc::new(config.search_space_generation.clone());
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.search_space_generation.num_tasks)
+                .map(|_| {
+                    tokio::spawn(SearchSpaceGenerationTask::start(
+                        search_space_generation_config.clone(),
+                        storage.clone(),
+                        input_queue.clone(),
+                        output_queue.clone(),
+                        stop_flag.clone(),
+                    ))
+                })
+                .collect();
+
+        for handle in handles {
+            handle.await?;
+        }
+
+        Ok(())
     }
 }

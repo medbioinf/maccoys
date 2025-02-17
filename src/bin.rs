@@ -17,9 +17,14 @@ use glob::glob;
 use indicatif::ProgressStyle;
 use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
 use maccoys::pipeline::local_pipeline::LocalPipeline;
-use maccoys::pipeline::pipeline::Pipeline;
 use maccoys::pipeline::remote_pipeline::RemotePipeline;
 use maccoys::pipeline::remote_pipeline_web_api::RemotePipelineWebApi;
+use maccoys::pipeline::tasks::cleanup_task::CleanupTask;
+use maccoys::pipeline::tasks::identification_task::IdentificationTask;
+use maccoys::pipeline::tasks::indexing_task::IndexingTask;
+use maccoys::pipeline::tasks::preparation_task::PreparationTask;
+use maccoys::pipeline::tasks::scoring_task::ScoringTask;
+use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use tracing::{debug, info, Level};
@@ -581,12 +586,18 @@ async fn main() -> Result<()> {
             PipelineCommand::Index {
                 work_dir,
                 config_file_path,
-            } => Pipeline::standalone_indexing(work_dir, config_file_path).await?,
+            } => {
+                IndexingTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(
+                    work_dir,
+                    config_file_path,
+                )
+                .await?
+            }
             PipelineCommand::Preparation { config_file_path } => {
-                Pipeline::standalone_preparation(config_file_path).await?
+                PreparationTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(config_file_path).await?
             }
             PipelineCommand::SearchSpaceGeneration { config_file_path } => {
-                Pipeline::standalone_search_space_generation(config_file_path).await?
+                SearchSpaceGenerationTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(config_file_path).await?
             }
             PipelineCommand::CometSearch {
                 tmp_dir,
@@ -596,15 +607,15 @@ async fn main() -> Result<()> {
                     Some(tmp_dir) => tmp_dir,
                     None => env::temp_dir().join("maccoys"),
                 };
-                Pipeline::standalone_comet_search(tmp_dir, config_file_path).await?
+                IdentificationTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(tmp_dir, config_file_path).await?
             }
             PipelineCommand::GoodnessAndRescoring { config_file_path } => {
-                Pipeline::standalone_goodness_and_rescoring(config_file_path).await?
+                ScoringTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(config_file_path).await?
             }
             PipelineCommand::Cleanup {
                 work_dir,
                 config_file_path,
-            } => Pipeline::standalone_cleanup(work_dir, config_file_path).await?,
+            } => CleanupTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(work_dir, config_file_path).await?,
         },
     };
     Ok(())

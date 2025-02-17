@@ -293,7 +293,7 @@ pub struct StandaloneCometSearchConfiguration {
 /// Configuration for standalone indexing
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
-pub struct StandaloneGoodnessAndRescoringConfiguration {
+pub struct StandaloneScoringConfiguration {
     /// Goodness and rescoring task configuration
     pub goodness_and_rescoring: TaskConfiguration,
     /// Cleanup task configuration

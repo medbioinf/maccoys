@@ -1,7 +1,3 @@
-/// Functions to run the pipeline
-#[allow(clippy::module_inception)]
-pub mod pipeline;
-
 /// Pipleine configuration
 pub mod configuration;
 
