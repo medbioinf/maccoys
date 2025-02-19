@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use metrics::counter;
 use polars::frame::DataFrame;
 use tokio::fs::create_dir_all;
 use tracing::{debug, error};
@@ -22,24 +23,23 @@ use crate::{
         configuration::{
             CometSearchTaskConfiguration, SearchParameters, StandaloneCometSearchConfiguration,
         },
-        convert::AsInputOutputQueueAndStorage,
+        convert::AsInputOutputQueue,
         queue::PipelineQueue,
-        storage::PipelineStorage,
+        storage::{PipelineStorage, RedisPipelineStorage},
     },
 };
 
+use super::task::Task;
+
+/// Prefix for the identification counter
+///
+pub const COUNTER_PREFIX: &str = "maccoys_identifications";
+
 /// Task to identify the spectra
 ///
-pub struct IdentificationTask<Q: PipelineQueue + 'static, S: PipelineStorage + 'static> {
-    _phantom_queue: std::marker::PhantomData<Q>,
-    _phantom_storage: std::marker::PhantomData<S>,
-}
+pub struct IdentificationTask;
 
-impl<Q, S> IdentificationTask<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
+impl IdentificationTask {
     /// Starts the task
     ///
     /// # Arguments
@@ -50,14 +50,17 @@ where
     /// * `goodness_and_rescoreing_queue` - Goodness and rescoreing queue
     /// * `stop_flag` - Flag to indicate to stop once the Comet search queue is empty
     ///
-    pub async fn start(
+    pub async fn start<Q, S>(
         local_work_dir: PathBuf,
         config: Arc<CometSearchTaskConfiguration>,
         storage: Arc<S>,
         comet_search_queue: Arc<Q>,
         goodness_and_rescoreing_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-    ) {
+    ) where
+        Q: PipelineQueue + 'static,
+        S: PipelineStorage + 'static,
+    {
         match create_dir_all(&local_work_dir).await {
             Ok(_) => (),
             Err(e) => {
@@ -68,6 +71,7 @@ where
         let mut last_search_uuid = String::new();
         let mut current_comet_config: Option<CometConfiguration> = None;
         let mut current_search_params = SearchParameters::new();
+        let mut metrics_counter_name = COUNTER_PREFIX.to_string();
 
         let comet_params_file_path = local_work_dir.join("comet.params");
         let fasta_file_path = local_work_dir.join("search_space.fasta");
@@ -143,6 +147,7 @@ where
                         };
 
                     last_search_uuid = manifest.uuid.clone();
+                    metrics_counter_name = format!("{COUNTER_PREFIX}_{last_search_uuid}");
                 }
 
                 // Unwrap the current Comet configuration for easier access
@@ -282,16 +287,7 @@ where
                     );
                 }
 
-                match storage.increment_comet_search_ctr(&manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing Comet search counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
+                counter!(metrics_counter_name.clone()).increment(1);
 
                 loop {
                     manifest = match goodness_and_rescoreing_queue.push(manifest).await {
@@ -322,11 +318,10 @@ where
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
 
-        let (storage, input_queue, output_queue) =
-            config.as_input_output_queue_and_storage().await?;
-        let storage = Arc::new(storage);
+        let (input_queue, output_queue) = config.as_input_output_queue().await?;
         let input_queue = Arc::new(input_queue);
         let output_queue = Arc::new(output_queue);
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let comet_search_config = Arc::new(config.comet_search.clone());
 
@@ -351,5 +346,11 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl Task for IdentificationTask {
+    fn get_counter_prefix() -> &'static str {
+        COUNTER_PREFIX
     }
 }

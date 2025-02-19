@@ -238,6 +238,8 @@ pub struct RemoteEntypointConfiguration {
     pub cleanup: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
+    /// Promtheus base URL
+    pub prometheus_base_url: String,
 }
 
 /// Configuration for standalone indexing
@@ -248,8 +250,6 @@ pub struct StandaloneIndexingConfiguration {
     pub index: TaskConfiguration,
     /// Preparation task configuration
     pub preparation: TaskConfiguration,
-    /// Storage configuration
-    pub storage: PipelineStorageConfiguration,
 }
 
 /// Configuration for standalone preparation
@@ -298,8 +298,6 @@ pub struct StandaloneScoringConfiguration {
     pub goodness_and_rescoring: TaskConfiguration,
     /// Cleanup task configuration
     pub cleanup: TaskConfiguration,
-    /// Storage configuration
-    pub storage: PipelineStorageConfiguration,
 }
 
 /// Configuration for standalone cleanup

@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
+use futures::future::join_all;
 use http::StatusCode;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
@@ -22,14 +23,20 @@ use crate::{
     pipeline::{
         queue::RedisPipelineQueue,
         storage::{PipelineStorage, RedisPipelineStorage},
+        tasks::{cleanup_task::CleanupTask, task::Task},
     },
+    web::web_error::WebError,
 };
 
 use super::{
     configuration::{RemoteEntypointConfiguration, SearchParameters},
     queue::PipelineQueue,
     search_manifest::SearchManifest,
-    storage::COUNTER_LABLES,
+    tasks::{
+        identification_task::IdentificationTask, indexing_task::IndexingTask,
+        preparation_task::PreparationTask, scoring_task::ScoringTask,
+        search_space_generation_task::SearchSpaceGenerationTask,
+    },
 };
 
 /// Shared state for the remote entrypoint service
@@ -43,6 +50,7 @@ struct EntrypointServiceState {
     cleanup_queue: RedisPipelineQueue,
     storage: RwLock<RedisPipelineStorage>,
     work_dir: PathBuf,
+    prometheus_base_url: String,
 }
 
 /// Struct to share pipeline workload
@@ -107,7 +115,7 @@ impl RemotePipelineWebApi {
         let cleanup_queue = RedisPipelineQueue::new(&config.cleanup).await?;
         let storage = RwLock::new(RedisPipelineStorage::new(&config.storage).await?);
 
-        let state = Arc::new(EntrypointServiceState {
+        let state: Arc<EntrypointServiceState> = Arc::new(EntrypointServiceState {
             index_queue,
             preparation_queue,
             search_space_generation_queue,
@@ -116,6 +124,7 @@ impl RemotePipelineWebApi {
             cleanup_queue,
             storage,
             work_dir,
+            prometheus_base_url: config.prometheus_base_url.clone(),
         });
 
         // Build our application with route
@@ -315,42 +324,39 @@ impl RemotePipelineWebApi {
     async fn monitor(
         State(state): State<Arc<EntrypointServiceState>>,
         axum::extract::Path(uuid): axum::extract::Path<String>,
-    ) -> Result<Response<String>, AnyhowWebError> {
-        let counters: Vec<usize> = {
-            let storage = state.storage.read().await;
-            vec![
-                storage.get_started_searches_ctr(&uuid).await?,
-                storage.get_prepared_ctr(&uuid).await?,
-                storage.get_search_space_generation_ctr(&uuid).await?,
-                storage.get_comet_search_ctr(&uuid).await?,
-                storage.get_goodness_and_rescoring_ctr(&uuid).await?,
-                storage.get_cleanup_ctr(&uuid).await?,
-            ]
-        };
+    ) -> Result<(StatusCode, String), WebError> {
+        let counters: Vec<f64> = join_all(vec![
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &CleanupTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &IdentificationTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &IndexingTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &PreparationTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &ScoringTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &SearchSpaceGenerationTask::get_counter_name(&uuid),
+            ),
+        ])
+        .await;
 
-        // Start with column names
-        let mut csv = COUNTER_LABLES
-            .iter()
-            .map(|label| label.to_string())
-            .collect::<Vec<String>>()
-            .join("\t");
-        // add a new line
-        csv.push('\n');
-        // Add the counters
-        csv.push_str(
-            &counters
-                .into_iter()
-                .map(|ctr| format!("{}", ctr))
-                .collect::<Vec<String>>()
-                .join("\t"),
-        );
-
-        let response = axum::response::Response::builder()
-            .header("Content-Type", "text/tab-separated-values")
-            .status(StatusCode::OK)
-            .body(csv)?;
-
-        Ok(response)
+        match serde_json::to_string(&counters) {
+            Ok(counters) => Ok((StatusCode::OK, counters)),
+            Err(e) => Err(anyhow!("Error serializing counters: {:?}", e).into()),
+        }
     }
 
     /// Entrypoint for monitoring the queue occupation
@@ -384,5 +390,72 @@ impl RemotePipelineWebApi {
             .body(serde_json::to_string(&workload)?)?;
 
         Ok(response)
+    }
+
+    async fn get_prometheus_counter_rate(prometheus_url: &str, metric_name: &str) -> f64 {
+        let url = format!("{}/api/v1/query", prometheus_url);
+        let from =
+            reqwest::multipart::Form::new().text("query", format!("rate({}[5m])", metric_name));
+        let response = reqwest::Client::new()
+            .post(&url)
+            .multipart(from)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Error getting Prometheus counter rate: {:?}", e);
+                return -1.0;
+            }
+        };
+        if !response.status().is_success() {
+            error!(
+                "Error getting Prometheus counter rate: {:?}",
+                response.text().await
+            );
+            return -1.0;
+        }
+        let data = match response.json::<serde_json::Value>().await {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Error parsing Prometheus counter rate: {:?}", e);
+                return -1.0;
+            }
+        };
+
+        let mut data = data.get("data");
+        if data.is_none() {
+            error!("Error parsing Prometheus counter rate: {:?}", data);
+            return -1.0;
+        }
+
+        data = data.unwrap().get("result");
+        if data.is_none() {
+            error!("Error parsing Prometheus counter rate: {:?}", data);
+            return -1.0;
+        }
+
+        data = data.unwrap().get(0);
+        if data.is_none() {
+            error!("Error parsing Prometheus counter rate: {:?}", data);
+            return -1.0;
+        }
+
+        data = data.unwrap().get("value");
+        if data.is_none() {
+            error!("Error parsing Prometheus counter rate: {:?}", data);
+            return -1.0;
+        }
+
+        let data: (f64, f64) = match serde_json::from_value(data.unwrap().clone()) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Error parsing Prometheus counter rate: {:?}", e);
+                return -1.0;
+            }
+        };
+
+        // Prometheus is queried for the last 5 minutes, so we need to divide by 300 to get the rate per second
+        data.1 / 300.0
     }
 }

@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
@@ -18,124 +18,6 @@ use rustis::commands::{GenericCommands, StringCommands};
 use crate::io::comet::configuration::Configuration as CometConfiguration;
 
 use super::configuration::{PipelineStorageConfiguration, SearchParameters};
-
-/// Number of counters for the pipeline
-///
-pub const NUMBER_OF_COUNTERS: usize = 6;
-
-/// Labels for the counters
-///
-pub const COUNTER_LABLES: [&str; NUMBER_OF_COUNTERS] = [
-    "started_searches",
-    "prepared",
-    "search_space_generation",
-    "comet_search",
-    "goodness_and_rescoring",
-    "cleanup",
-];
-
-/// Macro creates functions to create the counter key from a search UUID
-/// and init-, get-, increment-, remove a counter.
-///
-/// E.g.:
-/// `build_key__init__get__increment__remove__ctr_functions!(started_searches);`
-/// results in the following functions:
-///
-/// ```rust
-/// fn get_started_searches_ctr_key(uuid: &str) -> String {
-///    format!("started_searches:{}", uuid)
-/// }
-///
-///  fn init_started_searches_ctr(&self, uuid: &str) -> impl Future<Output=Result<u64>> {
-///    async {
-///       Ok(self.init_ctr(&Self::get_started_ctr_key(uuid)).await?)
-///   }
-/// }
-///
-/// fn get_started_searches_ctr(&self, uuid: &str) -> impl Future<Output=Result<u64>> {
-///    async {
-///       Ok(self.get_ctr(&Self::get_started_ctr_key(uuid)).await?)
-///   }
-/// }
-///
-/// fn increment_started_searches_ctr(&self, uuid: &str) -> impl Future<Output=Result<u64>> {
-///    async {
-///       Ok(self.increment_ctr(&Self::get_started_ctr_key(uuid)).await?)
-///   }
-/// }
-///
-/// fn remove_started_searches_ctr(&self, uuid: &str) -> impl Future<Output=Result<u64>> {
-///    async {
-///       Ok(self.remove_ctr(&Self::get_started_ctr_key(uuid)).await?)
-///   }
-/// }
-///
-/// // ...
-/// ```
-///
-macro_rules! build_key__init__get__increment__remove__ctr_functions {
-    ($name:ident) => {
-        paste::item! {
-
-            /// Get the ["`$name`"]-key for the given counter
-            ///
-            /// # Arguments
-            /// * `uuid` - UUID for the counter
-            ///
-            fn [< get_ $name _ctr_key >](uuid: &str) -> String {
-                format!("{}:{}", stringify!($name), uuid)
-            }
-
-            #[doc = "Initialize the [" $name "]-counter for the given UUID with 0"]
-            ///
-            /// # Arguments
-            /// * `uuid` - UUID for the counter
-            ///
-            fn [< init_ $name _ctr >](&mut self, uuid: &str) -> impl Future<Output=Result<()>> + Send {
-                async {
-                    self.init_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await?;
-                    Ok(())
-                }
-            }
-
-            #[doc = "Return the [" $name "]-counter for the given UUID"]
-            ///
-            /// # Arguments
-            /// * `uuid` - UUID for the counter
-            ///
-            fn [< get_ $name _ctr >](&self, uuid: &str) -> impl Future<Output=Result<usize>> + Send {
-                async {
-                    self.get_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await
-                }
-            }
-
-            #[doc = "Increment the [" $name "]-counter for the given UUID by 1"]
-            ///
-            /// # Arguments
-            /// * `uuid` - UUID for the counter
-            ///
-            fn [< increment_ $name _ctr >](&self, uuid: &str) -> impl Future<Output=Result<usize>> + Send {
-                async {
-                    self.increment_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await
-                }
-            }
-
-            #[doc = "Remove the [" $name "]-counter for the given UUID"]
-            ///
-            /// # Arguments
-            /// * `uuid` - UUID for the counter
-            ///
-            fn [< remove_ $name _ctr >](&mut self, uuid: &str) -> impl Future<Output=Result<()>> + Send {
-                async {
-                    self.remove_ctr(&Self::[< get_ $name _ctr_key >](uuid)).await?;
-                    Ok(())
-                }
-            }
-
-
-        }
-    };
-}
 
 /// Central storage for configuration, PTM etc.
 ///
@@ -225,22 +107,6 @@ pub trait PipelineStorage: Send + Sync + Sized {
     ///
     fn remove_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
 
-    /// Inrement the given counter by one
-    ///
-    fn increment_ctr(&self, ctr_key: &str) -> impl Future<Output = Result<usize>> + Send;
-
-    /// Get the value of the given counter
-    ///
-    fn get_ctr(&self, ctr_key: &str) -> impl Future<Output = Result<usize>> + Send;
-
-    ///  Remove the given counter
-    ///
-    fn remove_ctr(&mut self, ctr_key: &str) -> impl Future<Output = Result<()>> + Send;
-
-    ///  Initialize counter with zero
-    ///
-    fn init_ctr(&mut self, ctr_key: &str) -> impl Future<Output = Result<()>> + Send;
-
     fn get_search_parameters_key(uuid: &str) -> String {
         format!("search_parameter:{}", uuid)
     }
@@ -256,13 +122,6 @@ pub trait PipelineStorage: Send + Sync + Sized {
     fn get_is_completely_enqueued_key(uuid: &str) -> String {
         format!("is_completely_enqueued:{}", uuid)
     }
-
-    build_key__init__get__increment__remove__ctr_functions!(started_searches);
-    build_key__init__get__increment__remove__ctr_functions!(prepared);
-    build_key__init__get__increment__remove__ctr_functions!(search_space_generation);
-    build_key__init__get__increment__remove__ctr_functions!(comet_search);
-    build_key__init__get__increment__remove__ctr_functions!(goodness_and_rescoring);
-    build_key__init__get__increment__remove__ctr_functions!(cleanup);
 
     /// Initialize a keys for new search
     ///
@@ -280,13 +139,6 @@ pub trait PipelineStorage: Send + Sync + Sized {
         comet_config: &CometConfiguration,
     ) -> impl Future<Output = Result<()>> {
         async {
-            // Init counters
-            self.init_started_searches_ctr(uuid).await?;
-            self.init_prepared_ctr(uuid).await?;
-            self.init_search_space_generation_ctr(uuid).await?;
-            self.init_comet_search_ctr(uuid).await?;
-            self.init_goodness_and_rescoring_ctr(uuid).await?;
-            self.init_cleanup_ctr(uuid).await?;
             // Set configs
             self.set_search_parameters(uuid, search_parameters).await?;
             self.set_ptms(uuid, ptms).await?;
@@ -305,69 +157,12 @@ pub trait PipelineStorage: Send + Sync + Sized {
     ///
     fn cleanup_search(&mut self, uuid: &str) -> impl Future<Output = Result<()>> {
         async {
-            // Remove counters
-            self.remove_started_searches_ctr(uuid).await?;
-            self.remove_prepared_ctr(uuid).await?;
-            self.remove_search_space_generation_ctr(uuid).await?;
-            self.remove_comet_search_ctr(uuid).await?;
-            self.remove_goodness_and_rescoring_ctr(uuid).await?;
-            self.remove_cleanup_ctr(uuid).await?;
             // Remove configs
             self.remove_search_params(uuid).await?;
             self.remove_ptms(uuid).await?;
             self.remove_comet_config(uuid).await?;
             // Remove flags
             self.remove_is_completely_enqueued(uuid).await?;
-
-            Ok(())
-        }
-    }
-
-    /// Updates the given array of counters for monitoring
-    ///
-    /// # Arguments
-    /// * `counters` - Array of counters
-    /// * `uuid` - UUID for the counters
-    ///
-    fn poll_counters(
-        &self,
-        counters: Vec<Arc<AtomicUsize>>,
-        uuid: &str,
-    ) -> impl Future<Output = Result<()>> {
-        async move {
-            if counters.len() != NUMBER_OF_COUNTERS {
-                bail!(
-                    "[STORAGE] Counters array must have {} elements",
-                    NUMBER_OF_COUNTERS
-                )
-            }
-
-            counters[0].store(
-                self.get_started_searches_ctr(uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            counters[1].store(
-                self.get_prepared_ctr(uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            counters[2].store(
-                self.get_search_space_generation_ctr(uuid)
-                    .await
-                    .unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            counters[3].store(
-                self.get_comet_search_ctr(uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            counters[4].store(
-                self.get_goodness_and_rescoring_ctr(uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            counters[5].store(
-                self.get_cleanup_ctr(uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
 
             Ok(())
         }
@@ -386,9 +181,6 @@ pub struct LocalPipelineStorage {
     /// Comet configurations
     comet_configs: HashMap<String, CometConfiguration>,
 
-    /// Counters
-    counters: HashMap<String, Arc<AtomicUsize>>,
-
     /// Flags
     flags: HashMap<String, Arc<AtomicBool>>,
 }
@@ -399,7 +191,6 @@ impl PipelineStorage for LocalPipelineStorage {
             search_parameters: HashMap::new(),
             ptms_collections: HashMap::new(),
             comet_configs: HashMap::new(),
-            counters: HashMap::new(),
             flags: HashMap::new(),
         })
     }
@@ -488,40 +279,6 @@ impl PipelineStorage for LocalPipelineStorage {
             Some(_) => Ok(()),
             None => Ok(()),
         }
-    }
-
-    async fn increment_ctr(&self, ctr_key: &str) -> Result<usize> {
-        let counter = match self.counters.get(ctr_key) {
-            Some(counter) => counter,
-            None => {
-                bail!("[STORAGE] Counter {} not found", ctr_key)
-            }
-        };
-
-        Ok(counter.fetch_add(1, Ordering::SeqCst))
-    }
-
-    async fn get_ctr(&self, ctr_key: &str) -> Result<usize> {
-        let counter = match self.counters.get(ctr_key) {
-            Some(counter) => counter,
-            None => {
-                bail!("[STORAGE] Counter {} not found", ctr_key)
-            }
-        };
-
-        Ok(counter.load(Ordering::SeqCst))
-    }
-
-    async fn remove_ctr(&mut self, ctr_key: &str) -> Result<()> {
-        let _ = self.counters.remove(ctr_key);
-
-        Ok(())
-    }
-
-    async fn init_ctr(&mut self, ctr_key: &str) -> Result<()> {
-        self.counters
-            .insert(ctr_key.to_string(), Arc::new(AtomicUsize::new(0)));
-        Ok(())
     }
 }
 
@@ -672,39 +429,6 @@ impl PipelineStorage for RedisPipelineStorage {
             .del(key)
             .await
             .context("[STORAGE] Error removing completely enqueued")?;
-
-        Ok(())
-    }
-
-    async fn increment_ctr(&self, ctr_key: &str) -> Result<usize> {
-        Ok(self
-            .client
-            .incr(ctr_key)
-            .await
-            .context("[STORAGE] Error incrementing counter")? as usize)
-    }
-
-    async fn get_ctr(&self, ctr_key: &str) -> Result<usize> {
-        self.client
-            .get(ctr_key)
-            .await
-            .context("[STORAGE] Error getting counter")
-    }
-
-    async fn remove_ctr(&mut self, ctr_key: &str) -> Result<()> {
-        self.client
-            .del(ctr_key)
-            .await
-            .context("[STORAGE] Error deleting counter")?;
-
-        Ok(())
-    }
-
-    async fn init_ctr(&mut self, ctr_key: &str) -> Result<()> {
-        self.client
-            .set(ctr_key, 0)
-            .await
-            .context("[STORAGE] Error initializing counter")?;
 
         Ok(())
     }

@@ -1,17 +1,43 @@
 use std::{
-    num::ParseIntError,
+    collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
 
 use anyhow::{anyhow, bail, Result};
-use macpepdb::tools::progress_monitor::ProgressMonitor;
-use tracing::{error, info};
+use indicatif::ProgressStyle;
+use lazy_static::lazy_static;
+use tokio::{spawn, task::JoinHandle, time::sleep_until};
+use tracing::{error, info, info_span, Span};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
-use super::storage::{COUNTER_LABLES, NUMBER_OF_COUNTERS};
+use super::tasks::{
+    cleanup_task::CleanupTask, identification_task::IdentificationTask,
+    indexing_task::IndexingTask, preparation_task::PreparationTask, scoring_task::ScoringTask,
+    search_space_generation_task::SearchSpaceGenerationTask, task::Task,
+};
+
+/// Interval to refresh the monitored metrics
+///
+const REFRESH_INTERVAL: u64 = 1000;
+
+/// Span style for simple metrics
+///
+const SIMPLE_STYLE: &str = "{msg} {pos}/s";
+
+lazy_static! {
+    static ref METRICS_RENDER_ORDER: [&'static str; 6] = [
+        IndexingTask::get_counter_prefix(),
+        PreparationTask::get_counter_prefix(),
+        SearchSpaceGenerationTask::get_counter_prefix(),
+        IdentificationTask::get_counter_prefix(),
+        ScoringTask::get_counter_prefix(),
+        CleanupTask::get_counter_prefix(),
+    ];
+}
 
 pub struct RemotePipeline {}
 
@@ -119,89 +145,72 @@ impl RemotePipeline {
     /// * `uuid` - UUID of the search
     ///
     pub async fn start_remote_search_monitor(base_url: String, uuid: &str) -> Result<()> {
-        let monitor_url = format!("{}/api/pipeline/monitor/{}", base_url, uuid);
-        let metrics_stop_flag = Arc::new(AtomicBool::new(false));
-        let metrics = (0..NUMBER_OF_COUNTERS)
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect::<Vec<Arc<AtomicUsize>>>();
-
-        let thread_metrics_stop_flag = metrics_stop_flag.clone();
-        let thread_metrics = metrics.clone();
-
-        // Polls the metrics from the remote server
-        let metrics_poll_taks: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
-            let mut next_poll = tokio::time::Instant::now();
-            while !thread_metrics_stop_flag.load(Ordering::Relaxed) {
-                if next_poll >= tokio::time::Instant::now() {
-                    tokio::time::sleep(next_poll - tokio::time::Instant::now()).await;
-                }
-                next_poll = tokio::time::Instant::now() + tokio::time::Duration::from_millis(300); // Should be smaller then the monitoring interval
-
-                let response = match reqwest::get(&monitor_url).await {
-                    Ok(response) => response,
-                    Err(e) => {
-                        error!("Error getting metrics: {:?}", e);
-                        continue;
-                    }
-                };
-
-                let tsv = match response.text().await {
-                    Ok(csv) => csv,
-                    Err(e) => {
-                        error!("Error reading metrics line: {:?}", e);
-                        continue;
-                    }
-                };
-
-                let mut tsv_line_iter = tsv.lines().skip(1);
-
-                let polled_metrics: Result<Vec<usize>, ParseIntError> = match tsv_line_iter.next() {
-                    Some(metrics) => metrics
-                        .trim()
-                        .split("\t")
-                        .map(|metric| metric.parse::<usize>())
-                        .collect(),
-                    None => {
-                        error!("No metrics found in response");
-                        continue;
-                    }
-                };
-
-                match polled_metrics {
-                    Ok(polled_metrics) => polled_metrics
-                        .into_iter()
-                        .zip(thread_metrics.iter())
-                        .for_each(|(polled_metric, metric)| {
-                            metric.store(polled_metric, Ordering::Relaxed);
-                        }),
-                    Err(e) => {
-                        error!("Error parsing metrics: {:?}", e);
-                        continue;
-                    }
-                };
-            }
-            Ok(())
-        });
-
-        let mut metrics_monitor = ProgressMonitor::new(
-            "",
-            metrics.clone(),
-            vec![None; NUMBER_OF_COUNTERS],
-            COUNTER_LABLES
-                .iter()
-                .rev()
-                .map(|label| label.to_string())
-                .collect(),
-            None,
-        )?;
+        let metrics_monitor = RemotePiplineMetricsMonitor::new(uuid, base_url);
 
         tokio::signal::ctrl_c().await?;
-
-        metrics_stop_flag.store(true, Ordering::Relaxed);
-        metrics_poll_taks.await??;
 
         metrics_monitor.stop().await?;
 
         Ok(())
+    }
+}
+
+struct RemotePiplineMetricsMonitor {
+    stop_flag: Arc<AtomicBool>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl RemotePiplineMetricsMonitor {
+    pub fn new(search_uuid: &str, remote_pipline_api: String) -> Self {
+        let url = format!("{remote_pipline_api}/api/pipeline/monitor/{search_uuid}");
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let handle = spawn(Self::view(stop_flag.clone(), url));
+
+        Self { stop_flag, handle }
+    }
+
+    async fn view(stop_flag: Arc<AtomicBool>, monitor_endpoint_url: String) -> Result<()> {
+        let spans: HashMap<String, Span> = METRICS_RENDER_ORDER
+            .iter()
+            .map(|metric| {
+                let span = info_span!("");
+                let _ = span.enter();
+                span.pb_set_position(0);
+                span.pb_set_message(metric);
+                span.pb_set_style(&ProgressStyle::with_template(SIMPLE_STYLE).unwrap());
+                (metric.to_string(), span)
+            })
+            .collect();
+
+        while !stop_flag.load(Ordering::Relaxed) {
+            let next_refresh =
+                tokio::time::Instant::now() + tokio::time::Duration::from_millis(REFRESH_INTERVAL);
+            let response = reqwest::get(&monitor_endpoint_url).await?;
+            if !response.status().is_success() {
+                continue;
+            }
+            let counter: HashMap<String, usize> = match response.json().await {
+                Ok(counter) => counter,
+                Err(e) => {
+                    error!("Error reading metrics line: {:?}", e);
+                    continue;
+                }
+            };
+
+            for metrics in METRICS_RENDER_ORDER.iter() {
+                let value = counter.get(*metrics).unwrap_or(&0);
+                let span = spans.get(*metrics).unwrap();
+                let _ = span.enter();
+                span.pb_set_position(*value as u64);
+            }
+            sleep_until(next_refresh).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn stop(self) -> Result<()> {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.handle.await?
     }
 }

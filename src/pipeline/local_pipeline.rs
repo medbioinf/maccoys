@@ -1,14 +1,14 @@
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
 
 use anyhow::{bail, Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
-use macpepdb::tools::{progress_monitor::ProgressMonitor, queue_monitor::QueueMonitor};
+use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
 use tokio::fs::{create_dir_all, remove_dir_all};
 use tracing::{error, info};
 use uuid::Uuid;
@@ -16,13 +16,12 @@ use uuid::Uuid;
 use crate::{
     io::comet::configuration::Configuration as CometConfiguration,
     pipeline::{
-        queue::PipelineQueueArc,
         search_manifest::SearchManifest,
-        storage::{COUNTER_LABLES, NUMBER_OF_COUNTERS},
         tasks::{
             cleanup_task::CleanupTask, identification_task::IdentificationTask,
             indexing_task::IndexingTask, preparation_task::PreparationTask,
             scoring_task::ScoringTask, search_space_generation_task::SearchSpaceGenerationTask,
+            task::Task,
         },
     },
 };
@@ -63,6 +62,7 @@ where
         mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
         mzml_file_paths: Vec<PathBuf>,
+        metrics_scrape_url: Option<String>,
     ) -> Result<()> {
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
@@ -105,65 +105,46 @@ where
         let comet_search_stop_flag = Arc::new(AtomicBool::new(false));
         let goodness_and_rescoreing_stop_flag = Arc::new(AtomicBool::new(false));
         let cleanup_stop_flag = Arc::new(AtomicBool::new(false));
-        let metrics_stop_flag = Arc::new(AtomicBool::new(false));
 
-        // Metrics
-        let metrics = (0..NUMBER_OF_COUNTERS)
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect::<Vec<Arc<AtomicUsize>>>();
+        let mut metrics_monitor: Option<MetricsMonitor> = None;
+        if let Some(metrics_scrape_url) = metrics_scrape_url {
+            let monitorable_metrics = vec![
+                MonitorableMetric::new(
+                    IndexingTask::get_counter_name(&uuid).to_string(),
+                    MonitorableMetricType::Rate,
+                ),
+                MonitorableMetric::new(
+                    PreparationTask::get_counter_name(&uuid).to_string(),
+                    MonitorableMetricType::Rate,
+                ),
+                MonitorableMetric::new(
+                    SearchSpaceGenerationTask::get_counter_name(&uuid).to_string(),
+                    MonitorableMetricType::Rate,
+                ),
+                MonitorableMetric::new(
+                    IdentificationTask::get_counter_name(&uuid).to_string(),
+                    MonitorableMetricType::Rate,
+                ),
+                MonitorableMetric::new(
+                    ScoringTask::get_counter_name(&uuid).to_string(),
+                    MonitorableMetricType::Rate,
+                ),
+                MonitorableMetric::new(
+                    CleanupTask::get_counter_name(&uuid).to_string(),
+                    MonitorableMetricType::Rate,
+                ),
+            ];
 
-        let mut queue_monitor = QueueMonitor::new::<PipelineQueueArc<Q>>(
-            "",
-            vec![
-                cleanup_queue.clone().into(),
-                goodness_and_rescoreing_queue.clone().into(),
-                comet_search_queue.clone().into(),
-                search_space_generation_queue.clone().into(),
-                preparation_queue.clone().into(),
-                index_queue.clone().into(),
-            ],
-            vec![
-                config.cleanup.queue_capacity as u64,
-                config.goodness_and_rescoring.queue_capacity as u64,
-                config.comet_search.queue_capacity as u64,
-                config.search_space_generation.queue_capacity as u64,
-                config.preparation.queue_capacity as u64,
-                config.index.queue_capacity as u64,
-            ],
-            vec![
-                "Cleanup".to_owned(),
-                "Goodness and Rescoring".to_owned(),
-                "Comet Search".to_owned(),
-                "Search Space Generation".to_owned(),
-                "Preparation".to_owned(),
-                "Index".to_owned(),
-            ],
-            None,
-        )?;
-
-        let metrics_poll_taks = tokio::spawn(Self::poll_store_metrics_task(
-            storage.clone(),
-            uuid.clone(),
-            metrics.clone(),
-            metrics_stop_flag.clone(),
-        ));
-
-        let mut metrics_monitor = ProgressMonitor::new(
-            "",
-            metrics.clone(),
-            vec![None; NUMBER_OF_COUNTERS],
-            COUNTER_LABLES
-                .iter()
-                .rev()
-                .map(|label| label.to_string())
-                .collect(),
-            None,
-        )?;
+            metrics_monitor = Some(MetricsMonitor::new(
+                "macpepdb.build.digest",
+                monitorable_metrics,
+                metrics_scrape_url,
+            )?);
+        }
 
         let index_handler: tokio::task::JoinHandle<()> = {
             tokio::spawn(IndexingTask::start(
                 result_dir.clone(),
-                storage.clone(),
                 index_queue.clone(),
                 preparation_queue.clone(),
                 index_stop_flag.clone(),
@@ -214,7 +195,6 @@ where
             (0..config.goodness_and_rescoring.num_tasks)
                 .map(|_| {
                     tokio::spawn(ScoringTask::start(
-                        storage.clone(),
                         goodness_and_rescoreing_queue.clone(),
                         cleanup_queue.clone(),
                         goodness_and_rescoreing_stop_flag.clone(),
@@ -315,10 +295,9 @@ where
             }
         }
 
-        metrics_stop_flag.store(true, Ordering::Relaxed);
-        metrics_poll_taks.await?;
-        queue_monitor.stop().await?;
-        metrics_monitor.stop().await?;
+        if let Some(mut metrics_monitor) = metrics_monitor {
+            metrics_monitor.stop().await?;
+        }
 
         let mut storage = match Arc::try_unwrap(storage) {
             Ok(storage) => storage,
@@ -333,58 +312,5 @@ where
             .context("Could not delete temporary directory")?;
 
         Ok(())
-    }
-
-    /// Task to poll the metrcis from the storage to monitor them
-    ///
-    /// # Arguments
-    /// * `storage` - Storage to access the metrics
-    /// * `uuid` - UUID of the search
-    /// * `metrics` - Metrics to store the values
-    /// * `stop_flag` - Flag to indicate to stop polling
-    ///
-    async fn poll_store_metrics_task(
-        storage: Arc<S>,
-        uuid: String,
-        metrics: Vec<Arc<AtomicUsize>>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
-        loop {
-            metrics[0].store(
-                storage.get_started_searches_ctr(&uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            metrics[1].store(
-                storage.get_prepared_ctr(&uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            metrics[2].store(
-                storage
-                    .get_search_space_generation_ctr(&uuid)
-                    .await
-                    .unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            metrics[3].store(
-                storage.get_comet_search_ctr(&uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            metrics[4].store(
-                storage
-                    .get_goodness_and_rescoring_ctr(&uuid)
-                    .await
-                    .unwrap_or(0),
-                Ordering::Relaxed,
-            );
-            metrics[5].store(
-                storage.get_cleanup_ctr(&uuid).await.unwrap_or(0),
-                Ordering::Relaxed,
-            );
-
-            tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-        }
     }
 }

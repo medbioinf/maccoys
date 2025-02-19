@@ -10,3 +10,5 @@ pub mod preparation_task;
 pub mod scoring_task;
 /// Task to generate the search space
 pub mod search_space_generation_task;
+/// Trait for defining some shared behavior for the tasks
+pub mod task;

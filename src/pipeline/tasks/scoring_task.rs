@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use metrics::counter;
 use polars::{prelude::NamedFrom, series::Series};
 use pyo3::{prelude::*, types::PyList};
 use signal_hook::{consts::SIGINT, iterator::Signals};
@@ -18,24 +19,23 @@ use crate::{
     constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
     goodness_of_fit_record::GoodnessOfFitRecord,
     pipeline::{
-        configuration::StandaloneScoringConfiguration, convert::AsInputOutputQueueAndStorage,
-        queue::PipelineQueue, storage::PipelineStorage,
+        configuration::StandaloneScoringConfiguration, convert::AsInputOutputQueue,
+        queue::PipelineQueue,
     },
 };
+
+use super::task::Task;
+
+/// Prefix for the scoring counter
+///
+pub const COUNTER_PREFIX: &str = "maccoys_scorings";
 
 /// Task to score the PSMs.
 /// This tasks runs a Python interpreter in the background to utilize functionality from [scipy](https://scipy.org/) which is currently not available in Rust
 ///
-pub struct ScoringTask<Q: PipelineQueue + 'static, S: PipelineStorage + 'static> {
-    _phantom_queue: std::marker::PhantomData<Q>,
-    _phantom_storage: std::marker::PhantomData<S>,
-}
+pub struct ScoringTask;
 
-impl<Q, S> ScoringTask<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
+impl ScoringTask {
     /// Starts the task
     ///
     /// # Arguments
@@ -44,12 +44,10 @@ where
     /// * `cleanup_queue` - The queue to push the scored PSMs to
     /// * `stop_flag` - The flag to stop the task
     ///
-    pub async fn start(
-        storage: Arc<S>,
-        scoring_queue: Arc<Q>,
-        cleanup_queue: Arc<Q>,
-        stop_flag: Arc<AtomicBool>,
-    ) {
+    pub async fn start<Q>(scoring_queue: Arc<Q>, cleanup_queue: Arc<Q>, stop_flag: Arc<AtomicBool>)
+    where
+        Q: PipelineQueue + 'static,
+    {
         let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
         let (to_rust, mut from_python) =
             tokio::sync::mpsc::channel::<(Vec<GoodnessOfFitRecord>, Vec<f64>, Vec<f64>)>(1);
@@ -120,6 +118,8 @@ where
                     "[{} / {}] Goodness and rescoring",
                     &manifest.uuid, &manifest.spectrum_id
                 );
+
+                let metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, manifest.uuid);
 
                 if manifest.precursors.len() != manifest.psms_dataframes.len() {
                     info!(
@@ -214,19 +214,7 @@ where
                     );
                 }
 
-                match storage
-                    .increment_goodness_and_rescoring_ctr(&manifest.uuid)
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing goodness and rescoring counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
+                counter!(metrics_counter_name.clone()).increment(1);
 
                 loop {
                     manifest = match cleanup_queue.push(manifest).await {
@@ -265,9 +253,7 @@ where
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
 
-        let (storage, input_queue, output_queue) =
-            config.as_input_output_queue_and_storage().await?;
-        let storage = Arc::new(storage);
+        let (input_queue, output_queue) = config.as_input_output_queue().await?;
         let input_queue = Arc::new(input_queue);
         let output_queue = Arc::new(output_queue);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -288,7 +274,6 @@ where
             (0..config.goodness_and_rescoring.num_tasks)
                 .map(|_| {
                     tokio::spawn(ScoringTask::start(
-                        storage.clone(),
                         input_queue.clone(),
                         output_queue.clone(),
                         stop_flag.clone(),
@@ -301,5 +286,11 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl Task for ScoringTask {
+    fn get_counter_prefix() -> &'static str {
+        COUNTER_PREFIX
     }
 }

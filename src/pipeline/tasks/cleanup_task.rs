@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use metrics::counter;
 use tokio::fs::create_dir_all;
 use tracing::{debug, error, trace};
 
@@ -17,18 +18,17 @@ use crate::pipeline::{
     storage::{PipelineStorage, RedisPipelineStorage},
 };
 
+use super::task::Task;
+
+/// Prefix for the cleanup counter
+///
+pub const COUNTER_PREFIX: &str = "maccoys_cleanups";
+
 /// Task to cleanup the search
 ///
-pub struct CleanupTask<Q: PipelineQueue + 'static, S: PipelineStorage + 'static> {
-    _phantom_queue: std::marker::PhantomData<Q>,
-    _phantom_storage: std::marker::PhantomData<S>,
-}
+pub struct CleanupTask;
 
-impl<Q, S> CleanupTask<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
+impl CleanupTask {
     /// Start the cleanup task
     ///
     /// # Arguments
@@ -37,15 +37,19 @@ where
     /// * `cleanup_queue` - Queue for the cleanup task
     /// * `stop_flag` - Flag to indicate to stop once the cleanup queue is empty
     ///
-    pub async fn start(
+    pub async fn start<Q, S>(
         result_dir: PathBuf,
         storage: Arc<S>,
         cleanup_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-    ) {
+    ) where
+        Q: PipelineQueue + 'static,
+        S: PipelineStorage + 'static,
+    {
         loop {
             let mut last_search_uuid = String::new();
             let mut current_search_params = SearchParameters::new();
+            let mut metrics_counter_name = COUNTER_PREFIX.to_string();
 
             while let Some(mut manifest) = cleanup_queue.pop().await {
                 debug!(
@@ -78,6 +82,7 @@ where
                             }
                         };
                     last_search_uuid = manifest.uuid.clone();
+                    metrics_counter_name = format!("{COUNTER_PREFIX}_{last_search_uuid}");
                 }
 
                 // Clone precursor so manifest is not borrowed
@@ -171,16 +176,7 @@ where
                     }
                 }
 
-                match storage.increment_cleanup_ctr(&manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing cleanup counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
+                counter!(metrics_counter_name.clone()).increment(1);
 
                 debug!(
                     "[{} / {}] Cleanup done in `{}`",
@@ -228,5 +224,11 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl Task for CleanupTask {
+    fn get_counter_prefix() -> &'static str {
+        COUNTER_PREFIX
     }
 }

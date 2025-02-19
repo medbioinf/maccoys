@@ -12,14 +12,17 @@ use dihardts_omicstools::{
     mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
     proteomics::io::mzml::reader::{Reader as MzMlReader, Spectrum},
 };
+use metrics::counter;
 use tracing::{debug, error, trace};
 
 use crate::pipeline::{
     configuration::{SearchParameters, StandalonePreparationConfiguration},
-    convert::AsInputOutputQueueAndStorage,
+    convert::AsInputOutputQueue,
     queue::PipelineQueue,
-    storage::PipelineStorage,
+    storage::{PipelineStorage, RedisPipelineStorage},
 };
+
+use super::task::Task;
 
 /// Default start tag for a spectrum in mzML
 const SPECTRUM_START_TAG: &[u8; 10] = b"<spectrum ";
@@ -27,18 +30,15 @@ const SPECTRUM_START_TAG: &[u8; 10] = b"<spectrum ";
 /// Default stop tag for a spectrum in mzML
 const SPECTRUM_STOP_TAG: &[u8; 11] = b"</spectrum>";
 
+/// Prefix for the preparation counter
+///
+const COUNTER_PREFIX: &str = "maccoys_preparations";
+
 /// /// Task to prepare the spectra work directories for the search space generation and search.
 ///
-pub struct PreparationTask<Q: PipelineQueue + 'static, S: PipelineStorage + 'static> {
-    _phantom_queue: std::marker::PhantomData<Q>,
-    _phantom_storage: std::marker::PhantomData<S>,
-}
+pub struct PreparationTask;
 
-impl<Q, S> PreparationTask<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
+impl PreparationTask {
     /// Start the preparation task
     ///
     ///
@@ -48,14 +48,18 @@ where
     /// * `search_space_generation_queue` - The queue to push the prepared spectra to
     /// * `stop_flag` - The flag to stop the task
     ///
-    pub async fn start(
+    pub async fn start<Q, S>(
         storage: Arc<S>,
         preparation_queue: Arc<Q>,
         search_space_generation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-    ) {
+    ) where
+        Q: PipelineQueue + 'static,
+        S: PipelineStorage + 'static,
+    {
         let mut current_search_params = SearchParameters::new();
         let mut last_search_uuid = String::new();
+        let mut metrics_counter_name = COUNTER_PREFIX.to_string();
 
         loop {
             while let Some(mut manifest) = preparation_queue.pop().await {
@@ -97,6 +101,7 @@ where
                             }
                         };
                     last_search_uuid = manifest.uuid.clone();
+                    metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, last_search_uuid);
                 }
 
                 let spectrum_mzml = match manifest.get_spectrum_mzml() {
@@ -205,16 +210,7 @@ where
 
                 drop(spectrum);
 
-                match storage.increment_prepared_ctr(&manifest.uuid).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error incrementing prepare counter: {:?}",
-                            &manifest.uuid, &manifest.spectrum_id, e
-                        );
-                        continue;
-                    }
-                }
+                counter!(metrics_counter_name.clone()).increment(1);
 
                 manifest.precursors = precursors;
 
@@ -249,11 +245,10 @@ where
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
 
-        let (storage, input_queue, output_queue) =
-            config.as_input_output_queue_and_storage().await?;
-        let storage = Arc::new(storage);
+        let (input_queue, output_queue) = config.as_input_output_queue().await?;
         let input_queue = Arc::new(input_queue);
         let output_queue = Arc::new(output_queue);
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
 
@@ -273,5 +268,11 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl Task for PreparationTask {
+    fn get_counter_prefix() -> &'static str {
+        COUNTER_PREFIX
     }
 }

@@ -14,6 +14,7 @@ use dihardts_omicstools::{
     proteomics::post_translational_modifications::PostTranslationalModification,
 };
 use macpepdb::mass::convert::to_int as mass_to_int;
+use metrics::counter;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error};
 
@@ -24,24 +25,23 @@ use crate::{
             SearchParameters, SearchSpaceGenerationTaskConfiguration,
             StandaloneSearchSpaceGenerationConfiguration,
         },
-        convert::AsInputOutputQueueAndStorage,
+        convert::AsInputOutputQueue,
         queue::PipelineQueue,
-        storage::PipelineStorage,
+        storage::{PipelineStorage, RedisPipelineStorage},
     },
 };
 
+use super::task::Task;
+
+/// Prefix for the search space generation counter
+///
+pub const COUNTER_PREFIX: &str = "maccoys_search_space_generation";
+
 /// Task to generate the search space for the search engine
 ///
-pub struct SearchSpaceGenerationTask<Q: PipelineQueue + 'static, S: PipelineStorage + 'static> {
-    _phantom_queue: std::marker::PhantomData<Q>,
-    _phantom_storage: std::marker::PhantomData<S>,
-}
+pub struct SearchSpaceGenerationTask;
 
-impl<Q, S> SearchSpaceGenerationTask<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
+impl SearchSpaceGenerationTask {
     /// Start the indexing task
     ///
     /// # Arguments
@@ -51,16 +51,20 @@ where
     /// * `storage` - Storage to access configuration and PTMs
     /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
     ///
-    pub async fn start(
+    pub async fn start<Q, S>(
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
         search_space_generation_queue: Arc<Q>,
         comet_search_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-    ) {
+    ) where
+        Q: PipelineQueue + 'static,
+        S: PipelineStorage + 'static,
+    {
         let mut last_search_uuid = String::new();
         let mut current_search_params = SearchParameters::new();
         let mut current_ptms: Vec<PostTranslationalModification> = Vec::new();
+        let mut metrics_counter_name = COUNTER_PREFIX.to_string();
 
         loop {
             while let Some(mut manifest) = search_space_generation_queue.pop().await {
@@ -114,6 +118,7 @@ where
                         }
                     };
                     last_search_uuid = manifest.uuid.clone();
+                    metrics_counter_name = format!("{COUNTER_PREFIX}_{last_search_uuid}");
                 }
 
                 let precursors = &manifest.precursors.clone();
@@ -165,19 +170,7 @@ where
 
                     manifest.push_fasta(buffered_fasta).unwrap();
 
-                    match storage
-                        .increment_search_space_generation_ctr(&manifest.uuid)
-                        .await
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                    "[{} / {}] Error incrementing search space generation counter: {:?}",
-                                    &manifest.uuid, &manifest.spectrum_id, e
-                                );
-                            continue;
-                        }
-                    }
+                    counter!(metrics_counter_name.clone()).increment(1);
                 }
 
                 loop {
@@ -209,11 +202,10 @@ where
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
 
-        let (storage, input_queue, output_queue) =
-            config.as_input_output_queue_and_storage().await?;
-        let storage = Arc::new(storage);
+        let (input_queue, output_queue) = config.as_input_output_queue().await?;
         let input_queue = Arc::new(input_queue);
         let output_queue = Arc::new(output_queue);
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let search_space_generation_config = Arc::new(config.search_space_generation.clone());
 
@@ -237,5 +229,11 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl Task for SearchSpaceGenerationTask {
+    fn get_counter_prefix() -> &'static str {
+        COUNTER_PREFIX
     }
 }

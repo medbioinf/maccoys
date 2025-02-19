@@ -10,76 +10,60 @@ use super::{
         StandaloneSearchSpaceGenerationConfiguration,
     },
     queue::{PipelineQueue, RedisPipelineQueue},
-    storage::{PipelineStorage, RedisPipelineStorage},
 };
 
 /// Trait to convert a configuration into input and output queues
 /// and storages
 ///
-pub trait AsInputOutputQueueAndStorage {
+pub trait AsInputOutputQueue {
     /// Convert the configuration into input and output queues
     ///
-    fn as_input_output_queue_and_storage(
+    fn as_input_output_queue(
         &self,
-    ) -> impl Future<Output = Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)>>;
+    ) -> impl Future<Output = Result<(RedisPipelineQueue, RedisPipelineQueue)>>;
 }
 
-impl AsInputOutputQueueAndStorage for StandaloneIndexingConfiguration {
-    async fn as_input_output_queue_and_storage(
-        &self,
-    ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
-        let storage = RedisPipelineStorage::new(&self.storage).await?;
+impl AsInputOutputQueue for StandaloneIndexingConfiguration {
+    async fn as_input_output_queue(&self) -> Result<(RedisPipelineQueue, RedisPipelineQueue)> {
         let input_queue = RedisPipelineQueue::new(&self.index).await?;
         let output_queue = RedisPipelineQueue::new(&self.preparation).await?;
 
-        Ok((storage, input_queue, output_queue))
+        Ok((input_queue, output_queue))
     }
 }
 
-impl AsInputOutputQueueAndStorage for StandalonePreparationConfiguration {
-    async fn as_input_output_queue_and_storage(
-        &self,
-    ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
-        let storage = RedisPipelineStorage::new(&self.storage).await?;
+impl AsInputOutputQueue for StandalonePreparationConfiguration {
+    async fn as_input_output_queue(&self) -> Result<(RedisPipelineQueue, RedisPipelineQueue)> {
         let input_queue = RedisPipelineQueue::new(&self.preparation).await?;
         let output_queue = RedisPipelineQueue::new(&self.search_space_generation).await?;
 
-        Ok((storage, input_queue, output_queue))
+        Ok((input_queue, output_queue))
     }
 }
 
-impl AsInputOutputQueueAndStorage for StandaloneSearchSpaceGenerationConfiguration {
-    async fn as_input_output_queue_and_storage(
-        &self,
-    ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
-        let storage = RedisPipelineStorage::new(&self.storage).await?;
+impl AsInputOutputQueue for StandaloneSearchSpaceGenerationConfiguration {
+    async fn as_input_output_queue(&self) -> Result<(RedisPipelineQueue, RedisPipelineQueue)> {
         let input_queue = RedisPipelineQueue::new(&self.search_space_generation).await?;
         let output_queue = RedisPipelineQueue::new(&self.comet_search).await?;
 
-        Ok((storage, input_queue, output_queue))
+        Ok((input_queue, output_queue))
     }
 }
 
-impl AsInputOutputQueueAndStorage for StandaloneCometSearchConfiguration {
-    async fn as_input_output_queue_and_storage(
-        &self,
-    ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
-        let storage = RedisPipelineStorage::new(&self.storage).await?;
+impl AsInputOutputQueue for StandaloneCometSearchConfiguration {
+    async fn as_input_output_queue(&self) -> Result<(RedisPipelineQueue, RedisPipelineQueue)> {
         let input_queue = RedisPipelineQueue::new(&self.comet_search).await?;
         let output_queue = RedisPipelineQueue::new(&self.goodness_and_rescoring).await?;
 
-        Ok((storage, input_queue, output_queue))
+        Ok((input_queue, output_queue))
     }
 }
 
-impl AsInputOutputQueueAndStorage for StandaloneScoringConfiguration {
-    async fn as_input_output_queue_and_storage(
-        &self,
-    ) -> Result<(RedisPipelineStorage, RedisPipelineQueue, RedisPipelineQueue)> {
-        let storage = RedisPipelineStorage::new(&self.storage).await?;
+impl AsInputOutputQueue for StandaloneScoringConfiguration {
+    async fn as_input_output_queue(&self) -> Result<(RedisPipelineQueue, RedisPipelineQueue)> {
         let input_queue = RedisPipelineQueue::new(&self.goodness_and_rescoring).await?;
         let output_queue = RedisPipelineQueue::new(&self.cleanup).await?;
 
-        Ok((storage, input_queue, output_queue))
+        Ok((input_queue, output_queue))
     }
 }

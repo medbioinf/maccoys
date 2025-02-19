@@ -10,25 +10,25 @@ use std::{
 
 use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::io::mzml::{indexed_reader::IndexedReader, indexer::Indexer};
+use metrics::counter;
 use tracing::{debug, error};
 
 use crate::pipeline::{
-    configuration::StandaloneIndexingConfiguration, convert::AsInputOutputQueueAndStorage,
-    queue::PipelineQueue, storage::PipelineStorage,
+    configuration::StandaloneIndexingConfiguration, convert::AsInputOutputQueue,
+    queue::PipelineQueue,
 };
+
+use super::task::Task;
+
+/// Prefix for the indexing counter
+///
+pub const COUNTER_PREFIX: &str = "maccoys_indexings";
 
 /// Task to index and split up the mzML file
 ///
-pub struct IndexingTask<Q: PipelineQueue + 'static, S: PipelineStorage + 'static> {
-    _phantom_queue: std::marker::PhantomData<Q>,
-    _phantom_storage: std::marker::PhantomData<S>,
-}
+pub struct IndexingTask;
 
-impl<Q, S> IndexingTask<Q, S>
-where
-    Q: PipelineQueue + 'static,
-    S: PipelineStorage + 'static,
-{
+impl IndexingTask {
     /// Start the indexing task
     ///
     /// # Arguments
@@ -37,15 +37,17 @@ where
     /// * `preparation_queue` - Queue for the preparation task
     /// * `stop_flag` - Flag to indicate to stop once the index queue is empty
     ///
-    pub async fn start(
+    pub async fn start<Q>(
         work_dir: PathBuf,
-        storage: Arc<S>,
         index_queue: Arc<Q>,
         preparation_queue: Arc<Q>,
         stop_flag: Arc<AtomicBool>,
-    ) {
+    ) where
+        Q: PipelineQueue + 'static,
+    {
         loop {
             while let Some(manifest) = index_queue.pop().await {
+                let metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, &manifest.uuid);
                 let index =
                     match Indexer::create_index(&manifest.get_ms_run_mzml_path(&work_dir), None) {
                         Ok(index) => index,
@@ -103,16 +105,7 @@ where
                         }
                     };
 
-                    match storage.increment_started_searches_ctr(&manifest.uuid).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error incrementing indexing counter: {:?}",
-                                &new_manifest.uuid, &new_manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
+                    counter!(metrics_counter_name.clone()).increment(1);
 
                     loop {
                         new_manifest = match preparation_queue.push(new_manifest).await {
@@ -144,9 +137,7 @@ where
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
 
-        let (storage, input_queue, output_queue) =
-            config.as_input_output_queue_and_storage().await?;
-        let storage = Arc::new(storage);
+        let (input_queue, output_queue) = config.as_input_output_queue().await?;
         let input_queue = Arc::new(input_queue);
         let output_queue = Arc::new(output_queue);
 
@@ -156,7 +147,6 @@ where
             .map(|_| {
                 tokio::spawn(IndexingTask::start(
                     work_dir.clone(),
-                    storage.clone(),
                     input_queue.clone(),
                     output_queue.clone(),
                     stop_flag.clone(),
@@ -169,5 +159,11 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl Task for IndexingTask {
+    fn get_counter_prefix() -> &'static str {
+        COUNTER_PREFIX
     }
 }

@@ -1,12 +1,12 @@
 // std imports
 use std::collections::HashMap;
-use std::env;
 use std::fs::{read_to_string, write as write_file};
 use std::path::{Path, PathBuf};
+use std::{env, process};
 
 // 3rd party imports
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dihardts_omicstools::mass_spectrometry::spectrum::Spectrum as SpectrumTrait;
 use dihardts_omicstools::proteomics::io::mzml::reader::Spectrum;
 use dihardts_omicstools::proteomics::io::mzml::{
@@ -14,7 +14,6 @@ use dihardts_omicstools::proteomics::io::mzml::{
 };
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
-use indicatif::ProgressStyle;
 use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
 use maccoys::pipeline::local_pipeline::LocalPipeline;
 use maccoys::pipeline::remote_pipeline::RemotePipeline;
@@ -27,6 +26,9 @@ use maccoys::pipeline::tasks::scoring_task::ScoringTask;
 use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
+use metrics_exporter_prometheus::PrometheusBuilder;
+use reqwest::Url;
+use tokio::net::TcpListener;
 use tracing::{debug, info, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_indicatif::IndicatifLayer;
@@ -41,23 +43,42 @@ use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use maccoys::web::decoy_api::Server as DecoyApiServer;
 use maccoys::web::results_api::Server as ResultApiServer;
 
+/// Target for tracing
+///
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum TracingTarget {
+    Loki,
+    File,
+    Terminal,
+    All,
+}
+
+/// Target for metrics
+///
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum MetricTarget {
+    Terminal,
+    Prometheus,
+    All,
+}
+
 /// Log rotation values for CLI
 ///
 #[derive(clap::ValueEnum, Clone, Debug)]
-enum LogRotation {
+enum TracingLogRotation {
     Minutely,
     Hourly,
     Daily,
     Never,
 }
 
-impl From<LogRotation> for Rotation {
-    fn from(rotation: LogRotation) -> Self {
+impl From<TracingLogRotation> for Rotation {
+    fn from(rotation: TracingLogRotation) -> Self {
         match rotation {
-            LogRotation::Minutely => Rotation::MINUTELY,
-            LogRotation::Hourly => Rotation::HOURLY,
-            LogRotation::Daily => Rotation::DAILY,
-            LogRotation::Never => Rotation::NEVER,
+            TracingLogRotation::Minutely => Rotation::MINUTELY,
+            TracingLogRotation::Hourly => Rotation::HOURLY,
+            TracingLogRotation::Daily => Rotation::DAILY,
+            TracingLogRotation::Never => Rotation::NEVER,
         }
     }
 }
@@ -291,12 +312,27 @@ struct Cli {
     /// > 3 - Trace
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
-    /// Hourly roated logfile.
-    #[arg(short, long)]
-    log_file: Option<PathBuf>,
-    /// Log rotation interval
-    #[arg(value_enum, long, default_value = "never")]
-    log_rotation: LogRotation,
+    /// How to log tracing. Can be used multiple times
+    #[arg(short, long, value_enum, action = clap::ArgAction::Append)]
+    tracing_target: Vec<TracingTarget>,
+    /// Tracing log file. Only used if `file` is set in `tracing_target`.
+    #[arg(short, long, default_value = "./logs/macpepdb.log")]
+    file: PathBuf,
+    /// Tracing log rotation. Only used if `file` is set in `tracing_target`.
+    #[arg(short, long, value_enum, default_value = "never")]
+    rotation: TracingLogRotation,
+    /// Remote address of Loki endpoint for logging.
+    /// Only used if `loki` is set in `tracing_target`.
+    #[arg(short, long, default_value = "127.0.0.1:3100")]
+    loki: String,
+    /// How to log metrics. Can be used multiple times
+    #[arg(short, long, value_enum, action = clap::ArgAction::Append)]
+    metric_target: Vec<MetricTarget>,
+    /// Local address to serve the Prometheus metrics endpoint.
+    /// Port zero will automatically use a free port.
+    /// Only used if `prometheus` is set in `metric_target`.
+    #[arg(short, long, default_value = "127.0.0.1:9494")]
+    prometheus: String,
     #[command(subcommand)]
     command: Commands,
 }
@@ -305,6 +341,7 @@ struct Cli {
 async fn main() -> Result<()> {
     let args = Cli::parse();
 
+    //// Set up tracing
     let verbosity = match args.verbose {
         0 => Level::ERROR,
         1 => Level::WARN,
@@ -313,55 +350,103 @@ async fn main() -> Result<()> {
         _ => Level::TRACE,
     };
 
-    // wrapping each layer into an Option to allow for easy runtime configuration
-    // see: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/layer/index.html#runtime-configuration-with-layers
+    let filter = EnvFilter::from_default_env()
+        .add_directive(verbosity.into())
+        .add_directive("scylla=error".parse().unwrap())
+        .add_directive("tokio_postgres=error".parse().unwrap())
+        .add_directive("hyper=error".parse().unwrap())
+        .add_directive("reqwest=error".parse().unwrap());
 
-    let filter = Some(
-        EnvFilter::from_default_env()
-            .add_directive(verbosity.into())
-            .add_directive("scylla=info".parse().unwrap())
-            .add_directive("tokio_postgres=info".parse().unwrap())
-            .add_directive("hyper=info".parse().unwrap())
-            .add_directive("reqwest=info".parse().unwrap())
-            .add_directive("rustis=info".parse().unwrap()),
-    );
+    // Tracing layers
+    let mut tracing_indicatif_layer = None;
+    let mut tracing_terminal_layer = None;
+    let mut tracing_loki_layer = None;
+    let mut tracing_file_layer = None;
 
-    let indicatif_layer = Some(IndicatifLayer::new().with_progress_style(
-        ProgressStyle::with_template(
-            "{spinner:.cyan} {span_child_prefix}{span_name}{{{span_fields}}} {wide_msg} {elapsed}",
-        )
-        .unwrap()
-    ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent(" ").with_max_progress_bars(20, None));
+    // Tracing guards/tasks
+    let mut _tracing_loki_task = None;
+    let mut _tracing_log_writer_guard = None;
 
-    let indicatif_writer_layer = Some(
-        tracing_subscriber::fmt::layer()
-            .with_writer(indicatif_layer.as_ref().unwrap().get_stderr_writer()),
-    );
+    if args.tracing_target.contains(&TracingTarget::Terminal)
+        || args.metric_target.contains(&MetricTarget::Terminal)
+        || args.tracing_target.contains(&TracingTarget::All)
+        || args.metric_target.contains(&MetricTarget::All)
+    {
+        let layer = IndicatifLayer::new()
+            .with_span_child_prefix_symbol("\t")
+            .with_span_child_prefix_indent("");
+        tracing_indicatif_layer = Some(layer);
+    }
 
-    // Keep WorkerGuard for tracing_appender in scope to prevent it from being dropped
-    // otherwise the log is not written to the file
-    let mut _log_filw_writer_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+    if args.tracing_target.contains(&TracingTarget::Terminal)
+        || args.tracing_target.contains(&TracingTarget::All)
+    {
+        let parent_layer = tracing_indicatif_layer.as_ref().unwrap();
+        tracing_terminal_layer =
+            Some(tracing_subscriber::fmt::layer().with_writer(parent_layer.get_stderr_writer()));
+    }
 
-    let log_file_layer = match args.log_file {
-        Some(log_file) => {
-            let file_appender = RollingFileAppender::new(
-                args.log_rotation.into(),
-                log_file.parent().unwrap(),
-                log_file.file_name().unwrap(),
-            );
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            _log_filw_writer_guard = Some(guard);
-            Some(tracing_subscriber::fmt::layer().with_writer(non_blocking))
-        }
-        None => None,
-    };
+    if args.tracing_target.contains(&TracingTarget::File)
+        || args.tracing_target.contains(&TracingTarget::All)
+    {
+        let file_appender = RollingFileAppender::new(
+            args.rotation.into(),
+            args.file.parent().unwrap(),
+            args.file.file_name().unwrap(),
+        );
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        tracing_file_layer = Some(tracing_subscriber::fmt::layer().with_writer(non_blocking));
+        _tracing_log_writer_guard = Some(guard);
+    }
+
+    if args.tracing_target.contains(&TracingTarget::Loki)
+        || args.tracing_target.contains(&TracingTarget::All)
+    {
+        let (layer, task) = tracing_loki::builder()
+            .label("macpepdb", "development")?
+            .extra_field("pid", format!("{}", process::id()))?
+            .build_url(Url::parse(&format!("http://{}", args.loki)).unwrap())?;
+        tracing_loki_layer = Some(layer);
+        _tracing_loki_task = Some(tokio::spawn(task));
+    }
 
     tracing_subscriber::registry()
-        .with(indicatif_writer_layer)
-        .with(log_file_layer)
-        .with(indicatif_layer)
+        .with(tracing_terminal_layer)
+        .with(tracing_indicatif_layer)
+        .with(tracing_file_layer)
+        .with(tracing_loki_layer)
         .with(filter)
         .init();
+
+    //// Setup (prometheus) metrics
+
+    let mut prometheus_scrape_address = None;
+
+    if args.metric_target.contains(&MetricTarget::Prometheus)
+        || args.metric_target.contains(&MetricTarget::Terminal)
+        || args.metric_target.contains(&MetricTarget::All)
+    {
+        let prometheus_metrics_builder = PrometheusBuilder::new();
+
+        // Create TCP listener for Prometheus metrics to check if port is available.
+        // When Port 0 is given, the OS will choose a free port.
+        let prometheus_scrape_socket_tmp = TcpListener::bind(&args.prometheus)
+            .await
+            .context("Creating TCP listener for Prometheus scrape endpoint")?;
+        // Copy socket address to be able to use it for the endpoint
+        let prometheus_scrape_socket = prometheus_scrape_socket_tmp.local_addr()?;
+        prometheus_scrape_address = Some(format!(
+            "{}:{}",
+            prometheus_scrape_socket.ip(),
+            prometheus_scrape_socket.port()
+        ));
+        // Drop listener to make port available for the web server
+        drop(prometheus_scrape_socket_tmp);
+
+        prometheus_metrics_builder
+            .with_http_listener(prometheus_scrape_socket)
+            .install()?;
+    }
 
     info!("Welcome to MaCoyS - The `S` is silent!");
 
@@ -524,6 +609,7 @@ async fn main() -> Result<()> {
                         comet_config,
                         ptms,
                         mzml_file_paths,
+                        prometheus_scrape_address,
                     )
                     .await?;
                 } else {
@@ -535,6 +621,7 @@ async fn main() -> Result<()> {
                         comet_config,
                         ptms,
                         mzml_file_paths,
+                        prometheus_scrape_address,
                     )
                     .await?;
                 }
@@ -586,18 +673,12 @@ async fn main() -> Result<()> {
             PipelineCommand::Index {
                 work_dir,
                 config_file_path,
-            } => {
-                IndexingTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(
-                    work_dir,
-                    config_file_path,
-                )
-                .await?
-            }
+            } => IndexingTask::run_standalone(work_dir, config_file_path).await?,
             PipelineCommand::Preparation { config_file_path } => {
-                PreparationTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(config_file_path).await?
+                PreparationTask::run_standalone(config_file_path).await?
             }
             PipelineCommand::SearchSpaceGeneration { config_file_path } => {
-                SearchSpaceGenerationTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(config_file_path).await?
+                SearchSpaceGenerationTask::run_standalone(config_file_path).await?
             }
             PipelineCommand::CometSearch {
                 tmp_dir,
@@ -607,15 +688,15 @@ async fn main() -> Result<()> {
                     Some(tmp_dir) => tmp_dir,
                     None => env::temp_dir().join("maccoys"),
                 };
-                IdentificationTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(tmp_dir, config_file_path).await?
+                IdentificationTask::run_standalone(tmp_dir, config_file_path).await?
             }
             PipelineCommand::GoodnessAndRescoring { config_file_path } => {
-                ScoringTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(config_file_path).await?
+                ScoringTask::run_standalone(config_file_path).await?
             }
             PipelineCommand::Cleanup {
                 work_dir,
                 config_file_path,
-            } => CleanupTask::<RedisPipelineQueue, RedisPipelineStorage>::run_standalone(work_dir, config_file_path).await?,
+            } => CleanupTask::run_standalone(work_dir, config_file_path).await?,
         },
     };
     Ok(())
