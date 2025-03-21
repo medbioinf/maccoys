@@ -34,8 +34,7 @@ glob = "0.3.1"
 indicatif = "0.17.7"
 lazy_static = "1.4.0"
 lzma-rs = "0.3.0"
-# macpepdb = { path = "../macpepdb" }
-macpepdb = { git = "https://github.com/medbioinf/macpepdb.git", rev = "fee54bd87bad601bc95456841248d241a6b5a883" }
+macpepdb = { git = "https://github.com/medbioinf/macpepdb.git", rev = "2d2b763f9d70854edfbe053b7dc92c62663fedc5" }
 maccoys-exchange-entities = { git = "https://github.com/medbioinf/maccoys-exchange-entities", branch = "main" }
 paste = "1.0.15"
 polars = { version = "0.35.4", features = [

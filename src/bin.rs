@@ -494,7 +494,7 @@ async fn main() -> Result<()> {
             let fasta_file = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .create(true)
+                .truncate(true)
                 .append(false)
                 .open(fasta_file_path)
                 .await

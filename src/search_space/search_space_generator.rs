@@ -122,7 +122,7 @@ impl SearchSpaceGenerator {
         taxonomy_ids: Option<Vec<i64>>,
         proteome_id: Option<String>,
         is_reviewed: Option<bool>,
-        ptms: &Vec<PTM>,
+        ptms: &[PTM],
         limit: Option<usize>,
     ) -> Result<usize> {
         let proteome_ids = proteome_id.map(|proteome_id| vec![proteome_id]);
@@ -171,7 +171,7 @@ impl SearchSpaceGenerator {
                     taxonomy_ids,
                     proteome_ids,
                     is_reviewed,
-                    ptms.clone(),
+                    ptms,
                 )
                 .await?;
                 pin_mut!(target_stream);
@@ -309,7 +309,7 @@ impl SearchSpaceGenerator {
             }
             if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
                 new_peptide_ctr += 1;
-                fasta
+                let _ = fasta
                     .write(
                         gen_fasta_entry(
                             std::str::from_utf8(&buffer[..newline_pos])?,
@@ -329,6 +329,7 @@ impl SearchSpaceGenerator {
         Ok(new_peptide_ctr)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn generate_missing_decoys(
         &self,
         fasta: &mut Pin<Box<impl AsyncWrite>>,
@@ -338,7 +339,7 @@ impl SearchSpaceGenerator {
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
         max_variable_modifications: i8,
-        ptms: Vec<PTM>,
+        ptms: &[PTM],
     ) -> Result<usize> {
         let target_lookup: Option<TargetLookup> = match self.target_lookup_url {
             Some(ref url) => Some(TargetLookup::new(url).await?),
@@ -485,7 +486,7 @@ impl SearchSpaceGenerator {
         lower_mass_tolerance: i64,
         upper_mass_tolerance: i64,
         max_variable_modifications: i8,
-        ptms: Vec<PTM>,
+        ptms: &[PTM],
         decoys_per_peptide: usize,
     ) -> Result<(usize, usize)> {
         #[allow(unused_assignments)]
@@ -504,7 +505,7 @@ impl SearchSpaceGenerator {
                     None,
                     None,
                     None,
-                    &ptms,
+                    ptms,
                     None,
                 )
                 .await;
@@ -537,7 +538,7 @@ impl SearchSpaceGenerator {
                         None, // Not applicable for decoys
                         None, // Not applicable for decoys
                         None, // Not applicable for decoys
-                        &ptms,
+                        ptms,
                         Some(needed_decoys),
                     )
                     .await;
@@ -562,7 +563,7 @@ impl SearchSpaceGenerator {
                             lower_mass_tolerance,
                             upper_mass_tolerance,
                             max_variable_modifications,
-                            ptms.clone(),
+                            ptms,
                         )
                         .await;
 

@@ -169,7 +169,7 @@ pub fn gen_fasta_entry(
 #[allow(clippy::too_many_arguments)]
 pub async fn create_search_space(
     fasta: &mut Pin<Box<impl AsyncWrite>>,
-    ptms: &Vec<PostTranslationalModification>,
+    ptms: &[PostTranslationalModification],
     mass: i64,
     lower_mass_tolerance_ppm: i64,
     upper_mass_tolerance_ppm: i64,
@@ -195,7 +195,7 @@ pub async fn create_search_space(
             lower_mass_tolerance_ppm,
             upper_mass_tolerance_ppm,
             max_variable_modifications,
-            ptms.clone(),
+            ptms,
             decoys_per_peptide,
         )
         .await
