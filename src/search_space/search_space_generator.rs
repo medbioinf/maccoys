@@ -273,7 +273,7 @@ impl SearchSpaceGenerator {
                         peptide_ctr,
                         entry_prefix,
                         entry_name_prefix,
-                        limit,
+                        Some(limit),
                     )
                     .await
                     .context("Writing peptide buffer to FASTA")?;

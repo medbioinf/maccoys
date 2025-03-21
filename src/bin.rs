@@ -28,6 +28,7 @@ use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmRead
 use macpepdb::mass::convert::to_int as mass_to_int;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::Url;
+use tokio::fs::OpenOptions;
 use tokio::net::TcpListener;
 use tracing::{debug, info, Level};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -489,8 +490,16 @@ async fn main() -> Result<()> {
             decoy_cache_url,
         } => {
             let ptms = PtmReader::read(Path::new(&ptm_file_path))?;
-            let mut fasta_file =
-                Box::pin(tokio::fs::File::open(Path::new(&fasta_file_path)).await?);
+
+            let fasta_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .append(false)
+                .open(fasta_file_path)
+                .await
+                .context("Error when opening FASTA file")?;
+            let mut fasta_file = Box::pin(fasta_file);
 
             create_search_space(
                 &mut fasta_file,
