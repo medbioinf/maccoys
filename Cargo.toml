@@ -1,7 +1,7 @@
 [package]
 name = "maccoys"
 version = "0.1.0"
-authors = ["Dirk Winkelhardt <dirk.winkelhardt@rub.de>"] 
+authors = ["Dirk Winkelhardt <dirk.winkelhardt@rub.de>"]
 edition = "2021"
 description = "Mass spectrometry search engine using MaCPepDB as search space."
 repository = "https://github.com/medbioinf/maccoys"
@@ -22,7 +22,7 @@ path = "src/bin.rs"
 [dependencies]
 anyhow = { version = "1.0.75", features = ["backtrace"] }
 async-stream = "0.3.5"
-axum = {version = "0.7.4", features = ["multipart"]}
+axum = { version = "0.7.4", features = ["multipart"] }
 clap = { version = "4.4.6", features = ["derive"] }
 csv = "1.3.0"
 deadqueue = { version = "0.2.4", features = ["limited"] }
@@ -35,13 +35,25 @@ indicatif = "0.17.7"
 lazy_static = "1.4.0"
 lzma-rs = "0.3.0"
 # macpepdb = { path = "../macpepdb" }
-macpepdb = { git = "https://github.com/medbioinf/macpepdb.git", rev = "bafb9c54f036bd2bc135d10f8c42c41bf8e0470b" }
+macpepdb = { git = "https://github.com/medbioinf/macpepdb.git", rev = "fee54bd87bad601bc95456841248d241a6b5a883" }
 maccoys-exchange-entities = { git = "https://github.com/medbioinf/maccoys-exchange-entities", branch = "main" }
 paste = "1.0.15"
-polars = { version = "0.35.4", features = ["csv", "cum_agg", "lazy", "strings", "serde", "json"] }
+polars = { version = "0.35.4", features = [
+    "csv",
+    "cum_agg",
+    "lazy",
+    "strings",
+    "serde",
+    "json",
+] }
 pyo3 = { version = "0.22.0", features = ["auto-initialize"] }
 rand = "0.8.5"
-reqwest = { version = "0.12.8", features = ["blocking", "json", "stream", "multipart"] }
+reqwest = { version = "0.12.8", features = [
+    "blocking",
+    "json",
+    "stream",
+    "multipart",
+] }
 rustis = { version = "0.13.3", features = ["tokio-runtime"] }
 scylla = "0.8.1"
 serde = "1.0.189"
@@ -60,4 +72,6 @@ uuid = "1.9.0"
 http = "1.1.0"
 tracing-loki = "0.2.6"
 metrics = "0.24.1"
-metrics-exporter-prometheus = { version = "0.16.2", features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.16.2", features = [
+    "http-listener",
+] }

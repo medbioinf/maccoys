@@ -3,14 +3,11 @@ use anyhow::{bail, Result};
 use macpepdb::{
     chemistry::amino_acid::calc_sequence_mass_int,
     database::{
-        configuration_table::ConfigurationTable as ConfigurationTableTrait,
         generic_client::GenericClient,
         scylla::{
-            client::Client as DbClient,
-            configuration_table::ConfigurationTable,
-            peptide_table::{PeptideTable, UPDATE_SET_PLACEHOLDER},
+            client::Client as DbClient, configuration_table::ConfigurationTable,
+            peptide_table::PeptideTable,
         },
-        table::Table,
     },
     entities::{configuration::Configuration, peptide::Peptide},
     tools::peptide_partitioner::get_mass_partition,
@@ -78,15 +75,7 @@ impl DecoyCache {
                     })
                     .collect::<Result<Vec<Peptide>>>()?;
 
-                let statement = format!(
-                    "UPDATE {}.{} SET {}, is_metadata_updated = false WHERE partition = ? and mass = ? and sequence = ?",
-                    client.get_database(),
-                    PeptideTable::table_name(),
-                    UPDATE_SET_PLACEHOLDER.as_str()
-                );
-
-                let prepared = client.prepare(statement).await?;
-                PeptideTable::bulk_insert(client, decoys.iter(), &prepared).await?;
+                PeptideTable::bulk_upsert(client, decoys.iter()).await?;
             }
             Client::Http(client) => {
                 client

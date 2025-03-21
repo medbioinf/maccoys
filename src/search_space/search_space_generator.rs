@@ -14,12 +14,9 @@ use fancy_regex::Regex;
 use futures::{pin_mut, StreamExt};
 use macpepdb::database::generic_client::GenericClient;
 use macpepdb::{
-    database::{
-        configuration_table::ConfigurationTable as ConfigurationTableTrait,
-        scylla::{
-            client::Client as DbClient, configuration_table::ConfigurationTable,
-            peptide_table::PeptideTable,
-        },
+    database::scylla::{
+        client::Client as DbClient, configuration_table::ConfigurationTable,
+        peptide_table::PeptideTable,
     },
     mass::convert::{to_float as mass_to_float, to_int as mass_to_int},
 };

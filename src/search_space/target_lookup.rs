@@ -2,7 +2,6 @@
 use anyhow::{anyhow, bail, Result};
 use macpepdb::{
     database::{
-        configuration_table::ConfigurationTable as ConfigurationTableTrait,
         generic_client::GenericClient,
         scylla::{
             client::Client as DbClient, configuration_table::ConfigurationTable,

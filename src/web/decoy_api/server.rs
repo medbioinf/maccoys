@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::routing::post;
 use axum::Router;
-use macpepdb::database::configuration_table::ConfigurationTable as ConfigurationTableTrait;
 use macpepdb::database::generic_client::GenericClient;
 use macpepdb::database::scylla::client::Client;
 use macpepdb::database::scylla::configuration_table::ConfigurationTable;

@@ -7,10 +7,8 @@ use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use macpepdb::chemistry::amino_acid::calc_sequence_mass_int;
-use macpepdb::database::generic_client::GenericClient;
 use macpepdb::database::scylla::client::Client;
-use macpepdb::database::scylla::peptide_table::{PeptideTable, UPDATE_SET_PLACEHOLDER};
-use macpepdb::database::table::Table;
+use macpepdb::database::scylla::peptide_table::PeptideTable;
 use macpepdb::entities::{configuration::Configuration, peptide::Peptide as Decoy};
 use macpepdb::tools::peptide_partitioner::get_mass_partition;
 use macpepdb::web::web_error::WebError;
@@ -89,24 +87,8 @@ impl DecoyController {
     ) -> Result<Response, WebError> {
         let decoys = payload.get_decoys(configuration.as_ref())?;
 
-        let statement = format!(
-            "UPDATE {}.{} SET {}, is_metadata_updated = false WHERE partition = ? and mass = ? and sequence = ?",
-            db_client.get_database(),
-            PeptideTable::table_name(),
-            UPDATE_SET_PLACEHOLDER.as_str()
-        );
         let db_client = db_client.as_ref();
-
-        let prepared = match db_client.prepare(statement).await {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                return Err(WebError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{}", err),
-                ));
-            }
-        };
-        PeptideTable::bulk_insert(db_client, decoys.iter(), &prepared).await?;
+        PeptideTable::bulk_upsert(db_client, decoys.iter()).await?;
 
         Ok((StatusCode::OK, "").into_response())
     }
