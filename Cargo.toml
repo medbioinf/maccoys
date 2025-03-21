@@ -41,7 +41,7 @@ paste = "1.0.15"
 polars = { version = "0.35.4", features = ["csv", "cum_agg", "lazy", "strings", "serde", "json"] }
 pyo3 = { version = "0.22.0", features = ["auto-initialize"] }
 rand = "0.8.5"
-reqwest = { version = "0.11.22", features = ["blocking", "json", "stream", "multipart"] }
+reqwest = { version = "0.12.8", features = ["blocking", "json", "stream", "multipart"] }
 rustis = { version = "0.13.3", features = ["tokio-runtime"] }
 scylla = "0.8.1"
 serde = "1.0.189"
