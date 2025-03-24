@@ -14,12 +14,18 @@ dependencies = [
     "numpy ~= 1.26",
     "pandas ~= 2.1",
     "scipy  ~= 1.11",
-    "statsmodels ~= 0.13"
+    "statsmodels ~= 0.13",
 ]
 
 
 [project.optional-dependencies]
 dev = [
     "pandas-stubs",
-    "pylint"
+    "ruff",
 ]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["E501"]
