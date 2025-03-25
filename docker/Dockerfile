@@ -6,12 +6,13 @@ ENV PATH=/usr/local/bin:/root/.cargo/bin:/usr/local/bin:$PATH
 
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        build-essential \
-        curl \
-        libssl-dev \
-        libhdf5-dev \
-        pkg-config \
+    build-essential \
+    curl \
+    libssl-dev \
+    libhdf5-dev \
+    pkg-config \
     && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/* \
     # Install external tools
     && curl -L -o /usr/local/bin/comet https://github.com/UWPR/Comet/releases/download/v2024.01.1/comet.linux.exe \
     && chmod +x /usr/local/bin/comet \
@@ -20,14 +21,21 @@ RUN apt-get update -y \
     && cargo install --path . --root /usr/local \
     # Install Python package
     && pip install . \
-    # Cleanup
+    # Cleanup python
+    && pip cache purge \
+    # Cleanup rust
+    && cargo clean -r \
     && cargo clean \
+    && rustup self uninstall -y \
+    # Cleanup apt
     && apt-get purge -y \
-        build-essential \
-        curl \
-        pkg-config \
-    && apt-get autoremove -y \
-    && rustup self uninstall -y 
+    build-essential \
+    curl \
+    pkg-config \
+    && apt-get autoclean -y \
+    && apt-get autoremove -y --purge \
+    && rm -rf ./*
+
+ENV PATH=/usr/local/bin:/usr/local/bin:$PATH
 
 ENTRYPOINT [ "maccoys" ]
-
