@@ -56,9 +56,9 @@ impl ScoringTask {
 
         let python_handle: std::thread::JoinHandle<Result<()>> = std::thread::spawn(move || {
             match Python::with_gil(|py| {
-                // maccoys imports
-                let goodness_of_fit_mod = PyModule::import_bound(py, "maccoys.goodness_of_fit")?;
-                let scoring_mod = PyModule::import_bound(py, "maccoys.scoring")?;
+                // imports
+                let goodness_of_fit_mod = PyModule::import(py, "maccoys.goodness_of_fit")?;
+                let scoring_mod = PyModule::import(py, "maccoys.scoring")?;
 
                 // Load all necessary functions
                 let calc_goodnesses_fn = goodness_of_fit_mod.getattr("calc_goodnesses")?;
@@ -82,7 +82,7 @@ impl ScoringTask {
                         }
                     };
 
-                    let psm_scores = PyList::new_bound(py, psm_scores);
+                    let psm_scores = PyList::new(py, psm_scores)?;
 
                     let goodness_of_fits: Vec<GoodnessOfFitRecord> = calc_goodnesses_fn
                         .call1((&psm_scores,))?
