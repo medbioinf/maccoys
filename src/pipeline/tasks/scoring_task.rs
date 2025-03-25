@@ -9,15 +9,15 @@ use std::{
 
 use anyhow::{Context, Result};
 use metrics::counter;
+use numpy::IntoPyArray;
 use polars::{prelude::NamedFrom, series::Series};
-use pyo3::{prelude::*, types::PyList};
+use pyo3::prelude::*;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{debug, error, info};
 
 use crate::{
-    constants::{COMET_EXP_BASE_SCORE, DIST_SCORE_NAME, EXP_SCORE_NAME},
-    goodness_of_fit_record::GoodnessOfFitRecord,
+    constants::{COMET_EXP_BASE_SCORE, LOOP_SCORE_NAME},
     pipeline::{
         configuration::StandaloneScoringConfiguration, convert::AsInputOutputQueue,
         queue::PipelineQueue,
@@ -49,22 +49,18 @@ impl ScoringTask {
         Q: PipelineQueue + 'static,
     {
         let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
-        let (to_rust, mut from_python) =
-            tokio::sync::mpsc::channel::<(Vec<GoodnessOfFitRecord>, Vec<f64>, Vec<f64>)>(1);
+        let (to_rust, mut from_python) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
         let python_stop_flag = Arc::new(AtomicBool::new(false));
         let python_thread_stop_flag = python_stop_flag.clone(); // Getting moved in to the python thread
 
         let python_handle: std::thread::JoinHandle<Result<()>> = std::thread::spawn(move || {
             match Python::with_gil(|py| {
                 // imports
-                let goodness_of_fit_mod = PyModule::import(py, "maccoys.goodness_of_fit")?;
-                let scoring_mod = PyModule::import(py, "maccoys.scoring")?;
+                let pynomaly_loop = PyModule::import(py, "PyNomaly.loop")?;
 
-                // Load all necessary functions
-                let calc_goodnesses_fn = goodness_of_fit_mod.getattr("calc_goodnesses")?;
-                let calculate_exp_score_fn = scoring_mod.getattr("calculate_exp_score")?;
-                let calculate_distance_score_fn =
-                    scoring_mod.getattr("calculate_distance_score")?;
+                // classes
+                #[allow(non_snake_case)]
+                let LocalOutlierProbability = pynomaly_loop.getattr("LocalOutlierProbability")?;
 
                 loop {
                     if python_thread_stop_flag.load(Ordering::Relaxed) {
@@ -82,23 +78,17 @@ impl ScoringTask {
                         }
                     };
 
-                    let psm_scores = PyList::new(py, psm_scores)?;
+                    let psm_scores = psm_scores.into_pyarray(py);
 
-                    let goodness_of_fits: Vec<GoodnessOfFitRecord> = calc_goodnesses_fn
-                        .call1((&psm_scores,))?
-                        .extract::<Vec<(String, String, f64, f64)>>()?
-                        .into_iter()
-                        .map(GoodnessOfFitRecord::from)
-                        .collect();
+                    let local_outlier_probability_fit = LocalOutlierProbability
+                        .call1((psm_scores,))?
+                        .call_method0("fit")?;
 
-                    let exponential_score: Vec<f64> =
-                        calculate_exp_score_fn.call1((&psm_scores,))?.extract()?;
-
-                    let distance_score: Vec<f64> = calculate_distance_score_fn
-                        .call1((&psm_scores,))?
+                    let local_outlier_probability: Vec<f64> = local_outlier_probability_fit
+                        .call_method0("local_outlier_probability")?
                         .extract()?;
 
-                    to_rust.blocking_send((goodness_of_fits, exponential_score, distance_score))?;
+                    to_rust.blocking_send(local_outlier_probability)?;
                 }
 
                 Ok::<_, anyhow::Error>(())
@@ -172,19 +162,20 @@ impl ScoringTask {
                         }
                     }
 
-                    let (goodness_of_fits, exponential_scores, dist_scores) =
-                        match from_python.recv().await {
-                            Some(goodness_of_fit) => goodness_of_fit,
-                            None => {
-                                error!(
-                                    "[{} / {}] No goodness of fit received from Python",
-                                    &manifest.uuid, &manifest.spectrum_id
-                                );
-                                continue;
-                            }
-                        };
+                    let local_outlier_probabilities = match from_python.recv().await {
+                        Some(goodness_of_fit) => goodness_of_fit,
+                        None => {
+                            error!(
+                                "[{} / {}] No goodness of fit received from Python",
+                                &manifest.uuid, &manifest.spectrum_id
+                            );
+                            continue;
+                        }
+                    };
 
-                    match psms.with_column(Series::new(EXP_SCORE_NAME, exponential_scores)) {
+                    match psms
+                        .with_column(Series::new(LOOP_SCORE_NAME, local_outlier_probabilities))
+                    {
                         Ok(_) => (),
                         Err(e) => {
                             error!(
@@ -194,19 +185,6 @@ impl ScoringTask {
                             continue;
                         }
                     }
-
-                    match psms.with_column(Series::new(DIST_SCORE_NAME, dist_scores)) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error adding distance scores to PSMs: {:?}",
-                                &manifest.uuid, &manifest.spectrum_id, e
-                            );
-                            continue;
-                        }
-                    }
-
-                    manifest.goodness.push(goodness_of_fits);
 
                     debug!(
                         "[{} / {}] Goodness and rescoring done",
@@ -292,5 +270,48 @@ impl ScoringTask {
 impl Task for ScoringTask {
     fn get_counter_prefix() -> &'static str {
         COUNTER_PREFIX
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    /// Checks if the imports and usage of python is working
+    ///
+    async fn test_loop_calculation_using_python() {
+        let xcorr = vec![
+            469.0, 415.0, 361.0, 335.0, 271.0, 256.0, 231.0, 212.0, 193.0, 155.0, 71.0, 55.0, 36.0,
+            3.6854,
+        ];
+
+        match Python::with_gil(|py| {
+            // imports
+            let pynomaly_loop = PyModule::import(py, "PyNomaly.loop")?;
+
+            // submodules
+
+            // classes
+            #[allow(non_snake_case)]
+            let LocalOutlierProbability = pynomaly_loop.getattr("LocalOutlierProbability")?;
+
+            let xcorrpy = xcorr.into_pyarray(py);
+
+            let local_outlier_probability_fit = LocalOutlierProbability
+                .call1((xcorrpy,))?
+                .call_method0("fit")?;
+
+            let _local_outlier_probability: Vec<f64> = local_outlier_probability_fit
+                .getattr("local_outlier_probabilities")?
+                .extract()?;
+
+            Ok::<(), anyhow::Error>(())
+        }) {
+            Ok(_) => (),
+            Err(e) => {
+                println!("[PYTHON] Error running Python thread: {:?}", e);
+            }
+        }
     }
 }
