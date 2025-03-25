@@ -609,6 +609,10 @@ async fn main() -> Result<()> {
                 };
 
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
+                let scrape_endpoint = prometheus_scrape_address
+                    .as_ref()
+                    .map(|address| format!("http://{}/metrics", address));
+
                 if !use_redis {
                     info!("Running local pipeline");
                     LocalPipeline::<LocalPipelineQueue, LocalPipelineStorage>::run(
@@ -618,7 +622,7 @@ async fn main() -> Result<()> {
                         comet_config,
                         ptms,
                         mzml_file_paths,
-                        prometheus_scrape_address,
+                        scrape_endpoint,
                     )
                     .await?;
                 } else {
@@ -630,7 +634,7 @@ async fn main() -> Result<()> {
                         comet_config,
                         ptms,
                         mzml_file_paths,
-                        prometheus_scrape_address,
+                        scrape_endpoint,
                     )
                     .await?;
                 }
