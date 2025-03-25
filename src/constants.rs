@@ -49,3 +49,7 @@ pub const DIST_SCORE_NAME: &str = "dist_score";
 /// FDR col name
 ///
 pub const FDR_COL_NAME: &str = "fdr";
+
+/// Loop score
+///
+pub const LOOP_SCORE_NAME: &str = "loop_score";
