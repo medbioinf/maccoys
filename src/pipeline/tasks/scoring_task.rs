@@ -109,6 +109,28 @@ impl ScoringTask {
                     &manifest.uuid, &manifest.spectrum_id
                 );
 
+                // check if python thread is still running
+                if python_handle.is_finished() {
+                    error!(
+                        "[{} / {}] Python thread stopped unexpectedly. This scoring task is shutting down",
+                        &manifest.uuid,
+                        &manifest.spectrum_id
+                    );
+                    let uuid = manifest.uuid.clone();
+                    let spectrum_id = manifest.spectrum_id.clone();
+                    match scoring_queue.push(manifest).await {
+                        Ok(_) => (),
+                        Err(_) => {
+                            error!(
+                                "[{} / {}] Error pushing manifest back to queue after Python thread stopped unexpectedly",
+                                uuid,
+                                spectrum_id,
+                            );
+                        }
+                    }
+                    break;
+                }
+
                 let metrics_counter_name = Self::get_counter_name(&manifest.uuid);
 
                 if manifest.precursors.len() != manifest.psms_dataframes.len() {
