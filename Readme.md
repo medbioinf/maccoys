@@ -76,7 +76,5 @@ MaCcoyS will print an UUID to identify the search, e.g. to recheck the progress 
 1. `micromamba env create -f environment.yaml`
 2. `micromamba activate maccoys`
 3. `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(dirname $(dirname $(which python)))/lib`,
-    this will add environments Python libraries into the `LD_LIBRARY_PATH`-variable so they ara availabe for the Rust compiler
+    this will add environments Python libraries into the `LD_LIBRARY_PATH`-variable so they ara available for the Rust compiler. On macOS use `DYLD_FALLBACK_LIBRARY_PATH=...`
 3. `cargo build`, rustup should install the needed Rust version and compile
-
-
