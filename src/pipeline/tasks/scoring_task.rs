@@ -109,7 +109,7 @@ impl ScoringTask {
                     &manifest.uuid, &manifest.spectrum_id
                 );
 
-                let metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, manifest.uuid);
+                let metrics_counter_name = Self::get_counter_name(&manifest.uuid);
 
                 if manifest.precursors.len() != manifest.psms_dataframes.len() {
                     info!(

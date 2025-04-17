@@ -82,7 +82,7 @@ impl CleanupTask {
                             }
                         };
                     last_search_uuid = manifest.uuid.clone();
-                    metrics_counter_name = format!("{COUNTER_PREFIX}_{last_search_uuid}");
+                    metrics_counter_name = Self::get_counter_name(&manifest.uuid);
                 }
 
                 // Clone precursor so manifest is not borrowed
@@ -116,24 +116,24 @@ impl CleanupTask {
                         }
                     }
 
-                    let goodness_of_fit_file_path = manifest.get_goodness_file_path(
-                        &result_dir,
-                        *precursor_mz,
-                        *precursor_charge,
-                    );
-                    match manifest.pop_goodness_of_fit_to_file(&goodness_of_fit_file_path) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!(
-                                "[{} / {}] Error writing goodness of fit to `{}`: {:?}",
-                                &manifest.uuid,
-                                &manifest.spectrum_id,
-                                goodness_of_fit_file_path.display(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
+                    // let goodness_of_fit_file_path = manifest.get_goodness_file_path(
+                    //     &result_dir,
+                    //     *precursor_mz,
+                    //     *precursor_charge,
+                    // );
+                    // match manifest.pop_goodness_of_fit_to_file(&goodness_of_fit_file_path) {
+                    //     Ok(_) => (),
+                    //     Err(e) => {
+                    //         error!(
+                    //             "[{} / {}] Error writing goodness of fit to `{}`: {:?}",
+                    //             &manifest.uuid,
+                    //             &manifest.spectrum_id,
+                    //             goodness_of_fit_file_path.display(),
+                    //             e
+                    //         );
+                    //         continue;
+                    //     }
+                    // }
                 }
 
                 if current_search_params.keep_fasta_files && manifest.is_fasta_set() {

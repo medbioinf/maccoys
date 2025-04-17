@@ -147,7 +147,7 @@ impl IdentificationTask {
                         };
 
                     last_search_uuid = manifest.uuid.clone();
-                    metrics_counter_name = format!("{COUNTER_PREFIX}_{last_search_uuid}");
+                    metrics_counter_name = Self::get_counter_name(&manifest.uuid);
                 }
 
                 // Unwrap the current Comet configuration for easier access

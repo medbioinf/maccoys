@@ -92,7 +92,7 @@ impl PreparationTask {
                             }
                         };
                     last_search_uuid = manifest.uuid.clone();
-                    metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, last_search_uuid);
+                    metrics_counter_name = Self::get_counter_name(&manifest.uuid);
                 }
 
 

@@ -44,7 +44,8 @@ impl IndexingTask {
     {
         loop {
             while let Some(manifest) = index_queue.pop().await {
-                let metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, &manifest.uuid);
+                let metrics_counter_name = Self::get_counter_name(&manifest.uuid);
+                
                 let mzml_file = match File::open(manifest.get_ms_run_mzml_path(&work_dir)) {
                     Ok(file) => file,
                     Err(e) => {
@@ -53,6 +54,7 @@ impl IndexingTask {
                     }
                 };
                 let mut mzml_byte_reader = BufReader::new(mzml_file);
+                
                 let index =
                     match Indexer::create_index(&mut mzml_byte_reader, None) {
                         Ok(index) => index,
