@@ -80,15 +80,29 @@ impl ScoringTask {
 
                     let psm_scores = psm_scores.into_pyarray(py);
 
-                    let local_outlier_probability_fit = LocalOutlierProbability
-                        .call1((psm_scores,))?
-                        .call_method0("fit")?;
+                    let local_outlier_probabilities: PyResult<Vec<f64>> = LocalOutlierProbability
+                        .call1((psm_scores,))
+                        // .fit()
+                        .and_then(|local_outlier_probabilities| {
+                            local_outlier_probabilities.call_method0("fit")
+                        })
+                        // LocalOutlierProbability.fit().local_outlier_probability
+                        .and_then(|local_outlier_probabilities| {
+                            local_outlier_probabilities.getattr("local_outlier_probabilities")
+                        })
+                        // Cast to Vec
+                        .and_then(|local_outlier_probabilities| {
+                            local_outlier_probabilities.extract::<Vec<f64>>()
+                        });
 
-                    let local_outlier_probability: Vec<f64> = local_outlier_probability_fit
-                        .call_method0("local_outlier_probability")?
-                        .extract()?;
-
-                    to_rust.blocking_send(local_outlier_probability)?;
+                    if let Err(e) = local_outlier_probabilities {
+                        error!(
+                            "[PYTHON] Error calculating local outlier probabilities: {:?}",
+                            e
+                        );
+                        continue;
+                    }
+                    to_rust.blocking_send(local_outlier_probabilities.unwrap())?;
                 }
 
                 Ok::<_, anyhow::Error>(())
@@ -177,7 +191,7 @@ impl ScoringTask {
                         Ok(_) => (),
                         Err(e) => {
                             error!(
-                                "[{} / {}] Error sending scores to Python: {:?}",
+                                "[{} / {}] Error sending scores to Python: {}",
                                 &manifest.uuid, &manifest.spectrum_id, e
                             );
                             continue;
