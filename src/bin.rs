@@ -600,7 +600,8 @@ async fn main() -> Result<()> {
 
                 let mut ptms: Vec<PostTranslationalModification> = Vec::new();
                 if let Some(ptms_file) = &ptms_file {
-                    ptms = PtmReader::read(Path::new(ptms_file))?;
+                    ptms =
+                        PtmReader::read(Path::new(ptms_file)).context("Fail to read PSM file")?;
                 }
 
                 let comet_config = match CometConfiguration::try_from(&default_comet_params_file) {
