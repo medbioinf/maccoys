@@ -136,7 +136,7 @@ where
             ];
 
             metrics_monitor = Some(MetricsMonitor::new(
-                "macpepdb.build.digest",
+                "maccoys.local_pipeline",
                 monitorable_metrics,
                 metrics_scrape_url,
             )?);
