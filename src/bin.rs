@@ -1,16 +1,14 @@
 // std imports
-use std::collections::HashMap;
-use std::fs::{read_to_string, write as write_file};
+use std::fs::{read_to_string, write as write_file, File};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::{env, process};
 
 // 3rd party imports
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use dihardts_omicstools::mass_spectrometry::spectrum::Spectrum as SpectrumTrait;
-use dihardts_omicstools::proteomics::io::mzml::reader::Spectrum;
 use dihardts_omicstools::proteomics::io::mzml::{
-    index::Index, indexed_reader::IndexedReader, indexer::Indexer, reader::Reader as MzmlReader,
+    index::Index, reader::Reader as MzmlReader,
 };
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
@@ -521,26 +519,27 @@ async fn main() -> Result<()> {
             index_file_path,
             chunks_size,
         } => {
-            let spectra_file = Path::new(&spectrum_file_path);
-            let index = Indexer::create_index(spectra_file, chunks_size)?;
-            let mut indexed_reader = IndexedReader::new(spectra_file, &index)?;
-            let mut ms2_spectra_map: HashMap<String, (usize, usize)> = HashMap::new();
-            for (spec_id, spec_offsets) in index.get_spectra() {
-                if let Spectrum::MsNSpectrum(spec) = MzmlReader::parse_spectrum_xml(
-                    indexed_reader.get_raw_spectrum(spec_id)?.as_slice(),
-                )? {
-                    if spec.get_ms_level() == 2 {
-                        ms2_spectra_map.insert(spec_id.to_owned(), *spec_offsets);
-                    }
+            let mzml_path = Path::new(&spectrum_file_path);
+            let mut mzml_bytes_reader = BufReader::new(File::open(mzml_path)?);
+            let mut mzml_file = MzmlReader::read_indexed(&mut mzml_bytes_reader, chunks_size, false, false)?;
+            let mut spectrum_offsets = mzml_file.get_index().get_spectra().clone();
+
+            let spectrum_ids = spectrum_offsets.keys().cloned().collect::<Vec<_>>();
+
+            for spec_id in spectrum_ids {
+                let spectrum = mzml_file.get_spectrum(&spec_id).context("Getting spectrum")?;
+
+
+                let ms_level: u8 = spectrum.get_ms_level().unwrap_or(0);
+
+                if ms_level == 2 {
+                    spectrum_offsets.remove(&spec_id);
                 }
+                
             }
             let ms2_filtered_index = Index::new(
-                index.get_file_path().clone(),
-                index.get_indention().to_string(),
-                index.get_default_data_processing_ref().to_string(),
-                index.get_general_information_len(),
-                ms2_spectra_map,
-                HashMap::new(),
+                spectrum_offsets,
+                mzml_file.get_index().get_chromatograms().clone(),
             );
             write_file(
                 Path::new(&index_file_path),
@@ -553,12 +552,15 @@ async fn main() -> Result<()> {
             spectrum_id,
             output_file_path,
         } => {
+
             let index = Index::from_json(&read_to_string(Path::new(&index_file_path))?)?;
-            let mut extractor =
-                IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;
+            let mzml_path = Path::new(&original_spectrum_file_path);
+            let mut mzml_bytes_reader = BufReader::new(File::open(mzml_path)?);
+            let mut mzml_file =
+                MzmlReader::read_pre_indexed(&mut mzml_bytes_reader, index, None, false)?;
             write_file(
                 Path::new(&output_file_path),
-                extractor.extract_spectrum(&spectrum_id)?,
+                mzml_file.extract_spectrum(&spectrum_id, true)?,
             )?;
         }
         Commands::PostProcess {

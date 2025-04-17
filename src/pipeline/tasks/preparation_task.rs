@@ -7,13 +7,10 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
-use dihardts_omicstools::{
-    mass_spectrometry::spectrum::{MsNSpectrum, Precursor, Spectrum as SpectrumTrait},
-    proteomics::io::mzml::reader::{Reader as MzMlReader, Spectrum},
-};
+use anyhow::{anyhow, Context, Error, Result};
+use dihardts_omicstools::proteomics::io::mzml::{elements::{has_cv_params::HasCvParams, is_list::IsList, precursor::Precursor, selected_ion::SelectedIon}, reader::Reader as MzMlReader};
 use metrics::counter;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::pipeline::{
     configuration::{SearchParameters, StandalonePreparationConfiguration},
@@ -23,12 +20,6 @@ use crate::pipeline::{
 };
 
 use super::task::Task;
-
-/// Default start tag for a spectrum in mzML
-const SPECTRUM_START_TAG: &[u8; 10] = b"<spectrum ";
-
-/// Default stop tag for a spectrum in mzML
-const SPECTRUM_STOP_TAG: &[u8; 11] = b"</spectrum>";
 
 /// Prefix for the preparation counter
 ///
@@ -104,109 +95,116 @@ impl PreparationTask {
                     metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, last_search_uuid);
                 }
 
-                let spectrum_mzml = match manifest.get_spectrum_mzml() {
-                    Ok(spectrum_mzml) => spectrum_mzml,
+
+                let mzml_content = match manifest.get_spectrum_mzml() {
+                    Ok(content) => content,
                     Err(e) => {
                         error!(
-                            "[{} / {}] Error getting spectrum mzML: {:?}",
+                            "[{} / {}] Error getting mzML content: {:?}",
                             &manifest.uuid, &manifest.spectrum_id, e
                         );
                         continue;
                     }
                 };
 
-                let start = match spectrum_mzml
-                    .windows(SPECTRUM_START_TAG.len())
-                    .position(|window| window == SPECTRUM_START_TAG)
-                {
-                    Some(start) => start,
-                    None => {
+
+                let mut mzml_bytes_reader = std::io::Cursor::new(mzml_content);
+
+                let mut mzml_file = match MzMlReader::read_indexed(&mut mzml_bytes_reader, None, false, false) {
+                    Ok(file) => file,
+                    Err(e) => {
                         error!(
-                            "[{} / {}] No spectrum start",
-                            &manifest.uuid, &manifest.spectrum_id
+                            "[{} / {}] Error reading mzML content: {:?}",
+                            &manifest.uuid, &manifest.spectrum_id, e
                         );
                         continue;
                     }
                 };
 
-                let stop = match spectrum_mzml
-                    .windows(SPECTRUM_STOP_TAG.len())
-                    .position(|window| window == SPECTRUM_STOP_TAG)
-                {
-                    Some(stop) => stop,
-                    None => {
-                        error!(
-                            "[{} / {}] No spectrum stop",
-                            &manifest.uuid, &manifest.spectrum_id
-                        );
-                        continue;
-                    }
-                };
-
-                // Reduce to spectrum
-                let spectrum_mzml = spectrum_mzml[start..stop].to_vec();
-
-                // As this mzML is already reduced to the spectrum of interest, we can parse it directly
-                // using MzMlReader::parse_spectrum_xml
-                let spectrum = match MzMlReader::parse_spectrum_xml(spectrum_mzml.as_slice()) {
+                let spectrum = match mzml_file.get_spectrum(&manifest.spectrum_id) {
                     Ok(spectrum) => spectrum,
                     Err(e) => {
                         error!(
-                            "[{} / {}] Error parsing spectrum: {:?}",
+                            "[{} / {}] cannot find spectrum {:?}",
                             &manifest.uuid, &manifest.spectrum_id, e
                         );
                         continue;
                     }
                 };
 
-                let spectrum = match spectrum {
-                    Spectrum::MsNSpectrum(spectrum) => spectrum,
-                    _ => {
-                        // Ignore MS1
-                        trace!(
-                            "[{} / {}] Ignoring MS1 spectrum",
-                            &manifest.uuid,
-                            &manifest.spectrum_id
+                match spectrum.get_ms_level() {
+                    // Strange
+                    Some(0) => {
+                        error!(
+                            "[{} / {}] MS level 0?!",
+                            &manifest.uuid, &manifest.spectrum_id
                         );
                         continue;
                     }
-                };
+                    // Just continue
+                    Some(1) => continue, 
+                    // MS level 2 or higher
+                    Some(_) => (),
+                    // MS level is not set
+                    None => {
+                        error!(
+                            "[{} / {}] MS level is missing",
+                            &manifest.uuid, &manifest.spectrum_id
+                        );
+                        continue;
+                    }
+                }
 
-                // Ignore MS3 and higher
-                if spectrum.get_ms_level() != 2 {
-                    trace!(
-                        "[{} / {}] Ignoring MS{} spectrum",
-                        &manifest.uuid,
-                        &manifest.spectrum_id,
-                        spectrum.get_ms_level()
+                if spectrum.precursor_list.is_none() {
+                    error!(
+                        "[{} / {}] Precursor list is missing",
+                        &manifest.uuid, &manifest.spectrum_id
                     );
                     continue;
                 }
 
-                // Get mass to charge ratio and charges the most complicated way possible...
-                let precursors: Vec<(f64, u8)> = spectrum
-                    .get_precursors()
+                // Precursor list should not be none as it is a MS2 spectrum
+                // Collect precursor references
+                let precursor_refs: Vec<&Precursor> = spectrum.precursor_list.as_ref().unwrap().iter().collect();
+                // Collect selected ion references
+                let ion_refs: Vec<&SelectedIon> = precursor_refs
                     .iter()
-                    .flat_map(|precursor| {
-                        precursor
-                            .get_ions()
-                            .iter()
-                            .flat_map(|(mz, charges)| {
-                                // If precursor has no charges, use the default charges
-                                if charges.is_empty() {
-                                    (2..=current_search_params.max_charge)
-                                        .map(|charge| (*mz, charge))
-                                        .collect::<Vec<(f64, u8)>>()
-                                } else {
-                                    charges
-                                        .iter()
-                                        .map(|charge| (*mz, *charge))
-                                        .collect::<Vec<(f64, u8)>>()
-                                }
-                            })
-                            .collect::<Vec<(f64, u8)>>()
-                    })
+                    .filter(|precursor| precursor.selected_ion_list.is_some())
+                    .flat_map(|precursor| precursor.selected_ion_list.as_ref().unwrap().iter())
                     .collect();
+
+                // Collect mz and charge states as in pair (mz, charge) from selected ion references
+                let precursors_result: Result<Vec<Vec<(f64, u8)>>> = ion_refs
+                    .iter()
+                    .map(|ion| {
+                        let mz: f64 = ion.get_cv_param("MS:1000744").first().ok_or_else(|| anyhow!("Spectrum does not have selected ion m/z"))?.value.parse().context("Cannot parse selected ion m/z to f64")?;
+                        // // Select charge states statess
+                        let mut charge_cv_params = ion.get_cv_param("MS:1000041");
+                        // add possible charge states
+                        charge_cv_params.extend(ion.get_cv_param("MS:1000633"));
+
+                        let charges: Vec<u8> = if !charge_cv_params.is_empty() {
+                            charge_cv_params.into_iter().map(|x| {
+                                x.value.parse().map_err(|err| anyhow!("Error parsing charge: {}", err))
+                            }).collect::<Result<Vec<u8>>>()?
+                        } else {
+                            (2..=current_search_params.max_charge).collect()
+                        };
+
+                        Ok::<_, Error>(charges.into_iter().map(|charge| (mz, charge)).collect::<Vec<_>>())
+                    }).collect();
+
+                // Check for error and flatten the result
+                let precursors = match precursors_result {
+                    Ok(tmp) => tmp.into_iter().flatten().collect(),
+                    Err(e) => {
+                        error!(
+                            "[{} / {}] Error getting selected ion m/z {:?}",
+                            &manifest.uuid, &manifest.spectrum_id, e
+                        );
+                        continue;
+                    }
+                };
 
                 drop(spectrum);
 

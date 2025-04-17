@@ -1,15 +1,12 @@
 use std::{
-    fs,
-    io::Cursor,
-    path::PathBuf,
-    sync::{
+    fs::{self, File}, io::{BufReader, Cursor}, path::PathBuf, sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
-    },
+    }
 };
 
 use anyhow::{Context, Result};
-use dihardts_omicstools::proteomics::io::mzml::{indexed_reader::IndexedReader, indexer::Indexer};
+use dihardts_omicstools::proteomics::io::mzml::{indexer::Indexer, reader::Reader as MzMlReader};
 use metrics::counter;
 use tracing::{debug, error};
 
@@ -48,8 +45,16 @@ impl IndexingTask {
         loop {
             while let Some(manifest) = index_queue.pop().await {
                 let metrics_counter_name = format!("{}_{}", COUNTER_PREFIX, &manifest.uuid);
+                let mzml_file = match File::open(manifest.get_ms_run_mzml_path(&work_dir)) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        error!("[{}] Error opening mzML file: {:?}", &manifest.uuid, e);
+                        continue;
+                    }
+                };
+                let mut mzml_byte_reader = BufReader::new(mzml_file);
                 let index =
-                    match Indexer::create_index(&manifest.get_ms_run_mzml_path(&work_dir), None) {
+                    match Indexer::create_index(&mut mzml_byte_reader, None) {
                         Ok(index) => index,
                         Err(e) => {
                             error!("[{}] Error creating index: {:?}", &manifest.uuid, e);
@@ -74,8 +79,18 @@ impl IndexingTask {
                     }
                 };
 
-                let ms_run_mzml = manifest.get_ms_run_mzml_path(&work_dir);
-                let mut reader = match IndexedReader::new(&ms_run_mzml, &index) {
+                let mzml_path = manifest.get_ms_run_mzml_path(&work_dir);
+                let mut mzml_bytes_reader: BufReader<File> = BufReader::new(
+                    match File::open(&mzml_path) {
+                        Ok(file) => file,
+                        Err(e) => {
+                            error!("[{}] Error opening mzML file: {:?}", &manifest.uuid, e);
+                            continue;
+                        }
+                    },
+                );
+
+                let mut mzml_file = match MzMlReader::read_pre_indexed(&mut mzml_bytes_reader, index, None, false) {
                     Ok(reader) => reader,
                     Err(e) => {
                         error!("[{} /] Error creating reader: {:?}", &manifest.uuid, e);
@@ -83,12 +98,16 @@ impl IndexingTask {
                     }
                 };
 
-                for spec_id in index.get_spectra().keys() {
-                    let mzml = match reader.extract_spectrum(spec_id) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            error!("[{}] Error extracting spectrum: {:?}", &manifest.uuid, e);
-                            continue;
+                let spec_ids = mzml_file.get_index().get_spectra().keys().cloned().collect::<Vec<_>>();
+                
+                for spec_id in spec_ids.into_iter() {
+                    let mzml = {
+                        match mzml_file.extract_spectrum(&spec_id, true) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                error!("[{}] Error extracting spectrum: {:?}", &manifest.uuid, e);
+                                continue;
+                            }
                         }
                     };
 

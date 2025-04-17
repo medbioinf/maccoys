@@ -5,16 +5,14 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 // 3rd party imports
-use anyhow::{bail, Context, Result};
-use dihardts_omicstools::mass_spectrometry::spectrum::{
-    MsNSpectrum as MsNSpectrumTrait, Precursor as PrecursorTrait,
-};
+use anyhow::{bail, Context, Result, anyhow};
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
+use dihardts_omicstools::proteomics::io::mzml::elements::has_cv_params::HasCvParams;
+use dihardts_omicstools::proteomics::io::mzml::elements::is_list::IsList;
 use dihardts_omicstools::proteomics::{
     io::mzml::{
         index::Index,
-        indexed_reader::IndexedReader,
-        reader::{Reader as MzmlReader, Spectrum},
+        reader::Reader as MzmlReader,
     },
     post_translational_modifications::PostTranslationalModification,
 };
@@ -242,20 +240,39 @@ pub async fn search_preparation(
     let extracted_spectrum_file_path = work_dir.join("extracted.mzML");
     // Extract the spectrum from the original spectrum file
     let index = Index::from_json(&read_to_string(index_file_path)?)?;
-    let mut extractor = IndexedReader::new(Path::new(&original_spectrum_file_path), &index)?;
+    let mzml_file = std::fs::File::open(original_spectrum_file_path).context("Error opening mzML file")?;
+    let mut mzml_bytes_reader =  std::io::BufReader::new(mzml_file);
+    let mut mzml_file = MzmlReader::read_pre_indexed(&mut mzml_bytes_reader, index, None, false)?;
+
+    let spectrum = mzml_file.get_spectrum(spectrum_id).map_err(|err| anyhow!("Error getting spectrum: {}", err))?;
+
+    match spectrum.get_ms_level() {
+        // Strange
+        Some(0) => {
+            bail!(
+                "MS level 0?!"
+            );
+        }
+        Some(1) => bail!(
+            "MS level 1?!"
+        ), 
+        // MS level 2 or higher
+        Some(_) => (),
+        // MS level is not set
+        None => {
+            bail!(
+                "MS level is missing",
+            );
+        }
+    }
+
     write_file(
         &extracted_spectrum_file_path,
-        extractor.extract_spectrum(spectrum_id)?,
+        &mzml_file.extract_spectrum(spectrum_id, true)?,
     )
     .context("Could not write extracted spectrum.")?;
-    let spectrum = match MzmlReader::parse_spectrum_xml(
-        extractor.get_raw_spectrum(spectrum_id)?.as_slice(),
-    )? {
-        Spectrum::MsNSpectrum(spec) => spec,
-        _ => {
-            bail!("Extracted spectrum is not a MS2 spectrum");
-        }
-    };
+    
+
     let mut comet_config =
         CometConfiguration::try_from(&Path::new(default_comet_file_path).to_path_buf())?;
 
@@ -267,39 +284,53 @@ pub async fn search_preparation(
     comet_config.set_fragment_bin_tolerance(fragment_tolerance)?;
     comet_config.set_fragment_bin_offset(fragment_bin_offset)?;
 
-    for precursor in spectrum.get_precursors() {
-        for (precursor_mz, precursor_charges) in precursor.get_ions() {
-            // If the spectrum precursor charges are not set, use the given charges
-            let precursor_charges = if precursor_charges.is_empty() {
-                (2..=max_charge).collect()
-            } else {
-                precursor_charges.clone()
-            };
+    if let Some(ref precursor_list) = spectrum.precursor_list {
 
-            for precursor_charge in precursor_charges {
-                let file_base_name = format!("{}", precursor_charge);
-                let mass = mass_to_int(mass_to_charge_to_dalton(*precursor_mz, precursor_charge));
-                let fasta_file_path = work_dir.join(format!("{}.fasta", file_base_name));
-                let mut fasta_file = Box::pin(File::open(&fasta_file_path).await?);
-                let comet_config_path = work_dir.join(format!("{}.comet.params", file_base_name));
-                comet_config.set_charge(precursor_charge)?;
-                comet_config
-                    .to_file(&comet_config_path)
-                    .context("Could not write adjusted Comet parameter file.")?;
-                create_search_space(
-                    &mut fasta_file,
-                    ptms,
-                    mass,
-                    lower_mass_tolerance_ppm,
-                    upper_mass_tolerance_ppm,
-                    max_variable_modifications,
-                    decoys_per_peptide,
-                    target_url.to_owned(),
-                    decoy_url.clone(),
-                    target_lookup_url.clone(),
-                    decoy_cache_url.clone(),
-                )
-                .await?;
+        for precursor in precursor_list.iter() {
+            if let Some(selected_ion_list) = &precursor.selected_ion_list {
+                for selected_ion in selected_ion_list.iter() {
+                    let mz = selected_ion.get_cv_param("MS:1000744")
+                        .first().ok_or_else(|| anyhow!("Spectrum does not have precursor m/z"))?
+                        .value.parse::<f64>().map_err(|err| anyhow!("Error parsing precursor m/z: {}", err))?;
+                    // Select charge states states
+                    let mut charge_cv_params = selected_ion.get_cv_param("MS:1000041");
+                    // add possible charge states
+                    charge_cv_params.extend(selected_ion.get_cv_param("MS:1000633"));
+                    
+                    let charges: Vec<u8> = if !charge_cv_params.is_empty() {
+                        charge_cv_params.into_iter().map(|x| {
+                            x.value.parse::<u8>().map_err(|err| anyhow!("Error parsing charge: {}", err))
+                        }).collect::<Result<Vec<u8>>>()?
+                    } else {
+                        (2..=max_charge).collect()
+                    };
+                    
+                    for charge in charges {
+                        let file_base_name = format!("{}", charge);
+                        let mass = mass_to_int(mass_to_charge_to_dalton(mz, charge));
+                        let fasta_file_path = work_dir.join(format!("{}.fasta", file_base_name));
+                        let mut fasta_file = Box::pin(File::open(&fasta_file_path).await?);
+                        let comet_config_path = work_dir.join(format!("{}.comet.params", file_base_name));
+                        comet_config.set_charge(charge)?;
+                        comet_config
+                            .to_file(&comet_config_path)
+                            .context("Could not write adjusted Comet parameter file.")?;
+                        create_search_space(
+                            &mut fasta_file,
+                            ptms,
+                            mass,
+                            lower_mass_tolerance_ppm,
+                            upper_mass_tolerance_ppm,
+                            max_variable_modifications,
+                            decoys_per_peptide,
+                            target_url.to_owned(),
+                            decoy_url.clone(),
+                            target_lookup_url.clone(),
+                            decoy_cache_url.clone(),
+                        )
+                        .await?;
+                    }
+                }
             }
         }
     }

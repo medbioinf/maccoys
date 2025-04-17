@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{io::BufReader, path::PathBuf, sync::Arc};
 
 use crate::{constants::COMET_SEPARATOR, functions::sanatize_string, web::web_error::WebError};
 use anyhow::{bail, Context, Result};
@@ -7,14 +7,9 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use dihardts_omicstools::{
-    mass_spectrometry::spectrum::Spectrum,
-    proteomics::io::mzml::{
-        index::Index,
-        indexed_reader::IndexedReader,
-        reader::{Reader, Spectrum as IoSpectrum},
-    },
-};
+use dihardts_omicstools::{mass_spectrometry::spectrum::{SimpleMsNSpectrum, Spectrum}, proteomics::io::mzml::{index::Index,
+        reader::Reader as MzMlReader,
+    }};
 use maccoys_exchange_entities::results_api::{
     Identification, MsRun as MsRunResponse, Search as SearchResponse, Spectrum as SpectrumResponse,
 };
@@ -148,8 +143,19 @@ impl ResultController {
         // Get spectrum from mzML file
         let ms_run_index = Index::from_json(&read_to_string(ms_run_dir.join("index.json")).await?)?;
         let run_mzml_path = &ms_run_dir.join("run.mzML");
-        let mut reader = IndexedReader::new(run_mzml_path, &ms_run_index)?;
-        let xml_spectrum = match reader.get_raw_spectrum(&spectrum_id) {
+        let mut mzml_bytes_reader = BufReader::new(
+            match std::fs::File::open(run_mzml_path) {
+                Ok(file) => file,
+                Err(err) => {
+                    return Err(WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to open mzML file: {}", err),
+                    ))
+                }
+            },
+        );
+        let mut mzml_file = MzMlReader::read_pre_indexed(&mut mzml_bytes_reader, ms_run_index, None, false)?;
+        let spectrum = match mzml_file.get_spectrum(&spectrum_id) {
             Ok(spectrum) => spectrum,
             Err(_) => {
                 return Err(WebError::new(
@@ -158,14 +164,13 @@ impl ResultController {
                 ))
             }
         };
-        let spectrum = Reader::parse_spectrum_xml(&xml_spectrum)?;
 
-        let spectrum = match spectrum {
-            IoSpectrum::MsNSpectrum(spec) => spec,
-            _ => {
+        let spectrum: SimpleMsNSpectrum = match SimpleMsNSpectrum::try_from(spectrum) {
+            Ok(spectrum) => spectrum,
+            Err(err) => {
                 return Err(WebError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Got MS1 spectrum instead of MS2".to_string(),
+                    format!("Failed to convert spectrum: {}", err),
                 ))
             }
         };
@@ -285,13 +290,13 @@ impl ResultController {
                 ))
             }
         };
-
+        
         let response = SpectrumResponse::new(
             uuid,
             ms_run,
             spectrum_id,
-            spectrum.get_mz().to_vec(),
-            spectrum.get_intensity().to_vec(),
+            spectrum.get_mz().clone(),
+            spectrum.get_intensity().clone(),
             results,
         );
 
