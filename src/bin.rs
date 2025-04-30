@@ -7,19 +7,23 @@ use std::{env, process};
 // 3rd party imports
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use dihardts_omicstools::proteomics::io::mzml::{
-    index::Index, reader::Reader as MzmlReader,
-};
+use dihardts_omicstools::proteomics::io::mzml::{index::Index, reader::Reader as MzmlReader};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
 use maccoys::pipeline::local_pipeline::LocalPipeline;
+use maccoys::pipeline::messages::error_message::ErrorMessage;
+use maccoys::pipeline::messages::identification_message::IdentificationMessage;
+use maccoys::pipeline::messages::indexing_message::IndexingMessage;
+use maccoys::pipeline::messages::publication_message::PublicationMessage;
+use maccoys::pipeline::messages::scoring_message::ScoringMessage;
+use maccoys::pipeline::messages::search_space_generation_message::SearchSpaceGenerationMessage;
 use maccoys::pipeline::remote_pipeline::RemotePipeline;
 use maccoys::pipeline::remote_pipeline_web_api::RemotePipelineWebApi;
-use maccoys::pipeline::tasks::cleanup_task::CleanupTask;
+use maccoys::pipeline::tasks::error_task::ErrorTask;
 use maccoys::pipeline::tasks::identification_task::IdentificationTask;
 use maccoys::pipeline::tasks::indexing_task::IndexingTask;
-use maccoys::pipeline::tasks::preparation_task::PreparationTask;
+use maccoys::pipeline::tasks::publication_task::PublicationTask;
 use maccoys::pipeline::tasks::scoring_task::ScoringTask;
 use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
@@ -179,12 +183,6 @@ enum PipelineCommand {
         /// Contains `index`-, `preparation`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
-    /// Standalone preparation for distributed processing
-    Preparation {
-        /// Path to the indexing configuration file.
-        /// Contains `preparation`-, `search_space_generation`- & `storages`-section of the pipeline configuration
-        config_file_path: PathBuf,
-    },
     /// Standalone search space generation for distributed processing
     SearchSpaceGeneration {
         /// Path to the indexing configuration file.
@@ -192,7 +190,7 @@ enum PipelineCommand {
         config_file_path: PathBuf,
     },
     /// Standalone comet search for distributed processing
-    CometSearch {
+    Identification {
         /// Optional temp folder for intermediate files, default: `<system temp folder>/maccoys`
         #[arg(short, long)]
         tmp_dir: Option<PathBuf>,
@@ -201,13 +199,21 @@ enum PipelineCommand {
         config_file_path: PathBuf,
     },
     /// Standalone goodness and rescoring for distributed processing
-    GoodnessAndRescoring {
+    Scoring {
         /// Path to the indexing configuration file.
         /// Contains `comet_search`-, `goodness_and_rescoring`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
-    /// Standalone cleanup for distributed processing
-    Cleanup {
+    /// Standalone publication for distributed processing. Should run on the same machine which hosts the file system
+    Publication {
+        /// Work directroy where each MS run will get a subdirectory
+        work_dir: PathBuf,
+        /// Path to the indexing configuration file.
+        /// Contains `goodness_and_rescoring`-, `cleanup`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Standalone error task for distributed processing. Should run on the same machine which hosts the file system
+    Error {
         /// Work directroy where each MS run will get a subdirectory
         work_dir: PathBuf,
         /// Path to the indexing configuration file.
@@ -521,21 +527,22 @@ async fn main() -> Result<()> {
         } => {
             let mzml_path = Path::new(&spectrum_file_path);
             let mut mzml_bytes_reader = BufReader::new(File::open(mzml_path)?);
-            let mut mzml_file = MzmlReader::read_indexed(&mut mzml_bytes_reader, chunks_size, false, false)?;
+            let mut mzml_file =
+                MzmlReader::read_indexed(&mut mzml_bytes_reader, chunks_size, false, false)?;
             let mut spectrum_offsets = mzml_file.get_index().get_spectra().clone();
 
             let spectrum_ids = spectrum_offsets.keys().cloned().collect::<Vec<_>>();
 
             for spec_id in spectrum_ids {
-                let spectrum = mzml_file.get_spectrum(&spec_id).context("Getting spectrum")?;
-
+                let spectrum = mzml_file
+                    .get_spectrum(&spec_id)
+                    .context("Getting spectrum")?;
 
                 let ms_level: u8 = spectrum.get_ms_level().unwrap_or(0);
 
                 if ms_level == 2 {
                     spectrum_offsets.remove(&spec_id);
                 }
-                
             }
             let ms2_filtered_index = Index::new(
                 spectrum_offsets,
@@ -552,7 +559,6 @@ async fn main() -> Result<()> {
             spectrum_id,
             output_file_path,
         } => {
-
             let index = Index::from_json(&read_to_string(Path::new(&index_file_path))?)?;
             let mzml_path = Path::new(&original_spectrum_file_path);
             let mut mzml_bytes_reader = BufReader::new(File::open(mzml_path)?);
@@ -618,7 +624,15 @@ async fn main() -> Result<()> {
 
                 if !use_redis {
                     info!("Running local pipeline");
-                    LocalPipeline::<LocalPipelineQueue, LocalPipelineStorage>::run(
+                    LocalPipeline::<
+                        LocalPipelineQueue<IndexingMessage>,
+                        LocalPipelineQueue<SearchSpaceGenerationMessage>,
+                        LocalPipelineQueue<IdentificationMessage>,
+                        LocalPipelineQueue<ScoringMessage>,
+                        LocalPipelineQueue<PublicationMessage>,
+                        LocalPipelineQueue<ErrorMessage>,
+                        LocalPipelineStorage,
+                    >::run(
                         result_dir,
                         tmp_dir,
                         config,
@@ -630,7 +644,15 @@ async fn main() -> Result<()> {
                     .await?;
                 } else {
                     info!("Running redis pipeline");
-                    LocalPipeline::<RedisPipelineQueue, RedisPipelineStorage>::run(
+                    LocalPipeline::<
+                        RedisPipelineQueue<IndexingMessage>,
+                        RedisPipelineQueue<SearchSpaceGenerationMessage>,
+                        RedisPipelineQueue<IdentificationMessage>,
+                        RedisPipelineQueue<ScoringMessage>,
+                        RedisPipelineQueue<PublicationMessage>,
+                        RedisPipelineQueue<ErrorMessage>,
+                        RedisPipelineStorage,
+                    >::run(
                         result_dir,
                         tmp_dir,
                         config,
@@ -690,13 +712,10 @@ async fn main() -> Result<()> {
                 work_dir,
                 config_file_path,
             } => IndexingTask::run_standalone(work_dir, config_file_path).await?,
-            PipelineCommand::Preparation { config_file_path } => {
-                PreparationTask::run_standalone(config_file_path).await?
-            }
             PipelineCommand::SearchSpaceGeneration { config_file_path } => {
                 SearchSpaceGenerationTask::run_standalone(config_file_path).await?
             }
-            PipelineCommand::CometSearch {
+            PipelineCommand::Identification {
                 tmp_dir,
                 config_file_path,
             } => {
@@ -706,13 +725,17 @@ async fn main() -> Result<()> {
                 };
                 IdentificationTask::run_standalone(tmp_dir, config_file_path).await?
             }
-            PipelineCommand::GoodnessAndRescoring { config_file_path } => {
+            PipelineCommand::Scoring { config_file_path } => {
                 ScoringTask::run_standalone(config_file_path).await?
             }
-            PipelineCommand::Cleanup {
+            PipelineCommand::Publication {
                 work_dir,
                 config_file_path,
-            } => CleanupTask::run_standalone(work_dir, config_file_path).await?,
+            } => PublicationTask::run_standalone(work_dir, config_file_path).await?,
+            PipelineCommand::Error {
+                work_dir,
+                config_file_path,
+            } => ErrorTask::run_standalone(work_dir, config_file_path).await?,
         },
     };
     Ok(())

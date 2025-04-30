@@ -1,23 +1,12 @@
 // std imports
 use std::{ops::Deref, path::PathBuf};
 
-pub const CLEANUP_QUEUE_KEY: &str = "cleanup";
-pub const GOODNESS_AND_RESCORING_QUEUE_KEY: &str = "goodness_and_rescoring";
-pub const COMET_SEARCH_QUEUE_KEY: &str = "comet_search";
+pub const INDEXING_QUEUE_KEY: &str = "index";
 pub const SEARCH_SPACE_GENERATION_QUEUE_KEY: &str = "search_space_generation";
-pub const PREPARATION_QUEUE_KEY: &str = "preparation";
-pub const INDEX_QUEUE_KEY: &str = "index";
-
-/// All queue keys
-///
-pub const QUEUE_KEYS: [&str; 6] = [
-    CLEANUP_QUEUE_KEY,
-    GOODNESS_AND_RESCORING_QUEUE_KEY,
-    COMET_SEARCH_QUEUE_KEY,
-    SEARCH_SPACE_GENERATION_QUEUE_KEY,
-    PREPARATION_QUEUE_KEY,
-    INDEX_QUEUE_KEY,
-];
+pub const IDENTIFICATION_QUEUE_KEY: &str = "identification";
+pub const SCORING_QUEUE_KEY: &str = "scoring";
+pub const PUBLICATION_QUEUE_KEY: &str = "publication";
+pub const ERROR_QUEUE_KEY: &str = "publication";
 
 /// Search paramerter
 ///
@@ -112,7 +101,7 @@ impl Deref for SearchSpaceGenerationTaskConfiguration {
 /// Comet configuration
 ///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct CometSearchTaskConfiguration {
+pub struct IdentificationTaskConfiguration {
     /// General task configuration
     #[serde(flatten)]
     pub general: TaskConfiguration,
@@ -122,7 +111,7 @@ pub struct CometSearchTaskConfiguration {
     pub threads: usize,
 }
 
-impl Deref for CometSearchTaskConfiguration {
+impl Deref for IdentificationTaskConfiguration {
     type Target = TaskConfiguration;
 
     fn deref(&self) -> &TaskConfiguration {
@@ -138,16 +127,16 @@ pub struct PipelineConfiguration {
     pub search_parameters: SearchParameters,
     /// Index task configuration
     pub index: TaskConfiguration,
-    /// Preparation task configuration
-    pub preparation: TaskConfiguration,
     /// Search space generation task configuration
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
-    /// Comet search task configuration
-    pub comet_search: CometSearchTaskConfiguration,
-    /// Goodness and rescoring task configuration
-    pub goodness_and_rescoring: TaskConfiguration,
-    /// Cleanup task configuration
-    pub cleanup: TaskConfiguration,
+    /// Identification task configuration
+    pub identification: IdentificationTaskConfiguration,
+    /// scoring task configuration
+    pub scoring: TaskConfiguration,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
 }
@@ -171,14 +160,8 @@ impl Default for PipelineConfiguration {
             search_parameters: SearchParameters::new(),
             index: TaskConfiguration {
                 num_tasks: 1,
-                queue_name: INDEX_QUEUE_KEY.to_string(),
+                queue_name: INDEXING_QUEUE_KEY.to_string(),
                 queue_capacity: 100,
-                redis_url: None,
-            },
-            preparation: TaskConfiguration {
-                num_tasks: 4,
-                queue_name: PREPARATION_QUEUE_KEY.to_string(),
-                queue_capacity: 1000,
                 redis_url: None,
             },
             search_space_generation: SearchSpaceGenerationTaskConfiguration {
@@ -193,25 +176,31 @@ impl Default for PipelineConfiguration {
                 target_lookup_url: None,
                 decoy_cache_url: None,
             },
-            comet_search: CometSearchTaskConfiguration {
+            identification: IdentificationTaskConfiguration {
                 general: TaskConfiguration {
                     num_tasks: 4,
-                    queue_name: COMET_SEARCH_QUEUE_KEY.to_string(),
+                    queue_name: IDENTIFICATION_QUEUE_KEY.to_string(),
                     queue_capacity: 100,
                     redis_url: None,
                 },
                 comet_exe_path: PathBuf::from("/usr/local/bin/comet"),
                 threads: 2,
             },
-            goodness_and_rescoring: TaskConfiguration {
+            scoring: TaskConfiguration {
                 num_tasks: 2,
-                queue_name: GOODNESS_AND_RESCORING_QUEUE_KEY.to_string(),
+                queue_name: SCORING_QUEUE_KEY.to_string(),
                 queue_capacity: 100,
                 redis_url: None,
             },
-            cleanup: TaskConfiguration {
+            publication: TaskConfiguration {
                 num_tasks: 1,
-                queue_name: CLEANUP_QUEUE_KEY.to_string(),
+                queue_name: PUBLICATION_QUEUE_KEY.to_string(),
+                queue_capacity: 100,
+                redis_url: None,
+            },
+            error: TaskConfiguration {
+                num_tasks: 1,
+                queue_name: ERROR_QUEUE_KEY.to_string(),
                 queue_capacity: 100,
                 redis_url: None,
             },
@@ -231,7 +220,7 @@ pub struct RemoteEntypointConfiguration {
     /// Search space generation task configuration
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
     /// Comet search task configuration
-    pub comet_search: CometSearchTaskConfiguration,
+    pub comet_search: IdentificationTaskConfiguration,
     /// Goodness and rescoring task configuration
     pub goodness_and_rescoring: TaskConfiguration,
     /// Cleanup task configuration
@@ -248,20 +237,10 @@ pub struct RemoteEntypointConfiguration {
 pub struct StandaloneIndexingConfiguration {
     /// Index task configuration
     pub index: TaskConfiguration,
-    /// Preparation task configuration
-    pub preparation: TaskConfiguration,
-}
-
-/// Configuration for standalone preparation
-///
-#[derive(serde::Deserialize, Debug, Clone)]
-pub struct StandalonePreparationConfiguration {
-    /// Preparation task configuration
-    pub preparation: TaskConfiguration,
     /// Search space generation task configuration
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
-    /// Storage configuration
-    pub storage: PipelineStorageConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
 }
 
 /// Configuration for standalone search space generation
@@ -271,7 +250,9 @@ pub struct StandaloneSearchSpaceGenerationConfiguration {
     /// Search space generation task configuration
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
     /// Comet search task configuration
-    pub comet_search: CometSearchTaskConfiguration,
+    pub identification: IdentificationTaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
 }
@@ -279,13 +260,15 @@ pub struct StandaloneSearchSpaceGenerationConfiguration {
 /// Configuration for standalone comet search
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
-pub struct StandaloneCometSearchConfiguration {
+pub struct StandaloneIdentificationConfiguration {
     /// Comet search task configuration
-    pub comet_search: CometSearchTaskConfiguration,
+    pub identification: IdentificationTaskConfiguration,
     /// Goodness and rescoring task configuration
-    pub goodness_and_rescoring: TaskConfiguration,
-    /// Cleanup task configuration
-    pub cleanup: TaskConfiguration,
+    pub scoring: TaskConfiguration,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
 }
@@ -294,18 +277,28 @@ pub struct StandaloneCometSearchConfiguration {
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct StandaloneScoringConfiguration {
-    /// Goodness and rescoring task configuration
-    pub goodness_and_rescoring: TaskConfiguration,
-    /// Cleanup task configuration
-    pub cleanup: TaskConfiguration,
+    /// Scoring task configuration
+    pub scoring: TaskConfiguration,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
 }
 
-/// Configuration for standalone cleanup
+/// Configuration for standalone file publication
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
-pub struct StandaloneCleanupConfiguration {
+pub struct StandalonePublicationConfiguration {
     /// Cleanup task configuration
-    pub cleanup: TaskConfiguration,
-    /// Storage configuration
-    pub storage: PipelineStorageConfiguration,
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
+}
+
+/// Configuration for standalone error handling
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneErrorConfiguration {
+    /// Error task configuration
+    pub error: TaskConfiguration,
 }

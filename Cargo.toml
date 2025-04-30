@@ -75,3 +75,4 @@ metrics-exporter-prometheus = { version = "0.16.2", features = [
     "http-listener",
 ] }
 numpy = "0.24.0"
+thiserror = "2.0.12"

@@ -15,8 +15,8 @@ use tracing::{error, info, info_span, Span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use super::tasks::{
-    cleanup_task::CleanupTask, identification_task::IdentificationTask,
-    indexing_task::IndexingTask, preparation_task::PreparationTask, scoring_task::ScoringTask,
+    error_task::ErrorTask, identification_task::IdentificationTask, indexing_task::IndexingTask,
+    publication_task::PublicationTask, scoring_task::ScoringTask,
     search_space_generation_task::SearchSpaceGenerationTask, task::Task,
 };
 
@@ -31,11 +31,11 @@ const SIMPLE_STYLE: &str = "{msg} {pos}/s";
 lazy_static! {
     static ref METRICS_RENDER_ORDER: [&'static str; 6] = [
         IndexingTask::get_counter_prefix(),
-        PreparationTask::get_counter_prefix(),
         SearchSpaceGenerationTask::get_counter_prefix(),
         IdentificationTask::get_counter_prefix(),
         ScoringTask::get_counter_prefix(),
-        CleanupTask::get_counter_prefix(),
+        PublicationTask::get_counter_prefix(),
+        ErrorTask::get_counter_prefix(),
     ];
 }
 

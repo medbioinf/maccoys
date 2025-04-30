@@ -10,31 +10,31 @@ use rustis::commands::ListCommands;
 use tracing::{error, trace};
 
 //  local imports
-use super::{configuration::TaskConfiguration, search_manifest::SearchManifest};
+use super::{configuration::TaskConfiguration, messages::is_message::IsMessage};
 
 /// Trait defining the methods for a pipeline queue
 ///
-pub trait PipelineQueue: Send + Sync + Sized {
+pub trait PipelineQueue<M>: Sized + Send + Sync
+where
+    M: IsMessage,
+{
     /// Create a new pipeline queue
     fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send;
 
     fn get_capacity(&self) -> usize;
 
-    /// Pop a manifest from the queue
+    /// Pop a message from the queue
     /// Returns None if the queue is empty
     ///
-    fn pop(&self) -> impl Future<Output = Option<SearchManifest>> + Send;
+    fn pop(&self) -> impl Future<Output = Option<M>> + Send;
 
-    /// Push a manifest to the queue
-    /// Returns the manifest if the queue is full
+    /// Push a message to the queue
+    /// Returns the message if the queue is full
     ///
     /// # Arguments
-    /// * `manifest` - The manifest to push to the queue
+    /// * `message` - Manifest to be pushed`
     ///
-    fn push(
-        &self,
-        manifest: SearchManifest,
-    ) -> impl Future<Output = Result<(), SearchManifest>> + Send;
+    fn push(&self, message: M) -> impl Future<Output = Result<(), M>> + Send;
 
     /// Get the length of the queue
     ///
@@ -50,15 +50,21 @@ pub trait PipelineQueue: Send + Sync + Sized {
 /// Implementation of a local pipeline queue. useful to debug, testing, reviewing or
 /// very beefy servers
 ///
-pub struct LocalPipelineQueue {
-    /// Queue for search manifests to be processed
-    queue: Queue<SearchManifest>,
+pub struct LocalPipelineQueue<M>
+where
+    M: IsMessage,
+{
+    /// Queue for search messages to be processed
+    queue: Queue<M>,
 
     /// Capacity of the queue
     capacity: usize,
 }
 
-impl PipelineQueue for LocalPipelineQueue {
+impl<M> PipelineQueue<M> for LocalPipelineQueue<M>
+where
+    M: IsMessage,
+{
     async fn new(config: &TaskConfiguration) -> Result<Self> {
         Ok(Self {
             queue: Queue::new(config.queue_capacity),
@@ -70,12 +76,12 @@ impl PipelineQueue for LocalPipelineQueue {
         self.capacity
     }
 
-    async fn pop(&self) -> Option<SearchManifest> {
+    async fn pop(&self) -> Option<M> {
         self.queue.try_pop()
     }
 
-    async fn push(&self, manifest: SearchManifest) -> Result<(), SearchManifest> {
-        match self.queue.try_push(manifest) {
+    async fn push(&self, message: M) -> Result<(), M> {
+        match self.queue.try_push(message) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -88,7 +94,10 @@ impl PipelineQueue for LocalPipelineQueue {
 
 /// Redis implementation of the pipeline queue for distributed systems
 ///
-pub struct RedisPipelineQueue {
+pub struct RedisPipelineQueue<M>
+where
+    M: IsMessage,
+{
     /// Redis client
     client: rustis::client::Client,
 
@@ -97,9 +106,14 @@ pub struct RedisPipelineQueue {
 
     /// Capacity of the queue
     capacity: usize,
+
+    _phantom_message: std::marker::PhantomData<M>,
 }
 
-impl PipelineQueue for RedisPipelineQueue {
+impl<M> PipelineQueue<M> for RedisPipelineQueue<M>
+where
+    M: IsMessage,
+{
     async fn new(config: &TaskConfiguration) -> Result<Self> {
         if config.redis_url.is_none() {
             bail!("Redis URL is None")
@@ -119,6 +133,7 @@ impl PipelineQueue for RedisPipelineQueue {
             client,
             queue_name: config.queue_name.clone(),
             capacity: config.queue_capacity,
+            _phantom_message: std::marker::PhantomData,
         })
     }
 
@@ -126,8 +141,8 @@ impl PipelineQueue for RedisPipelineQueue {
         self.capacity
     }
 
-    async fn pop(&self) -> Option<SearchManifest> {
-        let serialized_manifest: String = match self
+    async fn pop(&self) -> Option<M> {
+        let serialized_message: String = match self
             .client
             .lpop::<_, _, Vec<String>>(&self.queue_name, 1)
             .await
@@ -140,28 +155,25 @@ impl PipelineQueue for RedisPipelineQueue {
                 }
             }
             Err(e) => {
-                error!("Error popping manifest from queue: {:?}", e);
+                error!("Error popping message from queue: {:?}", e);
                 return None;
             }
         };
 
-        if serialized_manifest.is_empty() {
+        if serialized_message.is_empty() {
             return None;
         }
 
-        match serde_json::from_str(&serialized_manifest) {
-            Ok(manifest) => manifest,
+        match serde_json::from_str(&serialized_message) {
+            Ok(message) => message,
             Err(e) => {
-                error!(
-                    "[{}] Error deserializing manifest: {:?}",
-                    self.queue_name, e
-                );
+                error!("[{}] Error deserializing message: {:?}", self.queue_name, e);
                 None
             }
         }
     }
 
-    async fn push(&self, manifest: SearchManifest) -> Result<(), SearchManifest> {
+    async fn push(&self, message: M) -> Result<(), M> {
         // Simple mechanism to prevent overcommitment of queue
         loop {
             if self.len().await < self.get_capacity() {
@@ -169,26 +181,26 @@ impl PipelineQueue for RedisPipelineQueue {
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
-        let serialized_manifest = match serde_json::to_string(&manifest) {
-            Ok(serialized_manifest) => serialized_manifest,
+        let serialized_message = match serde_json::to_string(&message) {
+            Ok(serialized_message) => serialized_message,
             Err(e) => {
-                error!("[{}] Error serializing manifest: {:?}", self.queue_name, e);
-                return Err(manifest);
+                error!("[{}] Error serializing message: {:?}", self.queue_name, e);
+                return Err(message);
             }
         };
 
         match self
             .client
-            .rpush(&self.queue_name, serialized_manifest)
+            .rpush(&self.queue_name, serialized_message)
             .await
         {
             Ok(_) => Ok(()),
             Err(e) => {
                 error!(
-                    "[{}] Error pushing manifest to queue: {:?}",
+                    "[{}] Error pushing message to queue: {:?}",
                     self.queue_name, e
                 );
-                Err(manifest)
+                Err(message)
             }
         }
     }
@@ -206,24 +218,35 @@ impl PipelineQueue for RedisPipelineQueue {
 
 /// New Arc type to implement the MonitorableQueue trait from `macpepdb`
 ///
-pub struct PipelineQueueArc<T>(Arc<T>)
+pub struct PipelineQueueArc<M, Q>
 where
-    T: PipelineQueue;
+    M: IsMessage + 'static,
+    Q: PipelineQueue<M> + 'static,
+{
+    /// Queue
+    queue: Arc<Q>,
+    _phantom_message: std::marker::PhantomData<M>,
+}
 
-impl<T> MonitorableQueue for PipelineQueueArc<T>
+impl<M, Q> MonitorableQueue for PipelineQueueArc<M, Q>
 where
-    T: PipelineQueue + 'static,
+    M: IsMessage + 'static,
+    Q: PipelineQueue<M> + 'static,
 {
     async fn len(&self) -> usize {
-        self.0.len().await
+        self.queue.len().await
     }
 }
 
-impl<Q> From<Arc<Q>> for PipelineQueueArc<Q>
+impl<M, Q> From<Arc<Q>> for PipelineQueueArc<M, Q>
 where
-    Q: PipelineQueue,
+    M: IsMessage + 'static,
+    Q: PipelineQueue<M> + 'static,
 {
     fn from(queue: Arc<Q>) -> Self {
-        Self(queue)
+        Self {
+            queue,
+            _phantom_message: std::marker::PhantomData,
+        }
     }
 }

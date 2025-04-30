@@ -282,9 +282,8 @@ impl Configuration {
     /// # Arguments
     /// * `path` - Path to write the configuration to.
     ///
-    pub async fn async_to_file(&self, path: &Path) -> Result<()> {
-        tokio::fs::write(path, &self.content).await?;
-        Ok(())
+    pub async fn async_to_file(&self, path: &Path) -> std::io::Result<()> {
+        tokio::fs::write(path, &self.content).await
     }
 
     /// Returns the content of the configuration.

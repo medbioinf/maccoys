@@ -23,31 +23,37 @@ use crate::{
     pipeline::{
         queue::RedisPipelineQueue,
         storage::{PipelineStorage, RedisPipelineStorage},
-        tasks::{cleanup_task::CleanupTask, task::Task},
+        tasks::task::Task,
     },
     web::web_error::WebError,
 };
 
 use super::{
     configuration::{RemoteEntypointConfiguration, SearchParameters},
+    messages::{
+        error_message::ErrorMessage, identification_message::IdentificationMessage,
+        indexing_message::IndexingMessage, publication_message::PublicationMessage,
+        scoring_message::ScoringMessage,
+        search_space_generation_message::SearchSpaceGenerationMessage,
+    },
     queue::PipelineQueue,
-    search_manifest::SearchManifest,
     tasks::{
-        identification_task::IdentificationTask, indexing_task::IndexingTask,
-        preparation_task::PreparationTask, scoring_task::ScoringTask,
+        error_task::ErrorTask, identification_task::IdentificationTask,
+        indexing_task::IndexingTask, publication_task::PublicationTask, scoring_task::ScoringTask,
         search_space_generation_task::SearchSpaceGenerationTask,
     },
+    utils::create_file_path_on_ms_run_level,
 };
 
 /// Shared state for the remote entrypoint service
 ///
 struct EntrypointServiceState {
-    index_queue: RedisPipelineQueue,
-    preparation_queue: RedisPipelineQueue,
-    search_space_generation_queue: RedisPipelineQueue,
-    comet_search_queue: RedisPipelineQueue,
-    goodness_and_rescoring_queue: RedisPipelineQueue,
-    cleanup_queue: RedisPipelineQueue,
+    index_queue: RedisPipelineQueue<IndexingMessage>,
+    search_space_generation_queue: RedisPipelineQueue<SearchSpaceGenerationMessage>,
+    identification_queue: RedisPipelineQueue<IdentificationMessage>,
+    scoring_queue: RedisPipelineQueue<ScoringMessage>,
+    publication_queue: RedisPipelineQueue<PublicationMessage>,
+    error_queue: RedisPipelineQueue<ErrorMessage>,
     storage: RwLock<RedisPipelineStorage>,
     work_dir: PathBuf,
     prometheus_base_url: String,
@@ -58,29 +64,29 @@ struct EntrypointServiceState {
 #[derive(serde::Deserialize, serde::Serialize)]
 struct PipelineWorkload {
     pub index_queue: usize,
-    pub preparation_queue: usize,
     pub search_space_generation_queue: usize,
-    pub comet_search_queue: usize,
-    pub goodness_and_rescoring_queue: usize,
-    pub cleanup_queue: usize,
+    pub identification_queue: usize,
+    pub scoring_queue: usize,
+    pub publication_queue: usize,
+    pub error_queue: usize,
 }
 
 impl PipelineWorkload {
     pub async fn new(
-        index_queue: &impl PipelineQueue,
-        preparation_queue: &impl PipelineQueue,
-        search_space_generation_queue: &impl PipelineQueue,
-        comet_search_queue: &impl PipelineQueue,
-        goodness_and_rescoring_queue: &impl PipelineQueue,
-        cleanup_queue: &impl PipelineQueue,
+        index_queue: &impl PipelineQueue<IndexingMessage>,
+        search_space_generation_queue: &impl PipelineQueue<SearchSpaceGenerationMessage>,
+        identification_queue: &impl PipelineQueue<IdentificationMessage>,
+        scoring_queue: &impl PipelineQueue<ScoringMessage>,
+        publication_queue: &impl PipelineQueue<PublicationMessage>,
+        error_queue: &impl PipelineQueue<ErrorMessage>,
     ) -> Self {
         Self {
             index_queue: index_queue.len().await,
-            preparation_queue: preparation_queue.len().await,
             search_space_generation_queue: search_space_generation_queue.len().await,
-            comet_search_queue: comet_search_queue.len().await,
-            goodness_and_rescoring_queue: goodness_and_rescoring_queue.len().await,
-            cleanup_queue: cleanup_queue.len().await,
+            identification_queue: identification_queue.len().await,
+            scoring_queue: scoring_queue.len().await,
+            publication_queue: publication_queue.len().await,
+            error_queue: error_queue.len().await,
         }
     }
 }
@@ -106,22 +112,21 @@ impl RemotePipelineWebApi {
         config: RemoteEntypointConfiguration,
     ) -> Result<()> {
         let index_queue = RedisPipelineQueue::new(&config.index).await?;
-        let preparation_queue = RedisPipelineQueue::new(&config.preparation).await?;
         let search_space_generation_queue =
             RedisPipelineQueue::new(&config.search_space_generation).await?;
-        let comet_search_queue = RedisPipelineQueue::new(&config.comet_search).await?;
-        let goodness_and_rescoring_queue =
-            RedisPipelineQueue::new(&config.goodness_and_rescoring).await?;
-        let cleanup_queue = RedisPipelineQueue::new(&config.cleanup).await?;
+        let identification_queue = RedisPipelineQueue::new(&config.comet_search).await?;
+        let scoring_queue = RedisPipelineQueue::new(&config.goodness_and_rescoring).await?;
+        let publication_queue = RedisPipelineQueue::new(&config.cleanup).await?;
+        let error_queue = RedisPipelineQueue::new(&config.cleanup).await?;
         let storage = RwLock::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let state: Arc<EntrypointServiceState> = Arc::new(EntrypointServiceState {
             index_queue,
-            preparation_queue,
             search_space_generation_queue,
-            comet_search_queue,
-            goodness_and_rescoring_queue,
-            cleanup_queue,
+            identification_queue,
+            scoring_queue,
+            publication_queue,
+            error_queue,
             storage,
             work_dir,
             prometheus_base_url: config.prometheus_base_url.clone(),
@@ -173,7 +178,7 @@ impl RemotePipelineWebApi {
         let mut search_params: Option<SearchParameters> = None;
         let mut comet_params: Option<CometConfiguration> = None;
         let mut ptms: Vec<PostTranslationalModification> = Vec::new();
-        let mut manifests: Vec<SearchManifest> = Vec::new();
+        let mut indexing_messages: Vec<IndexingMessage> = Vec::new();
 
         while let Ok(Some(field)) = payload.next_field().await {
             let field_name = match field.name() {
@@ -186,11 +191,16 @@ impl RemotePipelineWebApi {
                     Some(file_name) => file_name.to_string(),
                     None => continue,
                 };
-                let manifest = SearchManifest::new(uuid.clone(), &file_name);
-                tokio::fs::create_dir_all(&manifest.get_ms_run_dir_path(&state.work_dir)).await?;
 
-                write_streamed_file(&manifest.get_ms_run_mzml_path(&state.work_dir), field).await?;
-                manifests.push(manifest);
+                let mzml_path = state
+                    .work_dir
+                    .join(create_file_path_on_ms_run_level(&uuid, &file_name, "mzML"));
+
+                tokio::fs::create_dir_all(&mzml_path.parent().unwrap()).await?;
+
+                write_streamed_file(&mzml_path, field).await?;
+
+                indexing_messages.push(IndexingMessage::new(uuid.clone(), file_name));
                 continue;
             }
 
@@ -252,14 +262,14 @@ impl RemotePipelineWebApi {
             );
         }
 
-        if manifests.is_empty() {
+        if indexing_messages.is_empty() {
             return Err(anyhow!("No mzML files uploaded").into());
         }
 
         let search_params = match search_params {
             Some(search_params) => search_params,
             None => {
-                tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+                tokio::fs::remove_dir_all(&state.work_dir.join(&uuid)).await?;
                 return Err(anyhow!("Search parameters not uploaded").into());
             }
         };
@@ -267,7 +277,7 @@ impl RemotePipelineWebApi {
         let mut comet_params = match comet_params {
             Some(comet_params) => comet_params,
             None => {
-                tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+                tokio::fs::remove_dir_all(&state.work_dir.join(&uuid)).await?;
                 return Err(anyhow!("Comet parameters not uploaded").into());
             }
         };
@@ -285,15 +295,15 @@ impl RemotePipelineWebApi {
         {
             Ok(_) => (),
             Err(e) => {
-                tokio::fs::remove_dir_all(manifests[0].get_search_dir(&state.work_dir)).await?;
+                tokio::fs::remove_dir_all(&state.work_dir.join(&uuid)).await?;
                 return Err(anyhow!("Error initializing search: {:?}", e).into());
             }
         }
 
         // Start enqueuing manifest
-        for mut manifest in manifests.into_iter() {
+        for mut message in indexing_messages.into_iter() {
             loop {
-                manifest = match state.index_queue.push(manifest).await {
+                message = match state.index_queue.push(message).await {
                     Ok(_) => break,
                     Err(errored_manifest) => {
                         error!("Error pushing manifest to index queue");
@@ -328,19 +338,11 @@ impl RemotePipelineWebApi {
         let counters: Vec<f64> = join_all(vec![
             Self::get_prometheus_counter_rate(
                 &state.prometheus_base_url,
-                &CleanupTask::get_counter_name(&uuid),
+                &ErrorTask::get_counter_name(&uuid),
             ),
             Self::get_prometheus_counter_rate(
                 &state.prometheus_base_url,
-                &IdentificationTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &IndexingTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &PreparationTask::get_counter_name(&uuid),
+                &PublicationTask::get_counter_name(&uuid),
             ),
             Self::get_prometheus_counter_rate(
                 &state.prometheus_base_url,
@@ -348,7 +350,15 @@ impl RemotePipelineWebApi {
             ),
             Self::get_prometheus_counter_rate(
                 &state.prometheus_base_url,
+                &IdentificationTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
                 &SearchSpaceGenerationTask::get_counter_name(&uuid),
+            ),
+            Self::get_prometheus_counter_rate(
+                &state.prometheus_base_url,
+                &IndexingTask::get_counter_name(&uuid),
             ),
         ])
         .await;
@@ -376,11 +386,11 @@ impl RemotePipelineWebApi {
     ) -> Result<Response<String>, AnyhowWebError> {
         let workload = PipelineWorkload::new(
             &state.index_queue,
-            &state.preparation_queue,
             &state.search_space_generation_queue,
-            &state.comet_search_queue,
-            &state.goodness_and_rescoring_queue,
-            &state.cleanup_queue,
+            &state.identification_queue,
+            &state.scoring_queue,
+            &state.publication_queue,
+            &state.error_queue,
         )
         .await;
 
