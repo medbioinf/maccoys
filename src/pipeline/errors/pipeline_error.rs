@@ -3,7 +3,7 @@ use thiserror::Error;
 use super::{
     identification_error::IdentificationError, indexing_error::IndexingError,
     publication_error::PublicationError, scoring_error::ScoringError,
-    search_space_generation_error::SearchSpaceGenerationError,
+    search_space_generation_error::SearchSpaceGenerationError, storage_error::StorageError,
 };
 
 /// Merges all task errors into a single error type
@@ -27,6 +27,9 @@ pub enum PipelineError {
     MessageEnqueueError(),
     #[error("Unable to create directory")]
     DirectoryCreationError(std::io::Error),
+    // Storage errors
+    #[error("Storage error: {0}")]
+    StorageError(#[from] StorageError),
     // Errors in error handler
     #[error("Unable to open log file")]
     OpenLogError(std::io::Error),

@@ -1,23 +1,25 @@
-// std imports
 use std::{
     collections::HashMap,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicU64, Ordering},
+        RwLock,
     },
 };
 
-// 3rd party imports
-use anyhow::{bail, Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::Future;
 use rustis::commands::{GenericCommands, StringCommands};
 
-// local imports
 use crate::io::comet::configuration::Configuration as CometConfiguration;
 
-use super::configuration::{PipelineStorageConfiguration, SearchParameters};
+use super::{
+    configuration::{PipelineStorageConfiguration, SearchParameters},
+    errors::storage_error::{LocalStorageError, RedisStorageError, StorageError},
+};
+
+const TOTAL_SPECTRUM_COUNT_PREFIX: &str = "total_spectrum_count_";
+const FINISHED_SPECTRUM_COUNT_PREFIX: &str = "finished_spectrum_count_";
 
 /// Central storage for configuration, PTM etc.
 ///
@@ -27,85 +29,72 @@ pub trait PipelineStorage: Send + Sync + Sized {
     /// # Arguments
     /// * `config` - Configuration for the storage
     ///
-    fn new(config: &PipelineStorageConfiguration) -> impl Future<Output = Result<Self>> + Send;
+    fn new(
+        config: &PipelineStorageConfiguration,
+    ) -> impl Future<Output = Result<Self, StorageError>> + Send;
 
     /// Get the search parameters
     ///
     fn get_search_parameters(
         &self,
         uuid: &str,
-    ) -> impl Future<Output = Result<Option<SearchParameters>>> + Send;
+    ) -> impl Future<Output = Result<Option<SearchParameters>, StorageError>> + Send;
 
     /// Set the pipeline configuration
     ///
     fn set_search_parameters(
-        &mut self,
+        &self,
         uuid: &str,
         params: SearchParameters,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Remove the pipeline configuration
     ///
-    fn remove_search_params(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
+    fn remove_search_params(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Get the PTM reader
     ///
     fn get_ptms(
         &self,
         uuid: &str,
-    ) -> impl Future<Output = Result<Option<Vec<PostTranslationalModification>>>> + Send;
+    ) -> impl Future<Output = Result<Option<Vec<PostTranslationalModification>>, StorageError>> + Send;
 
     /// Set the PTM reader
     ///
     fn set_ptms(
-        &mut self,
+        &self,
         uuid: &str,
         ptms: &[PostTranslationalModification],
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Remove PTMs
     ///
-    fn remove_ptms(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
+    fn remove_ptms(&self, uuid: &str) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Get comet config
     ///
     fn get_comet_config(
         &self,
         uuid: &str,
-    ) -> impl Future<Output = Result<Option<CometConfiguration>>> + Send;
+    ) -> impl Future<Output = Result<Option<CometConfiguration>, StorageError>> + Send;
 
     /// Set comet config
     ///
     fn set_comet_config(
-        &mut self,
+        &self,
         uuid: &str,
         config: &CometConfiguration,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Remove comet config
     ///
-    fn remove_comet_config(&mut self, uuid: &str) -> impl Future<Output = Result<()>> + Send;
-
-    /// Initialize the flag that the complete search is enqueued
-    ///
-    /// # Arguments
-    /// * `uuid` - UUID for the counters
-    ///
-    fn init_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
-
-    /// Sets a flag that the complete search is enqueued
-    ///
-    /// # Arguments
-    /// * `uuid` - UUID for the counters
-    ///
-    fn set_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
-
-    /// Remove the flag that the complete search is enqueued
-    ///
-    /// # Arguments
-    /// * `uuid` - UUID for the counters
-    ///
-    fn remove_is_completely_enqueued(&mut self, uuid: &str) -> impl Future<Output = Result<()>>;
+    fn remove_comet_config(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     fn get_search_parameters_key(uuid: &str) -> String {
         format!("search_parameter:{}", uuid)
@@ -119,8 +108,21 @@ pub trait PipelineStorage: Send + Sync + Sized {
         format!("comet_config:{}", uuid)
     }
 
-    fn get_is_completely_enqueued_key(uuid: &str) -> String {
-        format!("is_completely_enqueued:{}", uuid)
+    /// Get the total search count key
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn get_total_spectrum_count_key(uuid: &str) -> String {
+        format!("{}{}", TOTAL_SPECTRUM_COUNT_PREFIX, uuid)
+    }
+
+    /// Get the finished search count key
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    fn get_finished_spectrum_count_key(uuid: &str) -> String {
+        format!("{}{}", FINISHED_SPECTRUM_COUNT_PREFIX, uuid)
     }
 
     /// Initialize a keys for new search
@@ -132,19 +134,20 @@ pub trait PipelineStorage: Send + Sync + Sized {
     /// * `comet_config` - Comet configuration
     ///
     fn init_search(
-        &mut self,
+        &self,
         uuid: &str,
         search_parameters: SearchParameters,
         ptms: &[PostTranslationalModification],
         comet_config: &CometConfiguration,
-    ) -> impl Future<Output = Result<()>> {
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async {
             // Set configs
             self.set_search_parameters(uuid, search_parameters).await?;
             self.set_ptms(uuid, ptms).await?;
             self.set_comet_config(uuid, comet_config).await?;
-            // Set flags
-            self.init_is_completely_enqueued(uuid).await?;
+            // Set counters
+            self.init_total_spectrum_count(uuid).await?;
+            self.init_finished_spectrum_count(uuid).await?;
 
             Ok(())
         }
@@ -155,16 +158,114 @@ pub trait PipelineStorage: Send + Sync + Sized {
     /// # Arguments
     /// * `uuid` - UUID for the counters
     ///
-    fn cleanup_search(&mut self, uuid: &str) -> impl Future<Output = Result<()>> {
+    fn cleanup_search(&self, uuid: &str) -> impl Future<Output = Result<(), StorageError>> + Send {
         async {
             // Remove configs
             self.remove_search_params(uuid).await?;
             self.remove_ptms(uuid).await?;
             self.remove_comet_config(uuid).await?;
-            // Remove flags
-            self.remove_is_completely_enqueued(uuid).await?;
-
+            // Remove counters
+            self.remove_total_spectrum_count(uuid).await?;
+            self.remove_finished_spectrum_count(uuid).await?;
             Ok(())
+        }
+    }
+
+    /// Initialize total search count
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn init_total_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Increment the total search count by
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    /// * `amount` - Amount to increment
+    ///
+    fn increase_total_spectrum_count(
+        &self,
+        uuid: &str,
+        value: u64,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Get the total search count
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn get_total_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Remove the total spectrum count
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn remove_total_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Initialize finished search count
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn init_finished_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Increment the finished search count by 1
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn increase_finished_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Get the finished search count
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn get_finished_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Remove the finished spectrum count
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn remove_finished_spectrum_count(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Checks if all spectra are finished
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn is_search_finished(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send {
+        async {
+            let total_count = self.get_total_spectrum_count(uuid).await?;
+            let finished_count = self.get_finished_spectrum_count(uuid).await?;
+            Ok(total_count == finished_count)
         }
     }
 }
@@ -173,112 +274,249 @@ pub trait PipelineStorage: Send + Sync + Sized {
 ///
 pub struct LocalPipelineStorage {
     /// Pipeline configuration
-    search_parameters: HashMap<String, SearchParameters>,
+    search_parameters: RwLock<HashMap<String, SearchParameters>>,
 
     /// Post translational modifications
-    ptms_collections: HashMap<String, Vec<PostTranslationalModification>>,
+    ptms_collections: RwLock<HashMap<String, Vec<PostTranslationalModification>>>,
 
     /// Comet configurations
-    comet_configs: HashMap<String, CometConfiguration>,
+    comet_configs: RwLock<HashMap<String, CometConfiguration>>,
 
-    /// Flags
-    flags: HashMap<String, Arc<AtomicBool>>,
+    /// Counts
+    counters: RwLock<HashMap<String, AtomicU64>>,
 }
 
 impl PipelineStorage for LocalPipelineStorage {
-    async fn new(_config: &PipelineStorageConfiguration) -> Result<Self> {
+    async fn new(_config: &PipelineStorageConfiguration) -> Result<Self, StorageError> {
         Ok(Self {
-            search_parameters: HashMap::new(),
-            ptms_collections: HashMap::new(),
-            comet_configs: HashMap::new(),
-            flags: HashMap::new(),
+            search_parameters: RwLock::new(HashMap::new()),
+            ptms_collections: RwLock::new(HashMap::new()),
+            comet_configs: RwLock::new(HashMap::new()),
+            counters: RwLock::new(HashMap::new()),
         })
     }
 
-    async fn get_search_parameters(&self, uuid: &str) -> Result<Option<SearchParameters>> {
+    async fn get_search_parameters(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<SearchParameters>, StorageError> {
         Ok(self
             .search_parameters
+            .read()
+            .map_err(|_| LocalStorageError::PoisenedStorageLock("search parameters".to_string()))?
             .get(&Self::get_search_parameters_key(uuid))
             .cloned())
     }
 
-    async fn set_search_parameters(&mut self, uuid: &str, params: SearchParameters) -> Result<()> {
-        self.search_parameters
-            .insert(Self::get_search_parameters_key(uuid), params);
+    async fn set_search_parameters(
+        &self,
+        uuid: &str,
+        params: SearchParameters,
+    ) -> Result<(), StorageError> {
+        let mut search_parameters_guard = self.search_parameters.write().map_err(|_| {
+            LocalStorageError::PoisenedStorageLock("reading search parameters".to_string())
+        })?;
+        search_parameters_guard.insert(Self::get_search_parameters_key(uuid), params);
         Ok(())
     }
 
-    async fn remove_search_params(&mut self, uuid: &str) -> Result<()> {
-        self.search_parameters
-            .remove(&Self::get_search_parameters_key(uuid));
+    async fn remove_search_params(&self, uuid: &str) -> Result<(), StorageError> {
+        let mut search_parameters_guard = self.search_parameters.write().map_err(|_| {
+            LocalStorageError::PoisenedStorageLock("setting search parameters".to_string())
+        })?;
+        search_parameters_guard.remove(&Self::get_search_parameters_key(uuid));
         Ok(())
     }
 
-    async fn get_ptms(&self, uuid: &str) -> Result<Option<Vec<PostTranslationalModification>>> {
+    async fn get_ptms(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<Vec<PostTranslationalModification>>, StorageError> {
         Ok(self
             .ptms_collections
+            .read()
+            .map_err(|_| LocalStorageError::PoisenedStorageLock("reading ptms".to_string()))?
             .get(&Self::get_ptms_key(uuid))
             .cloned())
     }
 
-    async fn set_ptms(&mut self, uuid: &str, ptms: &[PostTranslationalModification]) -> Result<()> {
-        self.ptms_collections
-            .insert(Self::get_ptms_key(uuid), ptms.to_vec());
+    async fn set_ptms(
+        &self,
+        uuid: &str,
+        ptms: &[PostTranslationalModification],
+    ) -> Result<(), StorageError> {
+        let mut ptms_guard = self
+            .ptms_collections
+            .write()
+            .map_err(|_| LocalStorageError::PoisenedStorageLock("setting ptms".to_string()))?;
+        ptms_guard.insert(Self::get_ptms_key(uuid), ptms.to_vec());
         Ok(())
     }
 
-    async fn remove_ptms(&mut self, uuid: &str) -> Result<()> {
-        self.ptms_collections.remove(&Self::get_ptms_key(uuid));
+    async fn remove_ptms(&self, uuid: &str) -> Result<(), StorageError> {
+        let mut ptms_guard = self
+            .ptms_collections
+            .write()
+            .map_err(|_| LocalStorageError::PoisenedStorageLock("removing ptms".to_string()))?;
+        ptms_guard.remove(&Self::get_ptms_key(uuid));
         Ok(())
     }
 
-    async fn get_comet_config(&self, uuid: &str) -> Result<Option<CometConfiguration>> {
+    async fn get_comet_config(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<CometConfiguration>, StorageError> {
         Ok(self
             .comet_configs
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("reading comet configuration".to_string())
+            })?
             .get(&Self::get_comet_config_key(uuid))
             .cloned())
     }
 
-    async fn set_comet_config(&mut self, uuid: &str, config: &CometConfiguration) -> Result<()> {
-        self.comet_configs
-            .insert(Self::get_comet_config_key(uuid), config.clone());
+    async fn set_comet_config(
+        &self,
+        uuid: &str,
+        config: &CometConfiguration,
+    ) -> Result<(), StorageError> {
+        let mut comet_config_guards = self
+            .comet_configs
+            .write()
+            .map_err(|_| LocalStorageError::PoisenedStorageLock("setting ptms".to_string()))?;
+        comet_config_guards.insert(Self::get_comet_config_key(uuid), config.clone());
         Ok(())
     }
 
-    async fn remove_comet_config(&mut self, uuid: &str) -> Result<()> {
-        self.comet_configs.remove(&Self::get_comet_config_key(uuid));
+    async fn remove_comet_config(&self, uuid: &str) -> Result<(), StorageError> {
+        let mut comet_config_guards = self
+            .comet_configs
+            .write()
+            .map_err(|_| LocalStorageError::PoisenedStorageLock("setting ptms".to_string()))?;
+        comet_config_guards.remove(&Self::get_comet_config_key(uuid));
         Ok(())
     }
 
-    async fn init_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
-        self.flags.insert(
-            Self::get_is_completely_enqueued_key(uuid),
-            Arc::new(AtomicBool::new(false)),
-        );
+    async fn init_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        self.counters
+            .write()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock(
+                    "initializing total spectrum count".to_string(),
+                )
+            })?
+            .insert(Self::get_total_spectrum_count_key(uuid), AtomicU64::new(0));
         Ok(())
     }
 
-    async fn set_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
-        match self.flags.get(&Self::get_is_completely_enqueued_key(uuid)) {
-            Some(flag) => {
-                flag.store(true, Ordering::Relaxed);
-                Ok(())
-            }
-            None => bail!(
-                "[STORAGE] Flag {} not found",
-                Self::get_is_completely_enqueued_key(uuid)
-            ),
-        }
+    async fn increase_total_spectrum_count(
+        &self,
+        uuid: &str,
+        value: u64,
+    ) -> Result<(), StorageError> {
+        self.counters
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("setting total spectrum count".to_string())
+            })?
+            .get(&Self::get_total_spectrum_count_key(uuid))
+            .ok_or_else(|| {
+                LocalStorageError::CountNotFoundError(
+                    Self::get_total_spectrum_count_key(uuid).to_string(),
+                )
+            })?
+            .fetch_add(value, Ordering::Relaxed);
+        Ok(())
     }
 
-    async fn remove_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
-        match self
-            .flags
-            .remove(&Self::get_is_completely_enqueued_key(uuid))
-        {
-            Some(_) => Ok(()),
-            None => Ok(()),
-        }
+    async fn get_total_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .counters
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("getting total spectrum count".to_string())
+            })?
+            .get(&Self::get_total_spectrum_count_key(uuid))
+            .ok_or_else(|| {
+                LocalStorageError::CountNotFoundError(
+                    Self::get_total_spectrum_count_key(uuid).to_string(),
+                )
+            })?
+            .load(Ordering::Relaxed))
+    }
+
+    async fn remove_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        self.counters
+            .write()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("removing total spectrum count".to_string())
+            })?
+            .remove(&Self::get_total_spectrum_count_key(uuid));
+        Ok(())
+    }
+
+    async fn init_finished_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        self.counters
+            .write()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock(
+                    "initializing finshed spectrum count".to_string(),
+                )
+            })?
+            .insert(
+                Self::get_finished_spectrum_count_key(uuid),
+                AtomicU64::new(0),
+            );
+        Ok(())
+    }
+
+    async fn increase_finished_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .counters
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock(
+                    "increasing finished spectrum count".to_string(),
+                )
+            })?
+            .get(&Self::get_finished_spectrum_count_key(uuid))
+            .ok_or_else(|| {
+                LocalStorageError::CountNotFoundError(
+                    Self::get_finished_spectrum_count_key(uuid).to_string(),
+                )
+            })?
+            .fetch_add(1, Ordering::Relaxed))
+    }
+
+    async fn get_finished_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .counters
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock(
+                    "getting finished spectrum count".to_string(),
+                )
+            })?
+            .get(&Self::get_finished_spectrum_count_key(uuid))
+            .ok_or_else(|| {
+                LocalStorageError::CountNotFoundError(
+                    Self::get_finished_spectrum_count_key(uuid).to_string(),
+                )
+            })?
+            .load(Ordering::Relaxed))
+    }
+
+    async fn remove_finished_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        self.counters
+            .write()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock(
+                    "removing finished spectrum count".to_string(),
+                )
+            })?
+            .remove(&Self::get_finished_spectrum_count_key(uuid));
+        Ok(())
     }
 }
 
@@ -286,150 +524,279 @@ pub struct RedisPipelineStorage {
     client: rustis::client::Client,
 }
 
+impl RedisPipelineStorage {
+    /// Safely converts i64 to u64 so i64::MIN mapsto u64::MIN & i64::MAX maps to u64::MAX
+    ///
+    /// # Arguments
+    /// * `value` - i64 value
+    ///
+    fn safe_i64_to_u64(value: i64) -> u64 {
+        (value as u64).wrapping_add(1 << 63)
+    }
+
+    /// Safely converts u64 to i64 so u64::MIN maps to i64::MIN & u64::MAX maps to i64::MAX
+    ///
+    /// # Arguments
+    /// * `value` - u64 value
+    ///
+    fn safe_u64_to_i64(value: u64) -> i64 {
+        (value as i64).wrapping_add(1 << 63)
+    }
+}
+
 impl PipelineStorage for RedisPipelineStorage {
-    async fn new(config: &PipelineStorageConfiguration) -> Result<Self> {
+    async fn new(config: &PipelineStorageConfiguration) -> Result<Self, StorageError> {
         if config.redis_url.is_none() {
-            bail!("[STORAGE] Redis URL is None")
+            return Err(RedisStorageError::RedisUrlMissing.into());
         }
 
         let mut redis_client_config =
-            rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())?;
+            rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())
+                .map_err(RedisStorageError::ConfigError)?;
         redis_client_config.retry_on_error = true;
         redis_client_config.reconnection = rustis::client::ReconnectionConfig::new_constant(0, 5);
 
         let client = rustis::client::Client::connect(redis_client_config)
             .await
-            .context("[STORAGE] Error opening connection to Redis")?;
+            .map_err(RedisStorageError::ConnectionError)?;
 
         Ok(Self { client })
     }
 
-    async fn get_search_parameters(&self, uuid: &str) -> Result<Option<SearchParameters>> {
+    async fn get_search_parameters(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<SearchParameters>, StorageError> {
         let params_json: String = self
             .client
             .get(Self::get_search_parameters_key(uuid))
             .await
-            .context("[STORAGE] Error getting search params")?;
+            .map_err(|err| RedisStorageError::RedisError("getting search parameters", err))?;
 
         if params_json.is_empty() {
             return Ok(None);
         }
 
-        let params: SearchParameters = serde_json::from_str(&params_json)
-            .context("[STORAGE] Error deserializing search params")?;
+        let params: SearchParameters = serde_json::from_str(&params_json).map_err(|err| {
+            RedisStorageError::DeserializationError("getting search parameters".to_string(), err)
+        })?;
 
         Ok(Some(params))
     }
 
-    async fn set_search_parameters(&mut self, uuid: &str, params: SearchParameters) -> Result<()> {
-        let params_json =
-            serde_json::to_string(&params).context("[STORAGE] Error serializing search params")?;
+    async fn set_search_parameters(
+        &self,
+        uuid: &str,
+        params: SearchParameters,
+    ) -> Result<(), StorageError> {
+        let params_json = serde_json::to_string(&params).map_err(|err| {
+            RedisStorageError::SerializationError("setting search parameters".to_string(), err)
+        })?;
 
-        self.client
+        Ok(self
+            .client
             .set(Self::get_search_parameters_key(uuid), params_json)
             .await
-            .context("[STORAGE] Error setting configuration")
+            .map_err(|err| RedisStorageError::RedisError("setting search parameters", err))?)
     }
 
-    async fn remove_search_params(&mut self, uuid: &str) -> Result<()> {
+    async fn remove_search_params(&self, uuid: &str) -> Result<(), StorageError> {
         self.client
             .del(Self::get_search_parameters_key(uuid))
             .await
-            .context("[STORAGE] Error removing search params")?;
+            .map_err(|err| RedisStorageError::RedisError("removing search parameters", err))?;
         Ok(())
     }
 
-    async fn get_ptms(&self, uuid: &str) -> Result<Option<Vec<PostTranslationalModification>>> {
+    async fn get_ptms(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<Vec<PostTranslationalModification>>, StorageError> {
         let ptms_json: String = self
             .client
             .get(Self::get_ptms_key(uuid))
             .await
-            .context("[STORAGE] Error getting PTMs")?;
+            .map_err(|err| RedisStorageError::RedisError("getting PTMs", err))?;
 
         if ptms_json.is_empty() {
             return Ok(None);
         }
 
         let ptms: Vec<PostTranslationalModification> =
-            serde_json::from_str(&ptms_json).context("[STORAGE] Error deserializing PTMs")?;
+            serde_json::from_str(&ptms_json).map_err(|err| {
+                RedisStorageError::DeserializationError("getting PTMs".to_string(), err)
+            })?;
 
         Ok(Some(ptms))
     }
 
-    async fn set_ptms(&mut self, uuid: &str, ptms: &[PostTranslationalModification]) -> Result<()> {
-        let ptms_json = serde_json::to_string(ptms).context("[STORAGE] Error serializing PTMs")?;
+    async fn set_ptms(
+        &self,
+        uuid: &str,
+        ptms: &[PostTranslationalModification],
+    ) -> Result<(), StorageError> {
+        let ptms_json = serde_json::to_string(ptms).map_err(|err| {
+            RedisStorageError::SerializationError("setting ptms".to_string(), err)
+        })?;
 
-        self.client
+        Ok(self
+            .client
             .set(Self::get_ptms_key(uuid), ptms_json)
             .await
-            .context("[STORAGE] Error setting PTMs")
+            .map_err(|err| RedisStorageError::RedisError("setting PTMs", err))?)
     }
 
-    async fn remove_ptms(&mut self, uuid: &str) -> Result<()> {
+    async fn remove_ptms(&self, uuid: &str) -> Result<(), StorageError> {
         self.client
             .del(Self::get_ptms_key(uuid))
             .await
-            .context("[STORAGE] Error removing PTMs")?;
+            .map_err(|err| RedisStorageError::RedisError("removing PTMs", err))?;
         Ok(())
     }
 
-    async fn get_comet_config(&self, uuid: &str) -> Result<Option<CometConfiguration>> {
+    async fn get_comet_config(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<CometConfiguration>, StorageError> {
         let comet_params_json: String = self
             .client
             .get(Self::get_comet_config_key(uuid))
             .await
-            .context("[STORAGE] Error getting Comet configuration")?;
+            .map_err(|err| RedisStorageError::RedisError("getting comet configuration", err))?;
 
         if comet_params_json.is_empty() {
             return Ok(None);
         }
 
-        let config: CometConfiguration = serde_json::from_str(&comet_params_json)
-            .context("[STORAGE] Error deserializing Comet configuration")?;
+        let config: CometConfiguration =
+            serde_json::from_str(&comet_params_json).map_err(|err| {
+                RedisStorageError::DeserializationError(
+                    "getting comet configuration".to_string(),
+                    err,
+                )
+            })?;
 
         Ok(Some(config))
     }
 
-    async fn set_comet_config(&mut self, uuid: &str, config: &CometConfiguration) -> Result<()> {
-        let comet_params_json = serde_json::to_string(config)
-            .context("[STORAGE] Error serializing Comet configuration")?;
+    async fn set_comet_config(
+        &self,
+        uuid: &str,
+        config: &CometConfiguration,
+    ) -> Result<(), StorageError> {
+        let comet_params_json = serde_json::to_string(config).map_err(|err| {
+            RedisStorageError::SerializationError("setting comet configuration".to_string(), err)
+        })?;
 
-        self.client
+        Ok(self
+            .client
             .set(Self::get_comet_config_key(uuid), comet_params_json)
             .await
-            .context("[STORAGE] Error setting Comet configuration")
+            .map_err(|err| RedisStorageError::RedisError("setting comet configuration", err))?)
     }
 
-    async fn remove_comet_config(&mut self, uuid: &str) -> Result<()> {
+    async fn remove_comet_config(&self, uuid: &str) -> Result<(), StorageError> {
         self.client
             .del(Self::get_comet_config_key(uuid))
             .await
-            .context("[STORAGE] Error removing Comet configuration")?;
+            .map_err(|err| RedisStorageError::RedisError("removing comet configuration", err))?;
         Ok(())
     }
 
-    async fn init_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
-        let key = Self::get_is_completely_enqueued_key(uuid);
-        self.client
-            .set(key, false)
+    async fn init_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        Ok(self
+            .client
+            .set(Self::get_total_spectrum_count_key(uuid), 0_i64)
             .await
-            .context("[STORAGE] Error initialize is completely enqueued ")
-    }
-    async fn set_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
-        let key = Self::get_is_completely_enqueued_key(uuid);
-        self.client
-            .set(key, true)
-            .await
-            .context("[STORAGE] Error setting is completely enqueued")
+            .map_err(|err| {
+                RedisStorageError::RedisError("initializing total spectrum count", err)
+            })?)
     }
 
-    async fn remove_is_completely_enqueued(&mut self, uuid: &str) -> Result<()> {
-        let key = Self::get_is_completely_enqueued_key(uuid);
+    async fn increase_total_spectrum_count(
+        &self,
+        uuid: &str,
+        value: u64,
+    ) -> Result<(), StorageError> {
+        let value_i64 = Self::safe_u64_to_i64(value);
         self.client
-            .del(key)
+            .incrby(Self::get_total_spectrum_count_key(uuid), value_i64)
             .await
-            .context("[STORAGE] Error removing completely enqueued")?;
-
+            .map_err(|err| RedisStorageError::RedisError("increase total spectrum count", err))?;
         Ok(())
+    }
+
+    async fn get_total_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
+        let value_i64 = self
+            .client
+            .get(Self::get_total_spectrum_count_key(uuid))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("getting total spectrum count", err))?;
+        Ok(Self::safe_i64_to_u64(value_i64))
+    }
+
+    async fn remove_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        self.client
+            .del(Self::get_total_spectrum_count_key(uuid))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("removing total spectrum count", err))?;
+        Ok(())
+    }
+
+    async fn init_finished_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        Ok(self
+            .client
+            .set(Self::get_finished_spectrum_count_key(uuid), 0_i64)
+            .await
+            .map_err(|err| {
+                RedisStorageError::RedisError("initializing total spectrum count", err)
+            })?)
+    }
+
+    async fn increase_finished_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
+        let value_i64 = self
+            .client
+            .incr(Self::get_total_spectrum_count_key(uuid))
+            .await
+            .map_err(|err| {
+                RedisStorageError::RedisError("increasing finished spectrum count", err)
+            })?;
+        Ok(Self::safe_i64_to_u64(value_i64))
+    }
+
+    async fn get_finished_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
+        let value_i64 = self
+            .client
+            .get(Self::get_finished_spectrum_count_key(uuid))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("getting finished spectrum count", err))?;
+        Ok(Self::safe_i64_to_u64(value_i64))
+    }
+
+    async fn remove_finished_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
+        self.client
+            .del(Self::get_finished_spectrum_count_key(uuid))
+            .await
+            .map_err(|err| {
+                RedisStorageError::RedisError("removing finished spectrum count", err)
+            })?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_i64_to_u64() {
+        assert_eq!(RedisPipelineStorage::safe_i64_to_u64(i64::MIN), u64::MIN);
+        assert_eq!(RedisPipelineStorage::safe_i64_to_u64(i64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn test_safe_u64_to_i64() {
+        assert_eq!(RedisPipelineStorage::safe_u64_to_i64(u64::MIN), i64::MIN);
+        assert_eq!(RedisPipelineStorage::safe_u64_to_i64(u64::MAX), i64::MAX);
     }
 }

@@ -10,3 +10,5 @@ pub mod publication_error;
 pub mod scoring_error;
 /// Search space generation error
 pub mod search_space_generation_error;
+/// Errors related to the storage
+pub mod storage_error;
