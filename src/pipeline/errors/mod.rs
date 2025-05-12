@@ -6,6 +6,8 @@ pub mod indexing_error;
 pub mod pipeline_error;
 /// Errors related to the publication task
 pub mod publication_error;
+/// Errors related to the queue
+pub mod queue_error;
 /// Scoring error
 pub mod scoring_error;
 /// Search space generation error

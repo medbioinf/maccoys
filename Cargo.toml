@@ -76,3 +76,4 @@ metrics-exporter-prometheus = { version = "0.16.2", features = [
 ] }
 numpy = "0.24.0"
 thiserror = "2.0.12"
+gethostname = "1.0.2"

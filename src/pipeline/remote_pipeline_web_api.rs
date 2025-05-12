@@ -30,6 +30,7 @@ use crate::{
 
 use super::{
     configuration::{RemoteEntypointConfiguration, SearchParameters},
+    errors::queue_error::QueueError,
     messages::{
         error_message::ErrorMessage, identification_message::IdentificationMessage,
         indexing_message::IndexingMessage, publication_message::PublicationMessage,
@@ -81,12 +82,12 @@ impl PipelineWorkload {
         error_queue: &impl PipelineQueue<ErrorMessage>,
     ) -> Self {
         Self {
-            index_queue: index_queue.len().await,
-            search_space_generation_queue: search_space_generation_queue.len().await,
-            identification_queue: identification_queue.len().await,
-            scoring_queue: scoring_queue.len().await,
-            publication_queue: publication_queue.len().await,
-            error_queue: error_queue.len().await,
+            index_queue: index_queue.len().await.unwrap_or(0),
+            search_space_generation_queue: search_space_generation_queue.len().await.unwrap_or(0),
+            identification_queue: identification_queue.len().await.unwrap_or(0),
+            scoring_queue: scoring_queue.len().await.unwrap_or(0),
+            publication_queue: publication_queue.len().await.unwrap_or(0),
+            error_queue: error_queue.len().await.unwrap_or(0),
         }
     }
 }
@@ -305,12 +306,15 @@ impl RemotePipelineWebApi {
             loop {
                 message = match state.index_queue.push(message).await {
                     Ok(_) => break,
-                    Err(errored_manifest) => {
-                        error!("Error pushing manifest to index queue");
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        errored_manifest
-                    }
-                }
+                    Err((err, errored_message)) => match err {
+                        QueueError::QueueFullError => *errored_message,
+                        _ => {
+                            error!("{}", err);
+                            break;
+                        }
+                    },
+                };
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             }
         }
 

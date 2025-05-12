@@ -1,16 +1,23 @@
 // std import
-use std::{str::FromStr, sync::Arc};
+use std::{future::IntoFuture, str::FromStr, sync::Arc};
 
 // 3rd party imports
-use anyhow::{bail, Context, Result};
 use deadqueue::limited::Queue;
 use futures::Future;
 use macpepdb::tools::queue_monitor::MonitorableQueue;
-use rustis::commands::ListCommands;
-use tracing::{error, trace};
+use rustis::{
+    client::BatchPreparedCommand,
+    commands::{GenericCommands, LMoveWhere, ListCommands, StringCommands},
+};
+use tracing::debug;
+
+use crate::pipeline::errors::queue_error::RedisQueueError;
 
 //  local imports
-use super::{configuration::TaskConfiguration, messages::is_message::IsMessage};
+use super::{
+    configuration::TaskConfiguration, errors::queue_error::QueueError,
+    messages::is_message::IsMessage,
+};
 
 /// Trait defining the methods for a pipeline queue
 ///
@@ -19,14 +26,14 @@ where
     M: IsMessage,
 {
     /// Create a new pipeline queue
-    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self>> + Send;
+    fn new(config: &TaskConfiguration) -> impl Future<Output = Result<Self, QueueError>> + Send;
 
-    fn get_capacity(&self) -> usize;
+    fn get_capacity(&self) -> impl Future<Output = Result<usize, QueueError>>;
 
-    /// Pop a message from the queue
+    /// Pop a message_id and the message from the queue
     /// Returns None if the queue is empty
     ///
-    fn pop(&self) -> impl Future<Output = Option<M>> + Send;
+    fn pop(&self) -> impl Future<Output = Result<Option<(String, M)>, QueueError>> + Send;
 
     /// Push a message to the queue
     /// Returns the message if the queue is full
@@ -34,16 +41,20 @@ where
     /// # Arguments
     /// * `message` - Manifest to be pushed`
     ///
-    fn push(&self, message: M) -> impl Future<Output = Result<(), M>> + Send;
+    fn push(&self, message: M) -> impl Future<Output = Result<(), (QueueError, Box<M>)>> + Send;
+
+    /// Acknowledge a message
+    ///
+    fn ack(&self, message_id: &str) -> impl Future<Output = Result<(), QueueError>> + Send;
 
     /// Get the length of the queue
     ///
-    fn len(&self) -> impl Future<Output = usize> + Send;
+    fn len(&self) -> impl Future<Output = Result<usize, QueueError>> + Send;
 
     /// Checks if the queue is empty
     ///
-    fn is_empty(&self) -> impl Future<Output = bool> + Send {
-        async { self.len().await == 0 }
+    fn is_empty(&self) -> impl Future<Output = Result<bool, QueueError>> + Send {
+        async { Ok(self.len().await? == 0) }
     }
 }
 
@@ -65,34 +76,49 @@ impl<M> PipelineQueue<M> for LocalPipelineQueue<M>
 where
     M: IsMessage,
 {
-    async fn new(config: &TaskConfiguration) -> Result<Self> {
+    async fn new(config: &TaskConfiguration) -> Result<Self, QueueError> {
         Ok(Self {
             queue: Queue::new(config.queue_capacity),
             capacity: config.queue_capacity,
         })
     }
 
-    fn get_capacity(&self) -> usize {
-        self.capacity
+    async fn get_capacity(&self) -> Result<usize, QueueError> {
+        Ok(self.capacity)
     }
 
-    async fn pop(&self) -> Option<M> {
-        self.queue.try_pop()
+    async fn pop(&self) -> Result<Option<(String, M)>, QueueError> {
+        let message = self.queue.try_pop();
+        if let Some(message) = message {
+            return Ok(Some((message.get_id(), message)));
+        }
+        Ok(None)
     }
 
-    async fn push(&self, message: M) -> Result<(), M> {
+    async fn push(&self, message: M) -> Result<(), (QueueError, Box<M>)> {
         match self.queue.try_push(message) {
             Ok(_) => Ok(()),
-            Err(e) => Err(e),
+            Err(message) => Err((QueueError::QueueFullError, Box::new(message))),
         }
     }
 
-    async fn len(&self) -> usize {
-        self.queue.len()
+    async fn ack(&self, _message_id: &str) -> Result<(), QueueError> {
+        // No need to do anything for local queue
+        Ok(())
+    }
+
+    async fn len(&self) -> Result<usize, QueueError> {
+        Ok(self.queue.len())
     }
 }
 
 /// Redis implementation of the pipeline queue for distributed systems
+/// Messages are stored as key value pairs in Redis
+/// while the queue is stored as a list. This way we do not need the hole message again for
+/// acknowledging the message. As some messages get deconstructed during the task, to safe some memory
+/// we need to store the message in redis.
+/// Be aware that the max queue size is limited by this implementation not Redis.
+/// So it is important that every client is using the same queue size.
 ///
 pub struct RedisPipelineQueue<M>
 where
@@ -101,118 +127,183 @@ where
     /// Redis client
     client: rustis::client::Client,
 
-    /// Name of the queue
-    queue_name: String,
-
     /// Capacity of the queue
     capacity: usize,
 
+    /// Name of the queue
+    queue_name: String,
+
+    /// WIP queue name
+    wip_queue_name: String,
+
     _phantom_message: std::marker::PhantomData<M>,
+}
+
+impl<M> RedisPipelineQueue<M>
+where
+    M: IsMessage,
+{
+    /// Creates a new WIP queue name
+    ///
+    /// # Arguments
+    /// * `queue_name` - Name of the queue
+    ///
+    fn create_wip_queue_name(queue_name: &str) -> String {
+        format!("{}_wip", queue_name)
+    }
 }
 
 impl<M> PipelineQueue<M> for RedisPipelineQueue<M>
 where
     M: IsMessage,
 {
-    async fn new(config: &TaskConfiguration) -> Result<Self> {
+    async fn new(config: &TaskConfiguration) -> Result<Self, QueueError> {
+        // Check redis URL as it is optional in the config
         if config.redis_url.is_none() {
-            bail!("Redis URL is None")
+            return Err(RedisQueueError::RedisUrlMissing(config.queue_name.clone()).into());
         }
 
-        trace!("Storages: {:?} / {}", &config.redis_url, &config.queue_name);
+        debug!("Storages: {:?} / {}", &config.redis_url, &config.queue_name);
 
         let mut redis_client_config =
-            rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())?;
+            match rustis::client::Config::from_str(config.redis_url.as_ref().unwrap()) {
+                Ok(config) => config,
+                Err(e) => {
+                    return Err(RedisQueueError::ConfigError(config.queue_name.clone(), e).into())
+                }
+            };
+
         redis_client_config.retry_on_error = true;
         redis_client_config.reconnection = rustis::client::ReconnectionConfig::new_constant(0, 5);
 
-        let client = rustis::client::Client::connect(redis_client_config)
-            .await
-            .context("Error opening connection to Redis")?;
+        let client = match rustis::client::Client::connect(redis_client_config).await {
+            Ok(client) => client,
+            Err(e) => {
+                return Err(RedisQueueError::ConnectionError(config.queue_name.clone(), e).into())
+            }
+        };
+
         Ok(Self {
             client,
             queue_name: config.queue_name.clone(),
+            wip_queue_name: Self::create_wip_queue_name(&config.queue_name),
             capacity: config.queue_capacity,
             _phantom_message: std::marker::PhantomData,
         })
     }
 
-    fn get_capacity(&self) -> usize {
-        self.capacity
+    async fn get_capacity(&self) -> Result<usize, QueueError> {
+        Ok(self
+            .client
+            .llen(self.queue_name.clone())
+            .await
+            .map_err(|e| {
+                RedisQueueError::RedisError(self.queue_name.clone(), "getting capacity", e)
+            })?)
     }
 
-    async fn pop(&self) -> Option<M> {
-        let serialized_message: String = match self
+    async fn pop(&self) -> Result<Option<(String, M)>, QueueError> {
+        let message_id: String = self
             .client
-            .lpop::<_, _, Vec<String>>(&self.queue_name, 1)
+            .lmove(
+                &self.queue_name,
+                &self.wip_queue_name,
+                LMoveWhere::Right,
+                LMoveWhere::Left,
+            )
+            .into_future()
             .await
-        {
-            Ok(response) => {
-                if !response.is_empty() {
-                    response[0].clone()
-                } else {
-                    String::new()
-                }
-            }
+            .map_err(|e| {
+                RedisQueueError::RedisError(
+                    self.queue_name.clone(),
+                    "getting message ID during message popping",
+                    e,
+                )
+            })?;
+
+        if message_id.is_empty() {
+            return Ok(None);
+        }
+
+        let serialized_message: String = self.client.get(&message_id).await.map_err(|e| {
+            RedisQueueError::RedisError(
+                self.queue_name.clone(),
+                "getting message during message popping",
+                e,
+            )
+        })?;
+
+        match serde_json::from_str::<M>(&serialized_message) {
+            Ok(message) => Ok(Some((message_id, message))),
+            Err(e) => Err(RedisQueueError::DeserializationError(
+                self.queue_name.clone(),
+                "popping message",
+                e,
+            )
+            .into()),
+        }
+    }
+
+    async fn push(&self, message: M) -> Result<(), (QueueError, Box<M>)> {
+        let current_len = match self.len().await {
+            Ok(len) => len,
             Err(e) => {
-                error!("Error popping message from queue: {:?}", e);
-                return None;
+                return Err((e, Box::new(message)));
             }
         };
 
-        if serialized_message.is_empty() {
-            return None;
+        if current_len >= self.capacity {
+            return Err((QueueError::QueueFullError, Box::new(message)));
         }
 
-        match serde_json::from_str(&serialized_message) {
-            Ok(message) => message,
-            Err(e) => {
-                error!("[{}] Error deserializing message: {:?}", self.queue_name, e);
-                None
-            }
-        }
-    }
-
-    async fn push(&self, message: M) -> Result<(), M> {
-        // Simple mechanism to prevent overcommitment of queue
-        loop {
-            if self.len().await < self.get_capacity() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
         let serialized_message = match serde_json::to_string(&message) {
             Ok(serialized_message) => serialized_message,
             Err(e) => {
-                error!("[{}] Error serializing message: {:?}", self.queue_name, e);
-                return Err(message);
+                return Err((
+                    RedisQueueError::SerializationError(
+                        self.queue_name.clone(),
+                        "pushing message",
+                        e,
+                    )
+                    .into(),
+                    Box::new(message),
+                ))
             }
         };
+        let message_id = message.get_id();
 
-        match self
-            .client
-            .rpush(&self.queue_name, serialized_message)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!(
-                    "[{}] Error pushing message to queue: {:?}",
-                    self.queue_name, e
-                );
-                Err(message)
-            }
-        }
+        let mut transaction = self.client.create_transaction();
+
+        transaction.set(&message_id, serialized_message).forget();
+        transaction.rpush(&self.queue_name, message_id).forget();
+        let _: () = transaction.execute().await.map_err(|e| {
+            (
+                RedisQueueError::RedisError(self.queue_name.clone(), "pushing message", e).into(),
+                Box::new(message),
+            )
+        })?;
+
+        Ok(())
     }
 
-    async fn len(&self) -> usize {
-        match self.client.llen(&self.queue_name).await {
-            Ok(size) => size,
-            Err(e) => {
-                error!("[{}] Error getting queue size: {:?}", self.queue_name, e);
-                self.capacity + 111
-            }
-        }
+    async fn ack(&self, message_id: &str) -> Result<(), QueueError> {
+        let mut transaction = self.client.create_transaction();
+
+        transaction.del(message_id).forget();
+        transaction
+            .lrem(&self.wip_queue_name, 1, message_id)
+            .forget();
+        let _: () = transaction.execute().await.map_err(|e| {
+            RedisQueueError::RedisError(self.queue_name.clone(), "acknowledging message", e)
+        })?;
+
+        Ok(())
+    }
+
+    async fn len(&self) -> Result<usize, QueueError> {
+        Ok(self.client.llen(&self.queue_name).await.map_err(|e| {
+            RedisQueueError::RedisError(self.queue_name.clone(), "getting length", e)
+        })?)
     }
 }
 
@@ -234,7 +325,7 @@ where
     Q: PipelineQueue<M> + 'static,
 {
     async fn len(&self) -> usize {
-        self.queue.len().await
+        self.queue.len().await.unwrap_or(0)
     }
 }
 
