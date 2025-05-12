@@ -10,6 +10,8 @@ use super::{
     error_message::ErrorMessage, is_message::IsMessage, publication_message::PublicationMessage,
 };
 
+const ID_PREFIX: &str = "maccoys_scoring_message";
+
 /// Scoring message
 ///
 #[derive(Serialize, Deserialize)]
@@ -121,6 +123,18 @@ impl IsMessage for ScoringMessage {
             Some(self.spectrum_id.clone()),
             Some(self.precursor),
             error,
+        )
+    }
+
+    fn get_id(&self) -> String {
+        format!(
+            "{}_{}_{}_{}_{}_{}",
+            ID_PREFIX,
+            self.uuid,
+            self.ms_run_name,
+            self.spectrum_id,
+            self.precursor.0,
+            self.precursor.1,
         )
     }
 }

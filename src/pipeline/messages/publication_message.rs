@@ -1,10 +1,12 @@
-use std::path::PathBuf;
+use std::{io::Cursor, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::errors::pipeline_error::PipelineError;
 
 use super::{error_message::ErrorMessage, is_message::IsMessage};
+
+const ID_PREFIX: &str = "maccoys_publication_message";
 
 /// Publication message
 ///
@@ -85,6 +87,22 @@ impl IsMessage for PublicationMessage {
             Some(self.spectrum_id.clone()),
             None,
             error,
+        )
+    }
+
+    fn get_id(&self) -> String {
+        let lossy_file_path = self.file_path.to_string_lossy();
+        let mut path_cursor = Cursor::new(lossy_file_path.as_bytes());
+        let mut content_cursor = Cursor::new(&self.content);
+
+        format!(
+            "{}_{}_{}_{}_{}_{}",
+            ID_PREFIX,
+            self.uuid,
+            self.ms_run_name,
+            self.spectrum_id,
+            murmur3::murmur3_x64_128(&mut path_cursor, 0).unwrap_or(lossy_file_path.len() as u128),
+            murmur3::murmur3_x64_128(&mut content_cursor, 0).unwrap_or(self.content.len() as u128),
         )
     }
 }

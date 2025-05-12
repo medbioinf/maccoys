@@ -11,4 +11,8 @@ pub trait IsMessage: Sized + Send + Sync + Serialize + DeserializeOwned {
     /// * `error` - Error to be converted to an error message
     ///
     fn to_error_message(&self, error: PipelineError) -> super::error_message::ErrorMessage;
+
+    /// Create a unique identifier for the message for storing in a database or similar
+    ///
+    fn get_id(&self) -> String;
 }

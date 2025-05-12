@@ -7,6 +7,8 @@ use super::{
     search_space_generation_message::SearchSpaceGenerationMessage,
 };
 
+const ID_PREFIX: &str = "maccoys_indexing_message";
+
 /// Indexing message
 ///
 #[derive(Serialize, Deserialize)]
@@ -62,5 +64,9 @@ impl IsMessage for IndexingMessage {
             None,
             error,
         )
+    }
+
+    fn get_id(&self) -> String {
+        format!("{}_{}_{}_indexing", ID_PREFIX, self.uuid, self.ms_run_name,)
     }
 }

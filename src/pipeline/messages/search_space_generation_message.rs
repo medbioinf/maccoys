@@ -1,3 +1,5 @@
+use std::io::Cursor;
+
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::errors::pipeline_error::PipelineError;
@@ -6,6 +8,8 @@ use super::{
     error_message::ErrorMessage, identification_message::IdentificationMessage,
     is_message::IsMessage,
 };
+
+const ID_PREFIX: &str = "maccoys_search_space_generation_message";
 
 /// Search space generation message
 ///
@@ -106,6 +110,18 @@ impl IsMessage for SearchSpaceGenerationMessage {
             Some(self.spectrum_id.clone()),
             None,
             error,
+        )
+    }
+
+    fn get_id(&self) -> String {
+        let mut cursor = Cursor::new(&self.mzml);
+        format!(
+            "{}_{}_{}_{}_{}",
+            ID_PREFIX,
+            self.uuid,
+            self.ms_run_name,
+            self.spectrum_id,
+            murmur3::murmur3_x64_128(&mut cursor, 0).unwrap_or(self.uuid.len() as u128),
         )
     }
 }

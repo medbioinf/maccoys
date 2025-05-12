@@ -1,10 +1,12 @@
-use std::fmt::Display;
+use std::{fmt::Display, io::Cursor};
 
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::errors::pipeline_error::PipelineError;
 
 use super::is_message::IsMessage;
+
+const ID_PREFIX: &str = "maccoys_error_message";
 
 #[derive(Serialize, Deserialize)]
 pub struct ErrorMessage {
@@ -77,6 +79,21 @@ impl IsMessage for ErrorMessage {
             self.spectrum_id.clone(),
             self.precursor,
             error,
+        )
+    }
+
+    fn get_id(&self) -> String {
+        let mut cursor = Cursor::new(self.error.as_bytes());
+        format!(
+            "{}_{}_{}_{}_{}_{}",
+            ID_PREFIX,
+            self.uuid,
+            self.ms_run_name,
+            self.spectrum_id.as_deref().unwrap_or(""),
+            self.precursor
+                .map(|(mz, charge)| format!("{}_{}", mz, charge))
+                .unwrap_or_default(),
+            murmur3::murmur3_x64_128(&mut cursor, 0).unwrap_or(self.error.len() as u128),
         )
     }
 }

@@ -11,6 +11,8 @@ use super::{
     scoring_message::ScoringMessage,
 };
 
+const ID_PREFIX: &str = "maccoys_itentification_message";
+
 /// Indexing message
 ///
 #[derive(Serialize, Deserialize)]
@@ -145,6 +147,18 @@ impl IsMessage for IdentificationMessage {
             Some(self.spectrum_id.clone()),
             Some(self.precursor),
             error,
+        )
+    }
+
+    fn get_id(&self) -> String {
+        format!(
+            "{}_{}_{}_{}_{}_{}",
+            ID_PREFIX,
+            self.uuid,
+            self.ms_run_name,
+            self.spectrum_id,
+            self.precursor.0,
+            self.precursor.1,
         )
     }
 }

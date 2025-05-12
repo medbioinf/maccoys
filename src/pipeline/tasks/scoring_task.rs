@@ -7,7 +7,6 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
 use metrics::counter;
 use numpy::IntoPyArray;
 use polars::{prelude::NamedFrom, series::Series};
@@ -20,7 +19,7 @@ use crate::{
     constants::{COMET_EXP_BASE_SCORE, LOOP_SCORE_NAME},
     pipeline::{
         configuration::StandaloneScoringConfiguration,
-        errors::scoring_error::ScoringError,
+        errors::{pipeline_error::PipelineError, scoring_error::ScoringError},
         messages::{
             error_message::ErrorMessage,
             is_message::IsMessage,
@@ -130,147 +129,153 @@ impl ScoringTask {
             });
 
         'message_loop: loop {
-            while let Some(mut message) = scoring_queue.pop().await {
-                // check if python thread is still running
-                if python_handle.is_finished() {
-                    error!(
-                        "[{} / {}] Python thread stopped unexpectedly. This scoring task is shutting down",
-                        message.uuid(),
-                        message.spectrum_id()
-                    );
-                    let uuid = message.uuid().to_string();
-                    let spectrum_id = message.spectrum_id().to_string();
-                    match scoring_queue.push(message).await {
-                        Ok(_) => (),
-                        Err(_) => {
-                            error!(
-                                "[{} / {}] Error pushing manifest back to queue after Python thread stopped unexpectedly",
-                                uuid,
-                                spectrum_id,
-                            );
-                        }
-                    }
-                    break;
-                }
-
-                let metrics_counter_name = Self::get_counter_name(message.uuid());
-
-                let relative_psms_path = create_file_path_on_precursor_level(
-                    message.uuid(),
-                    message.ms_run_name(),
-                    message.spectrum_id(),
-                    message.precursor(),
-                    "tsv",
-                );
-
-                if message.psms().is_empty() {
-                    let publication_message = message
-                        .into_publication_message(relative_psms_path)
-                        .unwrap();
-                    Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-
-                let psms_score_series = match message.psms().column(COMET_EXP_BASE_SCORE) {
-                    Ok(scores) => scores,
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            ScoringError::MissingScoreError(COMET_EXP_BASE_SCORE.to_string(), e)
-                                .into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                let psms_score: Vec<f64> = match psms_score_series.f64() {
-                    Ok(scores) => scores
-                        .to_vec()
-                        .into_iter()
-                        .map(|score| score.unwrap_or(-1.0))
-                        .collect(),
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(ScoringError::ScoreToF64VecError(e).into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                match to_python.send(psms_score).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(ScoringError::RustToPythonSendError(e).into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                let local_outlier_probabilities = match from_python.recv().await {
-                    Some(Ok(loop_score)) => loop_score,
-                    Some(Err(e)) => {
-                        let error_message =
-                            message.to_error_message(ScoringError::PythonError(e).into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                    None => {
-                        let error_message = message.to_error_message(
-                            ScoringError::PythonThreadUnexpectedlyClosedError().into(),
-                        );
-                        error!("{},", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                match message
-                    .psms_mut()
-                    .with_column(Series::new(LOOP_SCORE_NAME, local_outlier_probabilities))
-                {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(ScoringError::AddingScoreToPSMError(e).into());
-                        error!("{},", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                let publication_message = match message.into_publication_message(relative_psms_path)
-                {
-                    Ok(publication_message) => publication_message,
-                    Err(e) => {
-                        let error_message = match *e {
-                            IntoPublicationMessageError::CsvWriteError(e, message) => message
-                                .to_error_message(
-                                    ScoringError::IntoPublicationMessageError(e).into(),
-                                ),
-                        };
-                        error!("{},", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
-
-                counter!(metrics_counter_name.clone()).increment(1);
-            }
             if stop_flag.load(Ordering::Relaxed) {
                 python_stop_flag.store(true, Ordering::Relaxed);
                 break;
             }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+            let (message_id, mut message) = match scoring_queue.pop().await {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    // If the queue is empty, wait for a while before checking again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+            };
+            // check if python thread is still running
+            if python_handle.is_finished() {
+                error!(
+                        "[{} / {}] Python thread stopped unexpectedly. This scoring task is shutting down",
+                        message.uuid(),
+                        message.spectrum_id()
+                    );
+                let uuid = message.uuid().to_string();
+                let spectrum_id = message.spectrum_id().to_string();
+                match scoring_queue.push(message).await {
+                    Ok(_) => (),
+                    Err(_) => {
+                        error!(
+                                "[{} / {}] Error pushing manifest back to queue after Python thread stopped unexpectedly",
+                                uuid,
+                                spectrum_id,
+                            );
+                    }
+                }
+                break;
+            }
 
+            let metrics_counter_name = Self::get_counter_name(message.uuid());
+
+            let relative_psms_path = create_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.precursor(),
+                "tsv",
+            );
+
+            if message.psms().is_empty() {
+                let publication_message = message
+                    .into_publication_message(relative_psms_path)
+                    .unwrap();
+                Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
+                continue 'message_loop;
+            }
+
+            let psms_score_series = match message.psms().column(COMET_EXP_BASE_SCORE) {
+                Ok(scores) => scores,
+                Err(e) => {
+                    let error_message = message.to_error_message(
+                        ScoringError::MissingScoreError(COMET_EXP_BASE_SCORE.to_string(), e).into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            };
+
+            let psms_score: Vec<f64> = match psms_score_series.f64() {
+                Ok(scores) => scores
+                    .to_vec()
+                    .into_iter()
+                    .map(|score| score.unwrap_or(-1.0))
+                    .collect(),
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(ScoringError::ScoreToF64VecError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            };
+
+            match to_python.send(psms_score).await {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(ScoringError::RustToPythonSendError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            let local_outlier_probabilities = match from_python.recv().await {
+                Some(Ok(loop_score)) => loop_score,
+                Some(Err(e)) => {
+                    let error_message =
+                        message.to_error_message(ScoringError::PythonError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+                None => {
+                    let error_message = message.to_error_message(
+                        ScoringError::PythonThreadUnexpectedlyClosedError().into(),
+                    );
+                    error!("{},", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            };
+
+            match message
+                .psms_mut()
+                .with_column(Series::new(LOOP_SCORE_NAME, local_outlier_probabilities))
+            {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(ScoringError::AddingScoreToPSMError(e).into());
+                    error!("{},", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            let publication_message = match message.into_publication_message(relative_psms_path) {
+                Ok(publication_message) => publication_message,
+                Err(e) => {
+                    let error_message = match *e {
+                        IntoPublicationMessageError::CsvWriteError(e, message) => message
+                            .to_error_message(ScoringError::IntoPublicationMessageError(e).into()),
+                    };
+                    error!("{},", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            };
+
+            Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
+
+            Self::ack_message(&message_id, scoring_queue.as_ref()).await;
+
+            counter!(metrics_counter_name.clone()).increment(1);
+        }
         drop(to_python);
         match python_handle.join() {
             Ok(_) => (),
@@ -286,10 +291,17 @@ impl ScoringTask {
     /// * `work_dir` - Working directory
     /// * `config_file_path` - Path to the configuration file
     ///
-    pub async fn run_standalone(config_file_path: PathBuf) -> Result<()> {
-        let config: StandaloneScoringConfiguration =
-            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
-                .context("Deserialize config")?;
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<(), PipelineError> {
+        let config = &fs::read_to_string(&config_file_path).map_err(|err| {
+            PipelineError::FileReadError(config_file_path.to_string_lossy().to_string(), err)
+        })?;
+
+        let config: StandaloneScoringConfiguration = toml::from_str(config).map_err(|err| {
+            PipelineError::ConfigDeserializationError(
+                config_file_path.to_string_lossy().to_string(),
+                err,
+            )
+        })?;
 
         let scoring_queue =
             Arc::new(RedisPipelineQueue::<ScoringMessage>::new(&config.scoring).await?);
@@ -299,7 +311,7 @@ impl ScoringTask {
 
         let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
-        let mut signals = Signals::new([SIGINT])?;
+        let mut signals = Signals::new([SIGINT]).map_err(PipelineError::SignalHandlerError)?;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
 

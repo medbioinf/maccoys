@@ -7,7 +7,6 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
 use metrics::counter;
 use polars::frame::DataFrame;
 use tokio::fs::create_dir_all;
@@ -24,7 +23,7 @@ use crate::{
             IdentificationTaskConfiguration, SearchParameters,
             StandaloneIdentificationConfiguration,
         },
-        errors::identification_error::IdentificationError,
+        errors::{identification_error::IdentificationError, pipeline_error::PipelineError},
         messages::{
             error_message::ErrorMessage, identification_message::IdentificationMessage,
             is_message::IsMessage, publication_message::PublicationMessage,
@@ -94,204 +93,211 @@ impl IdentificationTask {
         let mzml_file_path = local_work_dir.join("ms_run.mzML");
 
         'message_loop: loop {
-            while let Some(mut message) = identification_queue.pop().await {
-                if last_search_uuid != *message.uuid() {
-                    current_comet_config = match storage.get_comet_config(message.uuid()).await {
-                        Ok(Some(config)) => Some(config),
-                        Ok(None) => {
-                            let error_message = message.to_error_message(
-                                IdentificationError::NoCometCongigurationInStorageError().into(),
-                            );
-                            error!("{}", &error_message);
-                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                            continue 'message_loop;
-                        }
-                        Err(e) => {
-                            let error_message = message.to_error_message(
-                                IdentificationError::UnableToGetCometConfigurationFromStorageError(
-                                    e,
-                                )
-                                .into(),
-                            );
-                            error!("{}", &error_message);
-                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                            continue 'message_loop;
-                        }
-                    };
-
-                    match current_comet_config
-                        .as_mut()
-                        .unwrap()
-                        .set_option("threads", &format!("{}", config.threads))
-                    {
-                        Ok(_) => (),
-                        Err(e) => {
-                            let error_message = message.to_error_message(
-                                IdentificationError::UnableToSetCometConfigurationAttributeError(
-                                    "threads".to_string(),
-                                    e,
-                                )
-                                .into(),
-                            );
-                            error!("{}", &error_message);
-                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                            continue 'message_loop;
-                        }
-                    }
-
-                    current_search_params =
-                        match storage.get_search_parameters(message.uuid()).await {
-                            Ok(Some(params)) => params,
-                            Ok(None) => {
-                                let error_message = message.to_error_message(
-                                    IdentificationError::SearchParametersNotFoundError().into(),
-                                );
-                                error!("{}", &error_message);
-                                Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                                continue 'message_loop;
-                            }
-                            Err(e) => {
-                                let error_message = message.to_error_message(
-                                    IdentificationError::GetSearchParametersError(e).into(),
-                                );
-                                error!("{}", &error_message);
-                                Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                                continue 'message_loop;
-                            }
-                        };
-
-                    last_search_uuid = message.uuid().clone();
-                    metrics_counter_name = Self::get_counter_name(message.uuid());
-                }
-
-                // Unwrap the current Comet configuration for easier access
-                let comet_config = current_comet_config.as_mut().unwrap();
-
-                match message.write_spectrum_mzml_file(&mzml_file_path).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::WriteSpectrumMzMLFileError(e).into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                if current_search_params.keep_fasta_files {
-                    let relative_fasta_path = create_file_path_on_precursor_level(
-                        message.uuid(),
-                        message.ms_run_name(),
-                        message.spectrum_id(),
-                        message.precursor(),
-                        "fasta",
-                    );
-                    let fasta_publication_message = message
-                        .into_publication_message(relative_fasta_path, message.fasta().clone());
-                    Self::enqueue_message(fasta_publication_message, publication_queue.as_ref())
-                        .await;
-                }
-
-                match message.write_fasta_file(&mzml_file_path).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message
-                            .to_error_message(IdentificationError::WriteFastaFileError(e).into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                match comet_config.set_charge(message.precursor().1) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::CometConfigAttributeError(
-                                "precursor_charge, max_fragment_charge & max_precursor_charge"
-                                    .to_string(),
-                                e,
-                            )
-                            .into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                match comet_config.set_num_results(10000) {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::CometConfigAttributeError(
-                                "num_results".to_string(),
-                                e,
-                            )
-                            .into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                match comet_config.async_to_file(&comet_params_file_path).await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::WriteCometConfigFileError(e).into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                match run_comet_search(
-                    &config.comet_exe_path,
-                    &comet_params_file_path,
-                    &fasta_file_path,
-                    &psms_file_path.with_extension(""),
-                    &mzml_file_path,
-                )
-                .await
-                {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(IdentificationError::CometError(e).into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
-                // Add PSM file to the message
-                let psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
-                    Ok(Some(psms)) => psms,
-                    Ok(None) => DataFrame::empty(),
-                    Err(e) => {
-                        error!(
-                            "[{} / {}] Error reading PSMs from `{}`: {:?}",
-                            &message.uuid(),
-                            &message.spectrum_id(),
-                            psms_file_path.display(),
-                            e
-                        );
-                        continue;
-                    }
-                };
-
-                let scoring_message = message.into_scoring_message(psms);
-
-                Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
-                counter!(metrics_counter_name.clone()).increment(1);
-            }
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
+            let (message_id, mut message) = match identification_queue.pop().await {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    // If the queue is empty, wait for a while before checking again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+            };
+            if last_search_uuid != *message.uuid() {
+                current_comet_config = match storage.get_comet_config(message.uuid()).await {
+                    Ok(Some(config)) => Some(config),
+                    Ok(None) => {
+                        let error_message = message.to_error_message(
+                            IdentificationError::NoCometCongigurationInStorageError().into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                    Err(e) => {
+                        let error_message = message.to_error_message(
+                            IdentificationError::UnableToGetCometConfigurationFromStorageError(e)
+                                .into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
+
+                match current_comet_config
+                    .as_mut()
+                    .unwrap()
+                    .set_option("num_threads", &format!("{}", config.threads))
+                {
+                    Ok(_) => (),
+                    Err(e) => {
+                        let error_message = message.to_error_message(
+                            IdentificationError::UnableToSetCometConfigurationAttributeError(
+                                "threads".to_string(),
+                                e,
+                            )
+                            .into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                }
+
+                current_search_params = match storage.get_search_parameters(message.uuid()).await {
+                    Ok(Some(params)) => params,
+                    Ok(None) => {
+                        let error_message = message.to_error_message(
+                            IdentificationError::SearchParametersNotFoundError().into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                    Err(e) => {
+                        let error_message = message.to_error_message(
+                            IdentificationError::GetSearchParametersError(e).into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
+
+                last_search_uuid = message.uuid().clone();
+                metrics_counter_name = Self::get_counter_name(message.uuid());
+            }
+
+            // Unwrap the current Comet configuration for easier access
+            let comet_config = current_comet_config.as_mut().unwrap();
+
+            match message.write_spectrum_mzml_file(&mzml_file_path).await {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message = message.to_error_message(
+                        IdentificationError::WriteSpectrumMzMLFileError(e).into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            if current_search_params.keep_fasta_files {
+                let relative_fasta_path = create_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    message.precursor(),
+                    "fasta",
+                );
+                let fasta_publication_message =
+                    message.into_publication_message(relative_fasta_path, message.fasta().clone());
+                Self::enqueue_message(fasta_publication_message, publication_queue.as_ref()).await;
+            }
+
+            match message.write_fasta_file(&fasta_file_path).await {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message = message
+                        .to_error_message(IdentificationError::WriteFastaFileError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            match comet_config.set_charge(message.precursor().1) {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message = message.to_error_message(
+                        IdentificationError::CometConfigAttributeError(
+                            "precursor_charge, max_fragment_charge & max_precursor_charge"
+                                .to_string(),
+                            e,
+                        )
+                        .into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            match comet_config.set_num_results(10000) {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message = message.to_error_message(
+                        IdentificationError::CometConfigAttributeError(
+                            "num_results".to_string(),
+                            e,
+                        )
+                        .into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            match comet_config.async_to_file(&comet_params_file_path).await {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message = message
+                        .to_error_message(IdentificationError::WriteCometConfigFileError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            match run_comet_search(
+                &config.comet_exe_path,
+                &comet_params_file_path,
+                &fasta_file_path,
+                &psms_file_path.with_extension(""),
+                &mzml_file_path,
+            )
+            .await
+            {
+                Ok(_) => (),
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(IdentificationError::CometError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
+
+            // Add PSM file to the message
+            let psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
+                Ok(Some(psms)) => psms,
+                Ok(None) => DataFrame::empty(),
+                Err(e) => {
+                    error!(
+                        "[{} / {}] Error reading PSMs from `{}`: {:?}",
+                        &message.uuid(),
+                        &message.spectrum_id(),
+                        psms_file_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let scoring_message = message.into_scoring_message(psms);
+
+            Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
+            Self::ack_message(&message_id, identification_queue.as_ref()).await;
+            counter!(metrics_counter_name.clone()).increment(1);
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
@@ -303,10 +309,21 @@ impl IdentificationTask {
     /// * `work_dir` - Working directory
     /// * `config_file_path` - Path to the configuration file
     ///
-    pub async fn run_standalone(local_work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+    pub async fn run_standalone(
+        local_work_dir: PathBuf,
+        config_file_path: PathBuf,
+    ) -> Result<(), PipelineError> {
+        let config = &fs::read_to_string(&config_file_path).map_err(|err| {
+            PipelineError::FileReadError(config_file_path.to_string_lossy().to_string(), err)
+        })?;
+
         let config: StandaloneIdentificationConfiguration =
-            toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
-                .context("Deserialize config")?;
+            toml::from_str(config).map_err(|err| {
+                PipelineError::ConfigDeserializationError(
+                    config_file_path.to_string_lossy().to_string(),
+                    err,
+                )
+            })?;
 
         let identification_queue = Arc::new(
             RedisPipelineQueue::<IdentificationMessage>::new(&config.identification).await?,

@@ -40,7 +40,7 @@ pub fn create_file_path_on_ms_run_level(uuid: &str, ms_run_name: &str, extension
 /// * `uuid` - Search UUID
 /// * `ms_run_name` - MS run name
 /// * `spectrum_id` - Spectrum ID
-/// * `extension`` - File extension
+/// * `extension` - File extension
 ///
 pub fn create_file_path_on_spectrum_level(
     uuid: &str,
@@ -79,6 +79,14 @@ pub fn create_file_path_on_precursor_level(
             precursor.1,
             sanatize_string_for_path(extension)
         ))
+}
+
+pub fn get_ms_run_mzml_path(uuid: &str, ms_run_name: &str) -> PathBuf {
+    create_file_path_on_ms_run_level(uuid, ms_run_name, "mzML")
+}
+
+pub fn get_ms_run_index_path(uuid: &str, ms_run_name: &str) -> PathBuf {
+    create_file_path_on_ms_run_level(uuid, ms_run_name, "index.json")
 }
 
 #[cfg(test)]

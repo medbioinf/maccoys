@@ -5,18 +5,23 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
-use tokio::fs::{create_dir_all, remove_dir_all};
-use tracing::{error, info};
+use tokio::{
+    fs::{create_dir_all, remove_dir_all},
+    time::sleep,
+};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
 use crate::{
     io::comet::configuration::Configuration as CometConfiguration,
     pipeline::{
+        errors::queue_error::QueueError,
         tasks::{
             error_task::ErrorTask, identification_task::IdentificationTask,
             indexing_task::IndexingTask, publication_task::PublicationTask,
@@ -113,7 +118,7 @@ where
         comet_config.set_ptms(&ptms, config.search_parameters.max_variable_modifications)?;
         comet_config.set_num_results(10000)?;
 
-        let mut storage = S::new(&config.storage).await?;
+        let storage = S::new(&config.storage).await?;
         storage
             .init_search(
                 &uuid,
@@ -184,6 +189,7 @@ where
                 indexing_queue.clone(),
                 search_space_generation_queue.clone(),
                 error_queue.clone(),
+                storage.clone(),
                 index_stop_flag.clone(),
             ))
         };
@@ -237,6 +243,7 @@ where
                         result_dir.clone(),
                         publication_queue.clone(),
                         error_queue.clone(),
+                        storage.clone(),
                         publication_stop_flag.clone(),
                     ))
                 })
@@ -260,9 +267,11 @@ where
                 .unwrap()
                 .to_string();
 
-            let mzml_file_path = create_file_path_on_ms_run_level(&uuid, &mzml_file_name, "mzML");
-            tokio::fs::create_dir_all(mzml_file_path.parent().unwrap()).await?;
-            tokio::fs::copy(&mzml_file_path, &mzml_file_path).await?;
+            let relative_mzml_file_path =
+                create_file_path_on_ms_run_level(&uuid, &mzml_file_name, "mzML");
+            let absolute_mzml_file_path = result_dir.join(&relative_mzml_file_path);
+            tokio::fs::create_dir_all(absolute_mzml_file_path.parent().unwrap()).await?;
+            tokio::fs::copy(&mzml_file_path, &absolute_mzml_file_path).await?;
 
             let mut indexing_message: IndexingMessage =
                 IndexingMessage::new(uuid.clone(), mzml_file_name);
@@ -270,15 +279,32 @@ where
             loop {
                 indexing_message = match indexing_queue.push(indexing_message).await {
                     Ok(_) => break,
-                    Err(original_message) => {
-                        error!(
-                            "[{}] Could not push message. Try again.",
-                            &original_message.uuid()
-                        );
-                        original_message
-                    }
+                    Err((err, errored_message)) => match err {
+                        QueueError::QueueFullError => *errored_message,
+                        _ => {
+                            error!("{}", err);
+                            break;
+                        }
+                    },
                 };
             }
+        }
+
+        // Wait a couple of seconds for the indexing to start
+        sleep(Duration::from_millis(5000)).await;
+
+        loop {
+            if storage.get_finished_spectrum_count(&uuid).await?
+                == storage.get_total_spectrum_count(&uuid).await?
+            {
+                trace!(
+                    "Finished indexing {} spectra out of {}",
+                    storage.get_finished_spectrum_count(&uuid).await?,
+                    storage.get_total_spectrum_count(&uuid).await?
+                );
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
         }
 
         index_stop_flag.store(true, Ordering::Relaxed);
@@ -349,12 +375,6 @@ where
             metrics_monitor.stop().await?;
         }
 
-        let mut storage = match Arc::try_unwrap(storage) {
-            Ok(storage) => storage,
-            Err(_) => {
-                bail!("Error unwrapping storage");
-            }
-        };
         storage.cleanup_search(&uuid).await?;
 
         remove_dir_all(&tmp_dir)

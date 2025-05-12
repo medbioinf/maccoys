@@ -49,13 +49,28 @@ impl ErrorTask {
         E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
     {
         'message_loop: loop {
-            while let Some(message) = error_queue.pop().await {
-                let metrics_counter_name = Self::get_counter_name(message.uuid());
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let (message_id, message) = match error_queue.pop().await {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    // If the queue is empty, wait for a while before checking again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+            };
 
-                // Create a file path depending on the level of the message
-                let relative_file_path = if message.spectrum_id().is_some()
-                    && message.precursor().is_some()
-                {
+            let metrics_counter_name = Self::get_counter_name(message.uuid());
+
+            // Create a file path depending on the level of the message
+            let relative_file_path =
+                if message.spectrum_id().is_some() && message.precursor().is_some() {
                     create_file_path_on_precursor_level(
                         message.uuid(),
                         message.ms_run_name(),
@@ -74,50 +89,46 @@ impl ErrorTask {
                     create_file_path_on_ms_run_level(message.uuid(), message.ms_run_name(), "err")
                 };
 
-                let absolute_file_path = work_dir.join(relative_file_path);
+            let absolute_file_path = work_dir.join(relative_file_path);
 
-                match create_dir_all(absolute_file_path.parent().unwrap()).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(PipelineError::DirectoryCreationError(e));
-                        error!("{}", &error_message);
-                        continue 'message_loop;
-                    }
+            match create_dir_all(absolute_file_path.parent().unwrap()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(PipelineError::DirectoryCreationError(e));
+                    error!("{}", &error_message);
+                    continue 'message_loop;
                 }
+            }
 
-                let mut log_file = match File::options()
-                    .create(true)
-                    .append(true)
-                    .open(&absolute_file_path)
-                {
-                    Ok(file) => file,
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(PipelineError::OpenLogError(e));
-                        error!("{}", &error_message);
-                        continue 'message_loop;
-                    }
-                };
-
-                match log_file.write(message.error().as_bytes()) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let error_message =
-                            message.to_error_message(PipelineError::WriteLogError(e));
-                        error!("{}", &error_message);
-                        continue 'message_loop;
-                    }
+            let mut log_file = match File::options()
+                .create(true)
+                .append(true)
+                .open(&absolute_file_path)
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    let error_message = message.to_error_message(PipelineError::OpenLogError(e));
+                    error!("{}", &error_message);
+                    continue 'message_loop;
                 }
+            };
 
-                counter!(metrics_counter_name.clone()).increment(1);
+            match log_file.write(message.error().as_bytes()) {
+                Ok(_) => {}
+                Err(e) => {
+                    let error_message = message.to_error_message(PipelineError::WriteLogError(e));
+                    error!("{}", &error_message);
+                    continue 'message_loop;
+                }
             }
-            if stop_flag.load(Ordering::Relaxed) {
-                break 'message_loop;
-            }
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            Self::ack_message(&message_id, error_queue.as_ref()).await;
+
+            counter!(metrics_counter_name.clone()).increment(1);
         }
+        // wait before checking the queue again
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     /// Run the error handling task by itself

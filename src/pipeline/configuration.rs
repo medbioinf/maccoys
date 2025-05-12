@@ -241,6 +241,8 @@ pub struct StandaloneIndexingConfiguration {
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
     /// Error task configuration
     pub error: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
 }
 
 /// Configuration for standalone search space generation
@@ -293,6 +295,8 @@ pub struct StandalonePublicationConfiguration {
     pub publication: TaskConfiguration,
     /// Error task configuration
     pub error: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
 }
 
 /// Configuration for standalone error handling
