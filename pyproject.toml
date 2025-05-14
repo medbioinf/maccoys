@@ -11,18 +11,24 @@ requires-python = ">=3.11"
 
 
 dependencies = [
+    "numba ~= 0.61.2",
     "numpy ~= 1.26",
     "pandas ~= 2.1",
     "scipy  ~= 1.11",
     "statsmodels ~= 0.13",
+    "polars ~= 1.29.0",
+    "pyarrow ~= 20.0.0",
     "PyNomaly ~= 0.3.4",
 ]
 
 
 [project.optional-dependencies]
 dev = [
+    "ipykernel",
+    "jupyter",
     "pandas-stubs",
     "ruff",
+    
 ]
 
 [tool.ruff]

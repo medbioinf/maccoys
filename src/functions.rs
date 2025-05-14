@@ -5,15 +5,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 // 3rd party imports
-use anyhow::{bail, Context, Result, anyhow};
+use anyhow::{anyhow, bail, Context, Result};
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
 use dihardts_omicstools::proteomics::io::mzml::elements::has_cv_params::HasCvParams;
 use dihardts_omicstools::proteomics::io::mzml::elements::is_list::IsList;
 use dihardts_omicstools::proteomics::{
-    io::mzml::{
-        index::Index,
-        reader::Reader as MzmlReader,
-    },
+    io::mzml::{index::Index, reader::Reader as MzmlReader},
     post_translational_modifications::PostTranslationalModification,
 };
 use fancy_regex::Regex;
@@ -240,29 +237,26 @@ pub async fn search_preparation(
     let extracted_spectrum_file_path = work_dir.join("extracted.mzML");
     // Extract the spectrum from the original spectrum file
     let index = Index::from_json(&read_to_string(index_file_path)?)?;
-    let mzml_file = std::fs::File::open(original_spectrum_file_path).context("Error opening mzML file")?;
-    let mut mzml_bytes_reader =  std::io::BufReader::new(mzml_file);
+    let mzml_file =
+        std::fs::File::open(original_spectrum_file_path).context("Error opening mzML file")?;
+    let mut mzml_bytes_reader = std::io::BufReader::new(mzml_file);
     let mut mzml_file = MzmlReader::read_pre_indexed(&mut mzml_bytes_reader, index, None, false)?;
 
-    let spectrum = mzml_file.get_spectrum(spectrum_id).map_err(|err| anyhow!("Error getting spectrum: {}", err))?;
+    let spectrum = mzml_file
+        .get_spectrum(spectrum_id)
+        .map_err(|err| anyhow!("Error getting spectrum: {}", err))?;
 
     match spectrum.get_ms_level() {
         // Strange
         Some(0) => {
-            bail!(
-                "MS level 0?!"
-            );
+            bail!("MS level 0?!");
         }
-        Some(1) => bail!(
-            "MS level 1?!"
-        ), 
+        Some(1) => bail!("MS level 1?!"),
         // MS level 2 or higher
         Some(_) => (),
         // MS level is not set
         None => {
-            bail!(
-                "MS level is missing",
-            );
+            bail!("MS level is missing",);
         }
     }
 
@@ -271,7 +265,6 @@ pub async fn search_preparation(
         &mzml_file.extract_spectrum(spectrum_id, true)?,
     )
     .context("Could not write extracted spectrum.")?;
-    
 
     let mut comet_config =
         CometConfiguration::try_from(&Path::new(default_comet_file_path).to_path_buf())?;
@@ -285,32 +278,41 @@ pub async fn search_preparation(
     comet_config.set_fragment_bin_offset(fragment_bin_offset)?;
 
     if let Some(ref precursor_list) = spectrum.precursor_list {
-
         for precursor in precursor_list.iter() {
             if let Some(selected_ion_list) = &precursor.selected_ion_list {
                 for selected_ion in selected_ion_list.iter() {
-                    let mz = selected_ion.get_cv_param("MS:1000744")
-                        .first().ok_or_else(|| anyhow!("Spectrum does not have precursor m/z"))?
-                        .value.parse::<f64>().map_err(|err| anyhow!("Error parsing precursor m/z: {}", err))?;
+                    let mz = selected_ion
+                        .get_cv_param("MS:1000744")
+                        .first()
+                        .ok_or_else(|| anyhow!("Spectrum does not have precursor m/z"))?
+                        .value
+                        .parse::<f64>()
+                        .map_err(|err| anyhow!("Error parsing precursor m/z: {}", err))?;
                     // Select charge states states
                     let mut charge_cv_params = selected_ion.get_cv_param("MS:1000041");
                     // add possible charge states
                     charge_cv_params.extend(selected_ion.get_cv_param("MS:1000633"));
-                    
+
                     let charges: Vec<u8> = if !charge_cv_params.is_empty() {
-                        charge_cv_params.into_iter().map(|x| {
-                            x.value.parse::<u8>().map_err(|err| anyhow!("Error parsing charge: {}", err))
-                        }).collect::<Result<Vec<u8>>>()?
+                        charge_cv_params
+                            .into_iter()
+                            .map(|x| {
+                                x.value
+                                    .parse::<u8>()
+                                    .map_err(|err| anyhow!("Error parsing charge: {}", err))
+                            })
+                            .collect::<Result<Vec<u8>>>()?
                     } else {
                         (2..=max_charge).collect()
                     };
-                    
+
                     for charge in charges {
                         let file_base_name = format!("{}", charge);
                         let mass = mass_to_int(mass_to_charge_to_dalton(mz, charge));
                         let fasta_file_path = work_dir.join(format!("{}.fasta", file_base_name));
                         let mut fasta_file = Box::pin(File::open(&fasta_file_path).await?);
-                        let comet_config_path = work_dir.join(format!("{}.comet.params", file_base_name));
+                        let comet_config_path =
+                            work_dir.join(format!("{}.comet.params", file_base_name));
                         comet_config.set_charge(charge)?;
                         comet_config
                             .to_file(&comet_config_path)
@@ -429,13 +431,13 @@ pub fn false_discovery_rate(psms: DataFrame) -> Result<DataFrame> {
     let num_psms = psms.height();
     let mut psms = psms.lazy();
 
-    let sort_option = SortOptions {
-        descending: true,
-        nulls_last: true,
-        multithreaded: false,
-        maintain_order: false,
-    };
-    psms = psms.sort(COMET_EXP_BASE_SCORE, sort_option);
+    let sort_option = SortMultipleOptions::default()
+        .with_order_descending(true)
+        .with_nulls_last(true)
+        .with_multithreaded(false)
+        .with_maintain_order(false);
+
+    psms = psms.sort([COMET_EXP_BASE_SCORE], sort_option);
     psms = psms.with_column(col("is_target").not().cum_sum(false).alias("fdr"));
     psms = psms.with_column(cast(col("fdr"), DataType::Float64).alias("fdr"));
     let index: Series = (1..=num_psms).map(|idx| idx as f64).collect();

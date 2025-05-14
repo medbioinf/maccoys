@@ -7,9 +7,10 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use dihardts_omicstools::{mass_spectrometry::spectrum::{SimpleMsNSpectrum, Spectrum}, proteomics::io::mzml::{index::Index,
-        reader::Reader as MzMlReader,
-    }};
+use dihardts_omicstools::{
+    mass_spectrometry::spectrum::{SimpleMsNSpectrum, Spectrum},
+    proteomics::io::mzml::{index::Index, reader::Reader as MzMlReader},
+};
 use maccoys_exchange_entities::results_api::{
     Identification, MsRun as MsRunResponse, Search as SearchResponse, Spectrum as SpectrumResponse,
 };
@@ -92,7 +93,11 @@ impl ResultController {
             serde_json::to_string(&MsRunResponse::new(
                 uuid,
                 ms_run,
-                ms_run_index.get_spectra().keys().into_vec(),
+                ms_run_index
+                    .get_spectra()
+                    .keys()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>(),
             ))?,
         )
             .into_response())
@@ -143,18 +148,17 @@ impl ResultController {
         // Get spectrum from mzML file
         let ms_run_index = Index::from_json(&read_to_string(ms_run_dir.join("index.json")).await?)?;
         let run_mzml_path = &ms_run_dir.join("run.mzML");
-        let mut mzml_bytes_reader = BufReader::new(
-            match std::fs::File::open(run_mzml_path) {
-                Ok(file) => file,
-                Err(err) => {
-                    return Err(WebError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to open mzML file: {}", err),
-                    ))
-                }
-            },
-        );
-        let mut mzml_file = MzMlReader::read_pre_indexed(&mut mzml_bytes_reader, ms_run_index, None, false)?;
+        let mut mzml_bytes_reader = BufReader::new(match std::fs::File::open(run_mzml_path) {
+            Ok(file) => file,
+            Err(err) => {
+                return Err(WebError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to open mzML file: {}", err),
+                ))
+            }
+        });
+        let mut mzml_file =
+            MzMlReader::read_pre_indexed(&mut mzml_bytes_reader, ms_run_index, None, false)?;
         let spectrum = match mzml_file.get_spectrum(&spectrum_id) {
             Ok(spectrum) => spectrum,
             Err(_) => {
@@ -231,14 +235,23 @@ impl ResultController {
                 }
             };
 
-            // Do not use the PeptideSpectrumMatchTsv file reader her as it will skip the first row which is inly present in the initial Comet file but not after preprocessing
-            let psms = match CsvReader::from_path(&psms_file_path)
-                .context("Error when opening PSMs file")?
-                .has_header(true)
-                .with_separator(COMET_SEPARATOR.as_bytes()[0])
-                .finish()
+            let reader = match CsvReadOptions::default()
+                .with_parse_options(
+                    CsvParseOptions::default().with_separator(COMET_SEPARATOR.as_bytes()[0]),
+                )
+                .with_has_header(true)
+                .try_into_reader_with_file_path(Some(psms_file_path.clone()))
             {
-                Ok(psms) => Some(psms),
+                Ok(reader) => reader,
+                Err(err) => {
+                    error!("Error when opening PSMs file for reading: {}", err);
+                    bail!("Error when opening PSMs file for reading: {}", err);
+                }
+            };
+
+            // Do not use the PeptideSpectrumMatchTsv file reader here as it will skip the first row which is inly present in the initial Comet file but not after preprocessing
+            let psms = match reader.finish() {
+                Ok(df) => Some(df),
                 Err(err) => match err {
                     PolarsError::NoData(msg) => {
                         warn!("No data in PSMs file: {}", msg);
@@ -258,13 +271,15 @@ impl ResultController {
                 .with_extension("goodness.tsv");
 
             if goodness_file_path.is_file() {
-                let csv_reader = CsvReader::from_path(goodness_file_path)
+                goodness = match CsvReadOptions::default()
+                    .with_has_header(true)
+                    .with_parse_options(
+                        CsvParseOptions::default().with_separator(COMET_SEPARATOR.as_bytes()[0]),
+                    )
+                    .try_into_reader_with_file_path(Some(goodness_file_path))
                     .context("Error when opening goodness file")?
-                    .has_header(true)
-                    .with_separator(COMET_SEPARATOR.as_bytes()[0])
-                    .finish();
-
-                goodness = match csv_reader {
+                    .finish()
+                {
                     Ok(goodness) => Some(goodness),
                     Err(err) => match err {
                         PolarsError::NoData(msg) => {
@@ -290,7 +305,7 @@ impl ResultController {
                 ))
             }
         };
-        
+
         let response = SpectrumResponse::new(
             uuid,
             ms_run,

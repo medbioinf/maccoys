@@ -8,27 +8,24 @@ use std::{
 };
 
 use metrics::counter;
-use numpy::IntoPyArray;
-use polars::{prelude::NamedFrom, series::Series};
+use polars::prelude::*;
 use pyo3::prelude::*;
+use pyo3_polars::PyDataFrame;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use tokio::sync::mpsc::error::TryRecvError;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::{
-    constants::{COMET_EXP_BASE_SCORE, LOOP_SCORE_NAME},
-    pipeline::{
-        configuration::StandaloneScoringConfiguration,
-        errors::{pipeline_error::PipelineError, scoring_error::ScoringError},
-        messages::{
-            error_message::ErrorMessage,
-            is_message::IsMessage,
-            publication_message::PublicationMessage,
-            scoring_message::{IntoPublicationMessageError, ScoringMessage},
-        },
-        queue::{PipelineQueue, RedisPipelineQueue},
-        utils::create_file_path_on_precursor_level,
+use crate::pipeline::{
+    configuration::StandaloneScoringConfiguration,
+    errors::{pipeline_error::PipelineError, scoring_error::ScoringError},
+    messages::{
+        error_message::ErrorMessage,
+        is_message::IsMessage,
+        publication_message::PublicationMessage,
+        scoring_message::{IntoPublicationMessageError, ScoringMessage},
     },
+    queue::{PipelineQueue, RedisPipelineQueue},
+    utils::create_file_path_on_precursor_level,
 };
 
 use super::task::Task;
@@ -36,6 +33,26 @@ use super::task::Task;
 /// Prefix for the scoring counter
 ///
 pub const COUNTER_PREFIX: &str = "maccoys_scorings";
+
+/// Number of neighbors to use for the scoring
+///
+pub const N_NEIGHBORS: i64 = 100;
+
+/// Name for the new ions matched ratio column
+///
+pub const IONS_MATCHED_RATIO_COL_NAME: &str = "ions_matched_ratio";
+
+/// Name for the new mass diff column
+///
+pub const MASS_DIFF_COL_NAME: &str = "mass_diff";
+
+/// Features to use for the scoring
+///
+pub const FEATURES: [&str; 3] = ["xcorr", IONS_MATCHED_RATIO_COL_NAME, MASS_DIFF_COL_NAME];
+
+/// Name for the LoOP score
+///
+pub const LOOP_COL_NAME: &str = "loop_score";
 
 /// Task to score the PSMs.
 /// This tasks runs a Python interpreter in the background to utilize functionality from [scipy](https://scipy.org/) which is currently not available in Rust
@@ -60,68 +77,64 @@ impl ScoringTask {
         P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
         E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
     {
-        let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<Vec<f64>>(1);
-        let (to_rust, mut from_python) = tokio::sync::mpsc::channel::<Result<Vec<f64>, PyErr>>(1);
+        let (to_python, mut from_rust) = tokio::sync::mpsc::channel::<DataFrame>(1);
+        let (to_rust, mut from_python) =
+            tokio::sync::mpsc::channel::<Result<DataFrame, ScoringError>>(1);
         let python_stop_flag = Arc::new(AtomicBool::new(false));
         let python_thread_stop_flag = python_stop_flag.clone(); // Getting moved in to the python thread
 
         let python_handle: std::thread::JoinHandle<std::result::Result<(), ScoringError>> =
             std::thread::spawn(move || {
-                match Python::with_gil(|py| {
-                    // imports
-                    let pynomaly_loop = PyModule::import(py, "PyNomaly.loop")?;
-
-                    // classes
-                    #[allow(non_snake_case)]
-                    let LocalOutlierProbability =
-                        pynomaly_loop.getattr("LocalOutlierProbability")?;
-
+                let pyreturn = Python::with_gil(|py| {
                     loop {
                         if python_thread_stop_flag.load(Ordering::Relaxed) {
                             break;
                         }
 
-                        let psm_scores = match from_rust.try_recv() {
-                            Ok(scores) => scores,
+                        let psms = match from_rust.try_recv() {
+                            Ok(psms) => {
+                                debug!("[PYTHON] recv from rust");
+                                psms
+                            }
                             Err(TryRecvError::Empty) => {
+                                trace!("[PYTHON] recv empty, retrying");
                                 std::thread::sleep(tokio::time::Duration::from_millis(100));
                                 continue;
                             }
                             Err(TryRecvError::Disconnected) => {
+                                trace!("[PYTHON] connection to rust closed");
                                 break;
                             }
                         };
 
-                        let psm_scores = psm_scores.into_pyarray(py);
+                        trace!("[PYTHON] calc features and LoOP...");
+                        let now = std::time::Instant::now();
+                        let psms = calc_features(psms)
+                            .and_then(|psms| calc_local_outlier_probabilities(&py, psms));
+                        let elapsed = now.elapsed();
+                        debug!(
+                            "[PYTHON] calc features and LoOP took: {} s",
+                            elapsed.as_secs()
+                        );
 
-                        let local_outlier_probabilities: PyResult<Vec<f64>> =
-                            LocalOutlierProbability
-                                .call1((psm_scores,))
-                                // .fit()
-                                .and_then(|local_outlier_probabilities| {
-                                    local_outlier_probabilities.call_method0("fit")
-                                })
-                                // LocalOutlierProbability.fit().local_outlier_probability
-                                .and_then(|local_outlier_probabilities| {
-                                    local_outlier_probabilities
-                                        .getattr("local_outlier_probabilities")
-                                })
-                                // Cast to Vec
-                                .and_then(|local_outlier_probabilities| {
-                                    local_outlier_probabilities.extract::<Vec<f64>>()
-                                });
-
-                        match local_outlier_probabilities {
-                            Ok(score) => to_rust.blocking_send(Ok(score))?,
-                            Err(e) => to_rust.blocking_send(Err(e))?,
+                        trace!("[PYTHON] attempt to send results back to rust");
+                        match to_rust.blocking_send(psms) {
+                            Ok(_) => {
+                                trace!("[PYTHON] send results back to rust");
+                            }
+                            Err(e) => {
+                                error!("[PYTHON] Error sending results back to rust: {:?}", e);
+                            }
                         }
                     }
 
                     Ok::<_, ScoringError>(())
-                }) {
+                });
+
+                match pyreturn {
                     Ok(_) => (),
                     Err(e) => {
-                        error!("[PYTHON] Error running Python thread: {:?}", e);
+                        error!("[PYTHON] Error in Python thread: {:?}", e);
                     }
                 }
                 debug!("[PYTHON] Python thread stopped");
@@ -134,8 +147,12 @@ impl ScoringTask {
                 break;
             }
             let (message_id, mut message) = match scoring_queue.pop().await {
-                Ok(Some(message)) => message,
+                Ok(Some(message)) => {
+                    debug!("[{}] recv", &message.0);
+                    message
+                }
                 Ok(None) => {
+                    debug!("recv None, retrying");
                     // If the queue is empty, wait for a while before checking again
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     continue 'message_loop;
@@ -146,6 +163,7 @@ impl ScoringTask {
                     continue 'message_loop;
                 }
             };
+
             // check if python thread is still running
             if python_handle.is_finished() {
                 error!(
@@ -179,42 +197,26 @@ impl ScoringTask {
             );
 
             if message.psms().is_empty() {
+                warn!(
+                    "[{}] empty psms {} / {} / {} / {:?} ",
+                    &message_id,
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    message.precursor()
+                );
+                let psms = message.take_psms();
                 let publication_message = message
-                    .into_publication_message(relative_psms_path)
+                    .into_publication_message(relative_psms_path, psms)
                     .unwrap();
                 Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
                 continue 'message_loop;
             }
 
-            let psms_score_series = match message.psms().column(COMET_EXP_BASE_SCORE) {
-                Ok(scores) => scores,
-                Err(e) => {
-                    let error_message = message.to_error_message(
-                        ScoringError::MissingScoreError(COMET_EXP_BASE_SCORE.to_string(), e).into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
+            match to_python.send(message.take_psms()).await {
+                Ok(_) => {
+                    trace!("[{}] send to python", &message_id,);
                 }
-            };
-
-            let psms_score: Vec<f64> = match psms_score_series.f64() {
-                Ok(scores) => scores
-                    .to_vec()
-                    .into_iter()
-                    .map(|score| score.unwrap_or(-1.0))
-                    .collect(),
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(ScoringError::ScoreToF64VecError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
-
-            match to_python.send(psms_score).await {
-                Ok(_) => (),
                 Err(e) => {
                     let error_message =
                         message.to_error_message(ScoringError::RustToPythonSendError(e).into());
@@ -224,11 +226,10 @@ impl ScoringTask {
                 }
             }
 
-            let local_outlier_probabilities = match from_python.recv().await {
-                Some(Ok(loop_score)) => loop_score,
+            let psms = match from_python.recv().await {
+                Some(Ok(psms)) => psms,
                 Some(Err(e)) => {
-                    let error_message =
-                        message.to_error_message(ScoringError::PythonError(e).into());
+                    let error_message = message.to_error_message(e.into());
                     error!("{}", &error_message);
                     Self::enqueue_message(error_message, error_queue.as_ref()).await;
                     continue 'message_loop;
@@ -242,22 +243,11 @@ impl ScoringTask {
                     continue 'message_loop;
                 }
             };
+            trace!("[{}] recv from python", &message_id,);
 
-            match message
-                .psms_mut()
-                .with_column(Series::new(LOOP_SCORE_NAME, local_outlier_probabilities))
+            let publication_message = match message
+                .into_publication_message(relative_psms_path, psms)
             {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(ScoringError::AddingScoreToPSMError(e).into());
-                    error!("{},", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            let publication_message = match message.into_publication_message(relative_psms_path) {
                 Ok(publication_message) => publication_message,
                 Err(e) => {
                     let error_message = match *e {
@@ -272,13 +262,19 @@ impl ScoringTask {
 
             Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
 
+            trace!("[{}] enqueued for publication", &message_id,);
+
             Self::ack_message(&message_id, scoring_queue.as_ref()).await;
+
+            debug!("[{}] ack", &message_id,);
 
             counter!(metrics_counter_name.clone()).increment(1);
         }
         drop(to_python);
         match python_handle.join() {
-            Ok(_) => (),
+            Ok(_) => {
+                debug!("Joinded Python thread");
+            }
             Err(e) => {
                 error!("Error joining Python thread: {:?}", e);
             }
@@ -350,45 +346,115 @@ impl Task for ScoringTask {
     }
 }
 
+/// Calculates features for the scoring
+///
+/// # Arguments
+/// * `psms` - The PSMs to calculate the features for
+///
+fn calc_features(mut psms: DataFrame) -> Result<DataFrame, ScoringError> {
+    let ions_matches = psms.column("ions_matched")?.cast(&DataType::Float64)?;
+    let ions_total = psms.column("ions_total")?.cast(&DataType::Float64)?;
+    let ions_matched_ratio =
+        (ions_matches / ions_total)?.with_name(IONS_MATCHED_RATIO_COL_NAME.into());
+
+    let exp_neutral_mass = psms.column("exp_neutral_mass")?;
+    let calc_neutral_mass = psms.column("calc_neutral_mass")?;
+    let mass_diff = abs((exp_neutral_mass - calc_neutral_mass)?.as_materialized_series())?
+        .with_name(MASS_DIFF_COL_NAME.into());
+
+    psms.with_column(ions_matched_ratio)?;
+    psms.with_column(mass_diff)?;
+
+    Ok(psms)
+}
+
+/// Calculates the local outlier probabilities for the PSMs
+///
+/// # Arguments
+/// * `py` - The Python interpreter
+/// * `psms` - The PSMs to calculate the local outlier probabilities for
+///
+fn calc_local_outlier_probabilities(
+    py: &Python,
+    psms: DataFrame,
+) -> Result<DataFrame, ScoringError> {
+    // Import the Python modules and functionss
+    let loop_mod = PyModule::import(*py, "maccoys.local_outlier_probability_wrapper")?;
+    let calc_loop_fn = loop_mod.getattr("calculate_local_outlier_probability")?;
+
+    // Wrap it into a PyDataFrame
+    let mut psms = PyDataFrame(psms);
+
+    psms = calc_loop_fn
+        .call1((
+            psms,
+            FEATURES.into_pyobject(*py)?,
+            N_NEIGHBORS,
+            LOOP_COL_NAME,
+        ))?
+        .extract()?;
+
+    Ok(psms.into())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
     use super::*;
+    use crate::constants::COMET_SEPARATOR;
+
+    #[test]
+    fn test_calculate_features() {
+        let psm_file_path = PathBuf::from("test_files/well_separated_psms.tsv");
+
+        let mut psms = CsvReadOptions::default()
+            .with_has_header(true)
+            .with_parse_options(
+                CsvParseOptions::default().with_separator(COMET_SEPARATOR.as_bytes()[0]),
+            )
+            .try_into_reader_with_file_path(Some(psm_file_path))
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        psms = calc_features(psms).unwrap();
+
+        assert!(psms
+            .get_column_names()
+            .contains(&&PlSmallStr::from(FEATURES[1])));
+        assert!(psms
+            .get_column_names()
+            .contains(&&PlSmallStr::from(FEATURES[2])));
+    }
 
     #[tokio::test]
     /// Checks if the imports and usage of python is working
     ///
     async fn test_loop_calculation_using_python() {
-        let xcorr = vec![
-            469.0, 415.0, 361.0, 335.0, 271.0, 256.0, 231.0, 212.0, 193.0, 155.0, 71.0, 55.0, 36.0,
-            3.6854,
-        ];
+        let psm_file_path = PathBuf::from("test_files/well_separated_psms.tsv");
 
-        match Python::with_gil(|py| {
-            // imports
-            let pynomaly_loop = PyModule::import(py, "PyNomaly.loop")?;
+        let mut psms = CsvReadOptions::default()
+            .with_has_header(true)
+            .with_parse_options(
+                CsvParseOptions::default().with_separator(COMET_SEPARATOR.as_bytes()[0]),
+            )
+            .try_into_reader_with_file_path(Some(psm_file_path))
+            .unwrap()
+            .finish()
+            .unwrap();
 
-            // submodules
+        psms = calc_features(psms).unwrap();
 
-            // classes
-            #[allow(non_snake_case)]
-            let LocalOutlierProbability = pynomaly_loop.getattr("LocalOutlierProbability")?;
+        Python::with_gil(|py| {
+            psms = calc_local_outlier_probabilities(&py, psms).unwrap();
 
-            let xcorrpy = xcorr.into_pyarray(py);
-
-            let local_outlier_probability_fit = LocalOutlierProbability
-                .call1((xcorrpy,))?
-                .call_method0("fit")?;
-
-            let _local_outlier_probability: Vec<f64> = local_outlier_probability_fit
-                .getattr("local_outlier_probabilities")?
-                .extract()?;
-
-            Ok::<(), anyhow::Error>(())
-        }) {
-            Ok(_) => (),
-            Err(e) => {
-                println!("[PYTHON] Error running Python thread: {:?}", e);
-            }
-        }
+            println!("LOOP: {:?}", psms);
+            CsvWriter::new(File::create("./scored_psms.tsv").unwrap())
+                .include_header(true)
+                .with_separator(COMET_SEPARATOR.as_bytes()[0])
+                .finish(&mut psms)
+                .unwrap();
+        });
     }
 }

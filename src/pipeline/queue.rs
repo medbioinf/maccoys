@@ -276,7 +276,7 @@ where
 
         transaction.set(&message_id, serialized_message).forget();
         transaction.rpush(&self.queue_name, message_id).forget();
-        let _: () = transaction.execute().await.map_err(|e| {
+        let _: Vec<rustis::resp::Value> = transaction.execute().await.map_err(|e| {
             (
                 RedisQueueError::RedisError(self.queue_name.clone(), "pushing message", e).into(),
                 Box::new(message),
@@ -291,9 +291,9 @@ where
 
         transaction.del(message_id).forget();
         transaction
-            .lrem(&self.wip_queue_name, 1, message_id)
+            .lrem(&self.wip_queue_name, 0, message_id)
             .forget();
-        let _: () = transaction.execute().await.map_err(|e| {
+        let _: Vec<rustis::resp::Value> = transaction.execute().await.map_err(|e| {
             RedisQueueError::RedisError(self.queue_name.clone(), "acknowledging message", e)
         })?;
 

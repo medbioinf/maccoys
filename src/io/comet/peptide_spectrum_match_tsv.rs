@@ -20,13 +20,22 @@ impl PeptideSpectrumMatchTsv {
     /// * `psm_file_path` - Path to the Comet PSM file
     ///
     pub fn read(psm_file_path: &Path) -> Result<Option<DataFrame>> {
-        match CsvReader::from_path(psm_file_path)
-            .context("Error when opening Comet PSM file for reading")?
-            .has_header(true)
-            .with_separator(COMET_SEPARATOR.as_bytes()[0])
-            .with_skip_rows(COMET_HEADER_ROW as usize)
-            .finish()
+        let reader = match CsvReadOptions::default()
+            .with_parse_options(
+                CsvParseOptions::default().with_separator(COMET_SEPARATOR.as_bytes()[0]),
+            )
+            .with_has_header(true)
+            .with_skip_lines(COMET_HEADER_ROW as usize)
+            .try_into_reader_with_file_path(Some(psm_file_path.to_path_buf()))
         {
+            Ok(reader) => reader,
+            Err(err) => {
+                return Self::handle_polars_error(err)
+                    .context("Error when opening Comet PSM file for reading");
+            }
+        };
+
+        match reader.finish() {
             Ok(df) => Ok(Some(df)),
             Err(err) => Self::handle_polars_error(err)
                 .context("Error when parsing Comet PSM file to dataframe"),

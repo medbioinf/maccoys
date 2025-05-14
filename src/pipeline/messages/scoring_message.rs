@@ -4,7 +4,7 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::pipeline::errors::pipeline_error::PipelineError;
+use crate::{constants::COMET_SEPARATOR, pipeline::errors::pipeline_error::PipelineError};
 
 use super::{
     error_message::ErrorMessage, is_message::IsMessage, publication_message::PublicationMessage,
@@ -76,8 +76,10 @@ impl ScoringMessage {
         &self.psms
     }
 
-    pub fn psms_mut(&mut self) -> &mut DataFrame {
-        &mut self.psms
+    /// Takes the PSMs out of the message and replaces them with an empty DataFrame
+    ///
+    pub fn take_psms(&mut self) -> DataFrame {
+        std::mem::take(&mut self.psms)
     }
 
     /// Get the PSMs as a CSV
@@ -85,25 +87,19 @@ impl ScoringMessage {
     /// # Arguments
     /// * `file_path` - The relative path to the file to write content to
     pub fn into_publication_message(
-        mut self,
+        self,
         file_path: PathBuf,
+        mut psms: DataFrame,
     ) -> Result<PublicationMessage, Box<IntoPublicationMessageError>> {
         // Lets assume the CSV has roughly the same size as the PSMs dataframe
         let mut content: Vec<u8> =
             Vec::with_capacity(self.psms.estimated_size() * std::mem::size_of::<u8>());
 
-        match CsvWriter::new(&mut content)
+        CsvWriter::new(&mut content)
             .include_header(true)
-            .with_separator(b'\t')
-            .finish(&mut self.psms)
-        {
-            Ok(_) => (),
-            Err(e) => {
-                return Err(Box::new(IntoPublicationMessageError::CsvWriteError(
-                    e, self,
-                )));
-            }
-        }
+            .with_separator(COMET_SEPARATOR.as_bytes()[0])
+            .finish(&mut psms)
+            .unwrap();
 
         Ok(PublicationMessage::new(
             self.uuid,

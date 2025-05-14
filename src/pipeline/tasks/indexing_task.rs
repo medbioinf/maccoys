@@ -10,7 +10,7 @@ use std::{
 
 use dihardts_omicstools::proteomics::io::mzml::{indexer::Indexer, reader::Reader as MzMlReader};
 use metrics::counter;
-use tracing::error;
+use tracing::{debug, error, trace};
 
 use crate::pipeline::{
     configuration::StandaloneIndexingConfiguration,
@@ -69,8 +69,12 @@ impl IndexingTask {
                 break;
             }
             let (message_id, message) = match indexing_queue.pop().await {
-                Ok(Some(message)) => message,
+                Ok(Some(message)) => {
+                    debug!("[{}] recv", &message.0);
+                    message
+                }
                 Ok(None) => {
+                    debug!("recv None, retrying");
                     // If the queue is empty, wait for a while before checking again
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     continue 'message_loop;
@@ -108,6 +112,8 @@ impl IndexingTask {
                     continue 'message_loop;
                 }
             };
+
+            debug!("[{}] spec ctr {}", &message_id, index.get_spectra().len());
 
             match storage
                 .increase_total_spectrum_count(message.uuid(), index.get_spectra().len() as u64)
@@ -185,7 +191,9 @@ impl IndexingTask {
                         .increase_finished_spectrum_count(message.uuid())
                         .await
                     {
-                        Ok(_) => {}
+                        Ok(_) => {
+                            trace!("[{}] 'skipping' non-MS2 spectrum {}", &message_id, &spec_id);
+                        }
                         Err(e) => {
                             let error_message = message.to_error_message(e.into());
                             error!("{}", &error_message);
@@ -216,11 +224,11 @@ impl IndexingTask {
                     search_space_generation_queue.as_ref(),
                 )
                 .await;
-
-                Self::ack_message(&message_id, indexing_queue.as_ref()).await;
-
-                counter!(metrics_counter_name.clone()).increment(1);
             }
+
+            Self::ack_message(&message_id, indexing_queue.as_ref()).await;
+            debug!("[{}] ack", &message_id);
+            counter!(metrics_counter_name.clone()).increment(1);
         }
         // wait before checking the queue again
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
