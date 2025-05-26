@@ -290,6 +290,23 @@ impl SearchSpaceGenerationTask {
                 continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
             }
 
+            if precursors.len() > 1 {
+                for _ in precursors.iter().skip(1) {
+                    match storage.increase_total_spectrum_count(message.uuid()).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            let error_message = message.to_error_message(
+                                SearchSpaceGenerationError::IncreaseTotalSpectrumCountError(e)
+                                    .into(),
+                            );
+                            error!("{}", &error_message);
+                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                            continue 'message_loop;
+                        }
+                    }
+                }
+            }
+
             // Generate the search space for each precursor
             'precursor_loop: for (precursor_mz, precursor_charge) in precursors.into_iter() {
                 let mass = mass_to_int(mass_to_charge_to_dalton(precursor_mz, precursor_charge));

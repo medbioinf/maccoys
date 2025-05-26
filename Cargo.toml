@@ -81,3 +81,7 @@ metrics-exporter-prometheus = { version = "0.16.2", features = [
 thiserror = "2.0.12"
 gethostname = "1.0.2"
 murmur3 = "0.5.2"
+mini-moka = "0.10.3"
+
+[dev-dependencies]
+serial_test = "3.2.0"

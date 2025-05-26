@@ -9,6 +9,7 @@ use std::{
 
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::Future;
+use mini_moka::sync::Cache;
 use rustis::commands::{GenericCommands, StringCommands};
 
 use crate::io::comet::configuration::Configuration as CometConfiguration;
@@ -20,6 +21,9 @@ use super::{
 
 const TOTAL_SPECTRUM_COUNT_PREFIX: &str = "total_spectrum_count_";
 const FINISHED_SPECTRUM_COUNT_PREFIX: &str = "finished_spectrum_count_";
+
+/// Max AtomicU64 as default value if key was not found
+static MAX_ATOMIC_U64: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Central storage for configuration, PTM etc.
 ///
@@ -190,10 +194,9 @@ pub trait PipelineStorage: Send + Sync + Sized {
     fn increase_total_spectrum_count(
         &self,
         uuid: &str,
-        value: u64,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Get the total search count
+    /// Get the total search count. If the count is not initialized, it will return u64::MAX.
     ///
     /// # Arguments
     /// * `uuid` - UUID for the counters
@@ -233,7 +236,7 @@ pub trait PipelineStorage: Send + Sync + Sized {
         uuid: &str,
     ) -> impl Future<Output = Result<u64, StorageError>> + Send;
 
-    /// Get the finished search count
+    /// Get the finished search count. If the count is not initialized, it will return u64::MAX.
     ///
     /// # Arguments
     /// * `uuid` - UUID for the counters
@@ -265,9 +268,40 @@ pub trait PipelineStorage: Send + Sync + Sized {
         async {
             let total_count = self.get_total_spectrum_count(uuid).await?;
             let finished_count = self.get_finished_spectrum_count(uuid).await?;
-            Ok(total_count == finished_count)
+            Ok(total_count == finished_count && self.is_search_fully_enqueued(uuid).await?)
         }
     }
+
+    /// Returns key for done flag
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn get_search_fully_enqueued_key(uuid: &str) -> String {
+        format!("search_fully_enqueued:{}", uuid)
+    }
+
+    /// Sets flag that all spectra are enqueued for the search
+    /// Implementations needs to make sure, that the flag is deleted after a time to idle (time after last insert or get)
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn set_search_fully_enqueued(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Gets the fully enqueued flag for a search
+    /// Implementations needs to make sure, that the flag is deleted after a time to idle (time after last insert or get)
+    ///
+    /// # Arguments
+    /// * `uuid` - UUID for the counters
+    ///
+    fn is_search_fully_enqueued(
+        &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<bool, StorageError>> + Send;
 }
 
 /// Local storage for the pipeline to
@@ -284,15 +318,22 @@ pub struct LocalPipelineStorage {
 
     /// Counts
     counters: RwLock<HashMap<String, AtomicU64>>,
+
+    /// Flags
+    flags: Cache<String, bool>,
 }
 
 impl PipelineStorage for LocalPipelineStorage {
-    async fn new(_config: &PipelineStorageConfiguration) -> Result<Self, StorageError> {
+    async fn new(config: &PipelineStorageConfiguration) -> Result<Self, StorageError> {
         Ok(Self {
             search_parameters: RwLock::new(HashMap::new()),
             ptms_collections: RwLock::new(HashMap::new()),
             comet_configs: RwLock::new(HashMap::new()),
             counters: RwLock::new(HashMap::new()),
+            flags: Cache::builder()
+                .max_capacity(1000)
+                .time_to_idle(std::time::Duration::from_secs(config.time_to_idle))
+                .build(),
         })
     }
 
@@ -410,11 +451,7 @@ impl PipelineStorage for LocalPipelineStorage {
         Ok(())
     }
 
-    async fn increase_total_spectrum_count(
-        &self,
-        uuid: &str,
-        value: u64,
-    ) -> Result<(), StorageError> {
+    async fn increase_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
         self.counters
             .read()
             .map_err(|_| {
@@ -426,7 +463,7 @@ impl PipelineStorage for LocalPipelineStorage {
                     Self::get_total_spectrum_count_key(uuid).to_string(),
                 )
             })?
-            .fetch_add(value, Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -438,11 +475,7 @@ impl PipelineStorage for LocalPipelineStorage {
                 LocalStorageError::PoisenedStorageLock("getting total spectrum count".to_string())
             })?
             .get(&Self::get_total_spectrum_count_key(uuid))
-            .ok_or_else(|| {
-                LocalStorageError::CountNotFoundError(
-                    Self::get_total_spectrum_count_key(uuid).to_string(),
-                )
-            })?
+            .unwrap_or(&MAX_ATOMIC_U64)
             .load(Ordering::Relaxed))
     }
 
@@ -499,11 +532,7 @@ impl PipelineStorage for LocalPipelineStorage {
                 )
             })?
             .get(&Self::get_finished_spectrum_count_key(uuid))
-            .ok_or_else(|| {
-                LocalStorageError::CountNotFoundError(
-                    Self::get_finished_spectrum_count_key(uuid).to_string(),
-                )
-            })?
+            .unwrap_or(&MAX_ATOMIC_U64)
             .load(Ordering::Relaxed))
     }
 
@@ -518,10 +547,24 @@ impl PipelineStorage for LocalPipelineStorage {
             .remove(&Self::get_finished_spectrum_count_key(uuid));
         Ok(())
     }
+
+    async fn set_search_fully_enqueued(&self, uuid: &str) -> Result<(), StorageError> {
+        self.flags
+            .insert(Self::get_search_fully_enqueued_key(uuid), true);
+        Ok(())
+    }
+
+    async fn is_search_fully_enqueued(&self, uuid: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .flags
+            .get(&Self::get_search_fully_enqueued_key(uuid))
+            .unwrap_or(false))
+    }
 }
 
 pub struct RedisPipelineStorage {
     client: rustis::client::Client,
+    time_to_idle: u64,
 }
 
 impl RedisPipelineStorage {
@@ -560,7 +603,10 @@ impl PipelineStorage for RedisPipelineStorage {
             .await
             .map_err(RedisStorageError::ConnectionError)?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            time_to_idle: config.time_to_idle,
+        })
     }
 
     async fn get_search_parameters(
@@ -706,21 +752,19 @@ impl PipelineStorage for RedisPipelineStorage {
     async fn init_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
         Ok(self
             .client
-            .set(Self::get_total_spectrum_count_key(uuid), 0_i64)
+            .set(
+                Self::get_total_spectrum_count_key(uuid),
+                Self::safe_u64_to_i64(0),
+            )
             .await
             .map_err(|err| {
                 RedisStorageError::RedisError("initializing total spectrum count", err)
             })?)
     }
 
-    async fn increase_total_spectrum_count(
-        &self,
-        uuid: &str,
-        value: u64,
-    ) -> Result<(), StorageError> {
-        let value_i64 = Self::safe_u64_to_i64(value);
+    async fn increase_total_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
         self.client
-            .incrby(Self::get_total_spectrum_count_key(uuid), value_i64)
+            .incr(Self::get_total_spectrum_count_key(uuid))
             .await
             .map_err(|err| RedisStorageError::RedisError("increase total spectrum count", err))?;
         Ok(())
@@ -746,7 +790,10 @@ impl PipelineStorage for RedisPipelineStorage {
     async fn init_finished_spectrum_count(&self, uuid: &str) -> Result<(), StorageError> {
         Ok(self
             .client
-            .set(Self::get_finished_spectrum_count_key(uuid), 0_i64)
+            .set(
+                Self::get_finished_spectrum_count_key(uuid),
+                Self::safe_u64_to_i64(0),
+            )
             .await
             .map_err(|err| {
                 RedisStorageError::RedisError("initializing total spectrum count", err)
@@ -756,7 +803,7 @@ impl PipelineStorage for RedisPipelineStorage {
     async fn increase_finished_spectrum_count(&self, uuid: &str) -> Result<u64, StorageError> {
         let value_i64 = self
             .client
-            .incr(Self::get_total_spectrum_count_key(uuid))
+            .incr(Self::get_finished_spectrum_count_key(uuid))
             .await
             .map_err(|err| {
                 RedisStorageError::RedisError("increasing finished spectrum count", err)
@@ -782,10 +829,56 @@ impl PipelineStorage for RedisPipelineStorage {
             })?;
         Ok(())
     }
+
+    async fn set_search_fully_enqueued(&self, uuid: &str) -> Result<(), StorageError> {
+        let key = Self::get_search_fully_enqueued_key(uuid);
+
+        self.client
+            .set(&key, true)
+            .await
+            .map_err(|err| RedisStorageError::RedisError("setting search done flag", err))?;
+
+        self.client
+            .expire(
+                &key,
+                self.time_to_idle,
+                rustis::commands::ExpireOption::None,
+            )
+            .await
+            .map_err(|err| RedisStorageError::RedisError("setting search done flag expiry", err))?;
+
+        Ok(())
+    }
+
+    async fn is_search_fully_enqueued(&self, uuid: &str) -> Result<bool, StorageError> {
+        let key = Self::get_search_fully_enqueued_key(uuid);
+        // Get the value of the search done flag
+        let value: Option<bool> = self
+            .client
+            .get(&key)
+            .await
+            .map_err(|err| RedisStorageError::RedisError("getting search done flag", err))?;
+
+        // If the value exists, we extend its expiry time
+        match value {
+            Some(v) => {
+                self.client
+                    .expire(&key, self.time_to_idle, rustis::commands::ExpireOption::Gt)
+                    .await
+                    .map_err(|err| {
+                        RedisStorageError::RedisError("setting search done flag expiry", err)
+                    })?;
+                Ok(v)
+            }
+            None => Ok(false), // If the key does not exist, we consider the search not done
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     #[test]
@@ -798,5 +891,99 @@ mod tests {
     fn test_safe_u64_to_i64() {
         assert_eq!(RedisPipelineStorage::safe_u64_to_i64(u64::MIN), i64::MIN);
         assert_eq!(RedisPipelineStorage::safe_u64_to_i64(u64::MAX), i64::MAX);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_counting() {
+        let time_to_idle: u64 = 5;
+        let uuid: &'static str = "test_uuid";
+
+        let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
+            time_to_idle,
+            redis_url: Some("redis://127.0.0.1:6380".to_string()),
+        };
+
+        let storage = RedisPipelineStorage::new(&config).await.unwrap();
+        // start fresh
+        storage.client.del("*").await.unwrap();
+
+        // Initialize the counters
+        storage.init_total_spectrum_count(uuid).await.unwrap();
+        storage.init_finished_spectrum_count(uuid).await.unwrap();
+
+        // Check that the counters are initialized to 0
+        assert_eq!(0, storage.get_total_spectrum_count(uuid).await.unwrap());
+        assert_eq!(0, storage.get_finished_spectrum_count(uuid).await.unwrap());
+
+        // Increase the total spectrum count
+        for i in 1..10 {
+            storage.increase_total_spectrum_count(uuid).await.unwrap();
+
+            assert_eq!(i, storage.get_total_spectrum_count(uuid).await.unwrap());
+        }
+
+        // Increase the finished spectrum count
+        for i in 1..10 {
+            storage
+                .increase_finished_spectrum_count(uuid)
+                .await
+                .unwrap();
+
+            assert_eq!(i, storage.get_finished_spectrum_count(uuid).await.unwrap());
+        }
+    }
+
+    /// Test the time to idle functionality for cvarious storage implementations.s
+    async fn test_generic_time_to_idle<S>(storage: S, uuid: &str, time_to_idle: u64)
+    where
+        S: PipelineStorage,
+    {
+        // done flag should not exist
+        assert!(!storage.is_search_fully_enqueued(uuid).await.unwrap());
+
+        // set done flag
+        storage.set_search_fully_enqueued(uuid).await.unwrap();
+
+        // should be exists after half the TTI
+        tokio::time::sleep(tokio::time::Duration::from_secs(time_to_idle / 2)).await;
+        assert!(storage.is_search_fully_enqueued(uuid).await.unwrap());
+
+        // should not be exists after TTI
+        tokio::time::sleep(tokio::time::Duration::from_secs(time_to_idle + 1)).await;
+        assert!(!storage.is_search_fully_enqueued(uuid).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_time_to_idle() {
+        let time_to_idle: u64 = 5;
+        let uuid: &'static str = "test_uuid";
+
+        let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
+            time_to_idle,
+            redis_url: Some("redis://127.0.0.1:6380".to_string()),
+        };
+
+        let storage = RedisPipelineStorage::new(&config).await.unwrap();
+        // start fresh
+        storage.client.del("*").await.unwrap();
+
+        test_generic_time_to_idle(storage, uuid, time_to_idle).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_time_to_idle() {
+        let time_to_idle: u64 = 5;
+        let uuid: &'static str = "test_uuid";
+
+        let storage = LocalPipelineStorage::new(&PipelineStorageConfiguration {
+            time_to_idle,
+            redis_url: None,
+        })
+        .await
+        .unwrap();
+
+        test_generic_time_to_idle(storage, uuid, time_to_idle).await;
     }
 }

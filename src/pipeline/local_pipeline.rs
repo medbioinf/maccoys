@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
+use futures::future::join_all;
 use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
 use tokio::{fs::create_dir_all, time::sleep};
 use tracing::{debug, error, info};
@@ -303,38 +304,45 @@ where
             )?);
         }
 
-        for mzml_file_path in mzml_file_paths {
-            let mzml_file_name = mzml_file_path
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
+        // Sanitize file names and copy mzML files to the work directory
+        let mzml_file_names = join_all(mzml_file_paths.into_iter().map(|mzml_file_path| {
+            let uuid = uuid.clone();
+            async move {
+                let mzml_file_name = mzml_file_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let relative_mzml_file_path =
+                    create_file_path_on_ms_run_level(&uuid, &mzml_file_name, "mzML");
+                let absolute_mzml_file_path = self.result_dir.join(&relative_mzml_file_path);
+                tokio::fs::create_dir_all(absolute_mzml_file_path.parent().unwrap()).await?;
+                tokio::fs::copy(&mzml_file_path, &absolute_mzml_file_path).await?;
+                Ok::<_, anyhow::Error>(mzml_file_name)
+            }
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
 
-            let relative_mzml_file_path =
-                create_file_path_on_ms_run_level(&uuid, &mzml_file_name, "mzML");
-            let absolute_mzml_file_path = self.result_dir.join(&relative_mzml_file_path);
-            tokio::fs::create_dir_all(absolute_mzml_file_path.parent().unwrap()).await?;
-            tokio::fs::copy(&mzml_file_path, &absolute_mzml_file_path).await?;
+        let mut indexing_message: IndexingMessage =
+            IndexingMessage::new(uuid.clone(), mzml_file_names);
 
-            let mut indexing_message: IndexingMessage =
-                IndexingMessage::new(uuid.clone(), mzml_file_name);
-
-            loop {
-                indexing_message = match self.indexing_queue.push(indexing_message).await {
-                    Ok(_) => {
-                        debug!("Sucessfully pushed indexing message");
+        loop {
+            indexing_message = match self.indexing_queue.push(indexing_message).await {
+                Ok(_) => {
+                    debug!("Sucessfully pushed indexing message");
+                    break;
+                }
+                Err((err, errored_message)) => match err {
+                    QueueError::QueueFullError => *errored_message,
+                    _ => {
+                        error!("{}", err);
                         break;
                     }
-                    Err((err, errored_message)) => match err {
-                        QueueError::QueueFullError => *errored_message,
-                        _ => {
-                            error!("{}", err);
-                            break;
-                        }
-                    },
-                };
-            }
+                },
+            };
         }
 
         info!("Indexing scheduled wait 5s for the indexing to start");
@@ -343,11 +351,6 @@ where
         sleep(Duration::from_millis(5000)).await;
 
         loop {
-            info!(
-                "Finished indexing {} spectra out of {}",
-                self.storage.get_finished_spectrum_count(&uuid).await?,
-                self.storage.get_total_spectrum_count(&uuid).await?
-            );
             if self.storage.is_search_finished(&uuid).await? {
                 break;
             }

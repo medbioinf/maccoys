@@ -41,6 +41,13 @@ pub trait Task {
         }
     }
 
+    /// Loops until the message is successfully acknowledged by the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `message_id` - ID of the message to acknowledge
+    /// * `queue` - Message queue
+    ///
     fn ack_message<M, Q>(
         message_id: &str,
         queue: &Q,

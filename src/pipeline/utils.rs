@@ -21,6 +21,16 @@ pub fn sanatize_string_for_path(some_str: &str) -> String {
         .to_string()
 }
 
+/// Filepath on search level, e.g. `<uuid>/search.<extension>`
+///
+/// # Arguments
+/// * `uuid` - Search UUID
+/// * `extension` - File extension
+///
+pub fn create_file_path_on_search_level(uuid: &str, extension: &str) -> PathBuf {
+    PathBuf::from(uuid).join(format!("search.{}", sanatize_string_for_path(extension)))
+}
+
 /// Filepath on Ms run level, e.g. `<uuid>/<ms_run>/ms_run.<extension>`
 ///
 /// # Arguments

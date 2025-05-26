@@ -105,6 +105,7 @@ impl ScoringMessage {
             self.ms_run_name,
             self.spectrum_id,
             file_path,
+            true,
             content,
         ))
     }
@@ -114,7 +115,7 @@ impl IsMessage for ScoringMessage {
     fn to_error_message(&self, error: PipelineError) -> ErrorMessage {
         ErrorMessage::new(
             self.uuid.clone(),
-            self.ms_run_name.clone(),
+            Some(self.ms_run_name.clone()),
             Some(self.spectrum_id.clone()),
             Some(self.precursor),
             error,

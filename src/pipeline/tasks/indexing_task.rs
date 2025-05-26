@@ -10,7 +10,7 @@ use std::{
 
 use dihardts_omicstools::proteomics::io::mzml::{indexer::Indexer, reader::Reader as MzMlReader};
 use metrics::counter;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 
 use crate::pipeline::{
     configuration::StandaloneIndexingConfiguration,
@@ -87,75 +87,67 @@ impl IndexingTask {
             };
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
-            let relative_ms_run_mzml_path =
-                get_ms_run_mzml_path(message.uuid(), message.ms_run_name());
-            let absolulte_ms_run_mzml_path = work_dir.join(&relative_ms_run_mzml_path);
+            let ms_run_names = message.ms_run_names().clone();
 
-            let mut mzml_bytes_reader = match File::open(&absolulte_ms_run_mzml_path) {
-                Ok(file) => BufReader::new(file),
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(IndexingError::MsRunMzMlIoError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
+            for ms_run_name in ms_run_names.into_iter() {
+                let relative_ms_run_mzml_path = get_ms_run_mzml_path(message.uuid(), &ms_run_name);
+                let absolulte_ms_run_mzml_path = work_dir.join(&relative_ms_run_mzml_path);
 
-            let index = match Indexer::create_index(&mut mzml_bytes_reader, None) {
-                Ok(index) => index,
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(IndexingError::IndexCreationError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
+                let mut mzml_bytes_reader = match File::open(&absolulte_ms_run_mzml_path) {
+                    Ok(file) => BufReader::new(file),
+                    Err(e) => {
+                        let error_message =
+                            message.to_error_message(IndexingError::MsRunMzMlIoError(e).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
 
-            debug!("[{}] spec ctr {}", &message_id, index.get_spectra().len());
+                let index = match Indexer::create_index(&mut mzml_bytes_reader, None) {
+                    Ok(index) => index,
+                    Err(e) => {
+                        let error_message =
+                            message.to_error_message(IndexingError::IndexCreationError(e).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
 
-            match storage
-                .increase_total_spectrum_count(message.uuid(), index.get_spectra().len() as u64)
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    let error_message = message.to_error_message(e.into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
+                debug!("[{}] spec ctr {}", &message_id, index.get_spectra().len());
 
-            let relative_index_file_path =
-                get_ms_run_index_path(message.uuid(), message.ms_run_name());
-            let absolute_index_file_path = work_dir.join(&relative_index_file_path);
+                let relative_index_file_path = get_ms_run_index_path(message.uuid(), &ms_run_name);
+                let absolute_index_file_path = work_dir.join(&relative_index_file_path);
 
-            let index_json = match index.to_json() {
-                Ok(json) => json,
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(IndexingError::IndexToJsonError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
+                let index_json = match index.to_json() {
+                    Ok(json) => json,
+                    Err(e) => {
+                        let error_message =
+                            message.to_error_message(IndexingError::IndexToJsonError(e).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
 
-            match tokio::fs::write(&absolute_index_file_path, index_json).await {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(IndexingError::IndexWriteError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
+                match tokio::fs::write(&absolute_index_file_path, index_json).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        let error_message =
+                            message.to_error_message(IndexingError::IndexWriteError(e).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
 
-            let mut mzml_file =
-                match MzMlReader::read_pre_indexed(&mut mzml_bytes_reader, index, None, false) {
+                let mut mzml_file = match MzMlReader::read_pre_indexed(
+                    &mut mzml_bytes_reader,
+                    index,
+                    None,
+                    false,
+                ) {
                     Ok(reader) => reader,
                     Err(e) => {
                         let error_message = message
@@ -166,66 +158,77 @@ impl IndexingTask {
                     }
                 };
 
-            let spec_ids = mzml_file
-                .get_index()
-                .get_spectra()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
+                let spec_ids = mzml_file
+                    .get_index()
+                    .get_spectra()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
 
-            'spec_id_loop: for spec_id in spec_ids.into_iter() {
-                let spectrum = match mzml_file.get_spectrum(&spec_id) {
-                    Ok(spectrum) => spectrum,
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IndexingError::SpectrumReadError(spec_id.clone(), e).into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'spec_id_loop;
-                    }
-                };
-
-                if spectrum.get_ms_level() != Some(2) {
-                    match storage
-                        .increase_finished_spectrum_count(message.uuid())
-                        .await
-                    {
-                        Ok(_) => {
-                            trace!("[{}] 'skipping' non-MS2 spectrum {}", &message_id, &spec_id);
-                        }
+                'spec_id_loop: for spec_id in spec_ids.into_iter() {
+                    let spectrum = match mzml_file.get_spectrum(&spec_id) {
+                        Ok(spectrum) => spectrum,
                         Err(e) => {
-                            let error_message = message.to_error_message(e.into());
+                            let error_message = message.to_error_message(
+                                IndexingError::SpectrumReadError(spec_id.clone(), e).into(),
+                            );
                             error!("{}", &error_message);
                             Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                            continue 'spec_id_loop;
                         }
-                    }
-                    continue 'spec_id_loop;
-                }
+                    };
 
-                let mzml = {
-                    match mzml_file.extract_spectrum(&spec_id, true) {
-                        Ok(content) => content,
+                    if spectrum.get_ms_level() != Some(2) {
+                        continue 'spec_id_loop;
+                    }
+
+                    let mzml = {
+                        match mzml_file.extract_spectrum(&spec_id, true) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                let error_message = message.to_error_message(
+                                    IndexingError::SpectrumExtractionError(e).into(),
+                                );
+                                error!("{}", &error_message);
+                                Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                                continue 'message_loop;
+                            }
+                        }
+                    };
+
+                    // This increases the total spectrum count in the storage by one.
+                    // The speach space generation task will increase the count further if the spectrum
+                    // has multiple precursors or charge states.
+                    match storage.increase_total_spectrum_count(message.uuid()).await {
+                        Ok(_) => {}
                         Err(e) => {
-                            let error_message = message
-                                .to_error_message(IndexingError::SpectrumExtractionError(e).into());
+                            let error_message = message.to_error_message(e.into());
                             error!("{}", &error_message);
                             Self::enqueue_message(error_message, error_queue.as_ref()).await;
                             continue 'message_loop;
                         }
                     }
-                };
 
-                let search_space_generation_message =
-                    message.into_search_space_generation_message(spec_id, mzml);
+                    let search_space_generation_message = message
+                        .into_search_space_generation_message(ms_run_name.clone(), spec_id, mzml);
 
-                Self::enqueue_message(
-                    search_space_generation_message,
-                    search_space_generation_queue.as_ref(),
-                )
-                .await;
+                    Self::enqueue_message(
+                        search_space_generation_message,
+                        search_space_generation_queue.as_ref(),
+                    )
+                    .await;
+                }
             }
 
+            match storage.set_search_fully_enqueued(message.uuid()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let error_message = message.to_error_message(e.into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            }
             Self::ack_message(&message_id, indexing_queue.as_ref()).await;
             debug!("[{}] ack", &message_id);
             counter!(metrics_counter_name.clone()).increment(1);

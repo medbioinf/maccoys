@@ -119,6 +119,7 @@ impl IdentificationMessage {
             self.ms_run_name.clone(),
             self.spectrum_id.clone(),
             file_path,
+            false,
             content,
         )
     }
@@ -143,7 +144,7 @@ impl IsMessage for IdentificationMessage {
     fn to_error_message(&self, error: PipelineError) -> ErrorMessage {
         ErrorMessage::new(
             self.uuid.clone(),
-            self.ms_run_name.clone(),
+            Some(self.ms_run_name.clone()),
             Some(self.spectrum_id.clone()),
             Some(self.precursor),
             error,

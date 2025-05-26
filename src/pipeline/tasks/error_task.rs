@@ -21,7 +21,7 @@ use crate::pipeline::{
     queue::{PipelineQueue, RedisPipelineQueue},
     utils::{
         create_file_path_on_ms_run_level, create_file_path_on_precursor_level,
-        create_file_path_on_spectrum_level,
+        create_file_path_on_search_level, create_file_path_on_spectrum_level,
     },
 };
 
@@ -69,25 +69,33 @@ impl ErrorTask {
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
             // Create a file path depending on the level of the message
-            let relative_file_path =
-                if message.spectrum_id().is_some() && message.precursor().is_some() {
-                    create_file_path_on_precursor_level(
-                        message.uuid(),
-                        message.ms_run_name(),
-                        message.spectrum_id().as_ref().unwrap(),
-                        message.precursor().as_ref().unwrap(),
-                        "err",
-                    )
-                } else if message.spectrum_id().is_some() {
-                    create_file_path_on_spectrum_level(
-                        message.uuid(),
-                        message.ms_run_name(),
-                        message.spectrum_id().as_ref().unwrap(),
-                        "err",
-                    )
-                } else {
-                    create_file_path_on_ms_run_level(message.uuid(), message.ms_run_name(), "err")
-                };
+            let relative_file_path = if message.ms_run_name().is_some()
+                && message.spectrum_id().is_some()
+                && message.precursor().is_some()
+            {
+                create_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name().as_ref().unwrap(),
+                    message.spectrum_id().as_ref().unwrap(),
+                    message.precursor().as_ref().unwrap(),
+                    "err",
+                )
+            } else if message.ms_run_name().is_some() && message.spectrum_id().is_some() {
+                create_file_path_on_spectrum_level(
+                    message.uuid(),
+                    message.ms_run_name().as_ref().unwrap(),
+                    message.spectrum_id().as_ref().unwrap(),
+                    "err",
+                )
+            } else if message.ms_run_name().is_some() {
+                create_file_path_on_ms_run_level(
+                    message.uuid(),
+                    message.ms_run_name().as_ref().unwrap(),
+                    "err",
+                )
+            } else {
+                create_file_path_on_search_level(message.uuid(), "err")
+            };
 
             let absolute_file_path = work_dir.join(relative_file_path);
 

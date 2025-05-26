@@ -179,7 +179,7 @@ impl RemotePipelineWebApi {
         let mut search_params: Option<SearchParameters> = None;
         let mut comet_params: Option<CometConfiguration> = None;
         let mut ptms: Vec<PostTranslationalModification> = Vec::new();
-        let mut indexing_messages: Vec<IndexingMessage> = Vec::new();
+        let mut mzml_file_names: Vec<String> = Vec::new();
 
         while let Ok(Some(field)) = payload.next_field().await {
             let field_name = match field.name() {
@@ -200,8 +200,7 @@ impl RemotePipelineWebApi {
                 tokio::fs::create_dir_all(&mzml_path.parent().unwrap()).await?;
 
                 write_streamed_file(&mzml_path, field).await?;
-
-                indexing_messages.push(IndexingMessage::new(uuid.clone(), file_name));
+                mzml_file_names.push(file_name);
                 continue;
             }
 
@@ -263,7 +262,7 @@ impl RemotePipelineWebApi {
             );
         }
 
-        if indexing_messages.is_empty() {
+        if mzml_file_names.is_empty() {
             return Err(anyhow!("No mzML files uploaded").into());
         }
 
@@ -301,21 +300,19 @@ impl RemotePipelineWebApi {
             }
         }
 
-        // Start enqueuing manifest
-        for mut message in indexing_messages.into_iter() {
-            loop {
-                message = match state.index_queue.push(message).await {
-                    Ok(_) => break,
-                    Err((err, errored_message)) => match err {
-                        QueueError::QueueFullError => *errored_message,
-                        _ => {
-                            error!("{}", err);
-                            break;
-                        }
-                    },
-                };
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
+        let mut indexing_message = IndexingMessage::new(uuid.clone(), mzml_file_names);
+        loop {
+            indexing_message = match state.index_queue.push(indexing_message).await {
+                Ok(_) => break,
+                Err((err, errored_message)) => match err {
+                    QueueError::QueueFullError => *errored_message,
+                    _ => {
+                        error!("{}", err);
+                        break;
+                    }
+                },
+            };
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
         Ok((StatusCode::OK, uuid).into_response())

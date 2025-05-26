@@ -143,6 +143,8 @@ pub struct PipelineConfiguration {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStorageConfiguration {
+    /// Seconds after the last access to a flag after which is automatically removed.
+    pub time_to_idle: u64,
     pub redis_url: Option<String>,
 }
 
@@ -204,7 +206,10 @@ impl Default for PipelineConfiguration {
                 queue_capacity: 100,
                 redis_url: None,
             },
-            storage: PipelineStorageConfiguration { redis_url: None },
+            storage: PipelineStorageConfiguration {
+                time_to_idle: 86_400, // 24 hours
+                redis_url: None,
+            },
         }
     }
 }

@@ -30,4 +30,6 @@ pub enum SearchSpaceGenerationError {
     FastaGenerationError(anyhow::Error),
     #[error("Error when flushing FASTA:\n\t{0}")]
     FastaFlushError(std::io::Error),
+    #[error("Could not increased total spectrum count:\n\t{0}")]
+    IncreaseTotalSpectrumCountError(StorageError),
 }

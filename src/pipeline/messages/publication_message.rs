@@ -20,6 +20,8 @@ pub struct PublicationMessage {
     spectrum_id: String,
     /// Relative target file path
     file_path: PathBuf,
+    /// If true the spectrum count is updated in the storage
+    update_spectrum_count: bool,
     /// File content
     content: Vec<u8>,
 }
@@ -32,6 +34,7 @@ impl PublicationMessage {
         ms_run_name: String,
         spectrum_id: String,
         file_path: PathBuf,
+        update_spectrum_count: bool,
         content: Vec<u8>,
     ) -> Self {
         Self {
@@ -39,6 +42,7 @@ impl PublicationMessage {
             ms_run_name,
             spectrum_id,
             file_path,
+            update_spectrum_count,
             content,
         }
     }
@@ -66,6 +70,12 @@ impl PublicationMessage {
         &self.file_path
     }
 
+    /// Is the publication successful
+    ///
+    pub fn update_spectrum_count(&self) -> bool {
+        self.update_spectrum_count
+    }
+
     /// Get the target file content
     ///
     pub fn content(&self) -> &Vec<u8> {
@@ -83,7 +93,7 @@ impl IsMessage for PublicationMessage {
     fn to_error_message(&self, error: PipelineError) -> ErrorMessage {
         ErrorMessage::new(
             self.uuid.clone(),
-            self.ms_run_name.clone(),
+            Some(self.ms_run_name.clone()),
             Some(self.spectrum_id.clone()),
             None,
             error,

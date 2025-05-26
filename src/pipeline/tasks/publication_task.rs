@@ -97,6 +97,21 @@ impl PublicationTask {
                 }
             }
 
+            if message.update_spectrum_count() {
+                match storage
+                    .increase_finished_spectrum_count(message.uuid())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let error_message = message.to_error_message(e.into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                }
+            }
+
             Self::ack_message(&message_id, publication_queue.as_ref()).await;
 
             let is_search_finished = match storage.is_search_finished(message.uuid()).await {

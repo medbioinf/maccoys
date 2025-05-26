@@ -13,7 +13,7 @@ pub struct ErrorMessage {
     /// Search uuid
     uuid: String,
     /// MS run
-    ms_run_name: String,
+    ms_run_name: Option<String>,
     /// spectrum id
     spectrum_id: Option<String>,
     /// Precursor (m/z, charge)
@@ -25,7 +25,7 @@ pub struct ErrorMessage {
 impl ErrorMessage {
     pub fn new(
         uuid: String,
-        ms_run_name: String,
+        ms_run_name: Option<String>,
         spectrum_id: Option<String>,
         precursor: Option<(f64, u8)>,
         error: PipelineError,
@@ -48,7 +48,7 @@ impl ErrorMessage {
 
     /// Get the MS run name
     ///
-    pub fn ms_run_name(&self) -> &String {
+    pub fn ms_run_name(&self) -> &Option<String> {
         &self.ms_run_name
     }
 
@@ -88,7 +88,7 @@ impl IsMessage for ErrorMessage {
             "{}_{}_{}_{}_{}_{}",
             ID_PREFIX,
             self.uuid,
-            self.ms_run_name,
+            self.ms_run_name.as_deref().unwrap_or(""),
             self.spectrum_id.as_deref().unwrap_or(""),
             self.precursor
                 .map(|(mz, charge)| format!("{}_{}", mz, charge))
@@ -100,7 +100,10 @@ impl IsMessage for ErrorMessage {
 
 impl Display for ErrorMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut location = format!("{} / {}", &self.uuid, &self.ms_run_name);
+        let mut location = self.uuid.clone();
+        if let Some(ms_run) = &self.ms_run_name {
+            location.push_str(&format!(" / {}", ms_run));
+        }
         if let Some(spectrum_id) = &self.spectrum_id {
             location.push_str(&format!(" / {}", spectrum_id));
         }
