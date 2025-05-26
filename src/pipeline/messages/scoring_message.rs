@@ -76,10 +76,10 @@ impl ScoringMessage {
         &self.psms
     }
 
-    /// Takes the PSMs out of the message and replaces them with an empty DataFrame
+    /// get PSMs mutable
     ///
-    pub fn take_psms(&mut self) -> DataFrame {
-        std::mem::take(&mut self.psms)
+    pub fn psms_mut(&mut self) -> &mut DataFrame {
+        &mut self.psms
     }
 
     /// Get the PSMs as a CSV
@@ -87,9 +87,8 @@ impl ScoringMessage {
     /// # Arguments
     /// * `file_path` - The relative path to the file to write content to
     pub fn into_publication_message(
-        self,
+        mut self,
         file_path: PathBuf,
-        mut psms: DataFrame,
     ) -> Result<PublicationMessage, Box<IntoPublicationMessageError>> {
         // Lets assume the CSV has roughly the same size as the PSMs dataframe
         let mut content: Vec<u8> =
@@ -98,7 +97,7 @@ impl ScoringMessage {
         CsvWriter::new(&mut content)
             .include_header(true)
             .with_separator(COMET_SEPARATOR.as_bytes()[0])
-            .finish(&mut psms)
+            .finish(&mut self.psms)
             .unwrap();
 
         Ok(PublicationMessage::new(

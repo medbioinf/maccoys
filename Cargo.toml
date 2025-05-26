@@ -33,6 +33,7 @@ futures = "0.3.28"
 glob = "0.3.1"
 indicatif = "0.17.7"
 lazy_static = "1.4.0"
+local-outlier-probabilities = "1.0.1"
 lzma-rs = "0.3.0"
 macpepdb = { git = "https://github.com/medbioinf/macpepdb.git", rev = "b42e6424f342384bdb1e2e12fdf4815c7badfce0" }
 maccoys-exchange-entities = { path = "../maccoys-web-entities" }
@@ -42,10 +43,11 @@ polars = { version = "0.46.0", features = [
     "abs",
     "csv",
     "cum_agg",
+    "json",
     "lazy",
+    "ndarray",
     "strings",
     "serde",
-    "json",
 ] }
 pyo3 = { version = "0.23.3", features = ["auto-initialize"] }
 rand = "0.8.5"
@@ -79,4 +81,3 @@ metrics-exporter-prometheus = { version = "0.16.2", features = [
 thiserror = "2.0.12"
 gethostname = "1.0.2"
 murmur3 = "0.5.2"
-pyo3-polars = "0.20.0"
