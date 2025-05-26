@@ -1,5 +1,4 @@
 use std::{
-    marker::PhantomData,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,11 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
-use tokio::{
-    fs::{create_dir_all, remove_dir_all},
-    time::sleep,
-};
-use tracing::{error, info, trace};
+use tokio::{fs::create_dir_all, time::sleep};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -33,7 +29,7 @@ use crate::{
 };
 
 use super::{
-    configuration::PipelineConfiguration,
+    configuration::{PipelineConfiguration, SearchParameters},
     messages::{
         error_message::ErrorMessage, identification_message::IdentificationMessage,
         indexing_message::IndexingMessage, publication_message::PublicationMessage,
@@ -67,13 +63,30 @@ where
     EQ: PipelineQueue<ErrorMessage> + 'static,
     S: PipelineStorage + 'static,
 {
-    _indexing_queue_phantom: PhantomData<IQ>,
-    _search_space_generation_queue_phantom: PhantomData<SQ>,
-    _identification_queue_phantom: PhantomData<CQ>,
-    _scoring_queue_phantom: PhantomData<GQ>,
-    _publication_queue_phantom: PhantomData<PQ>,
-    _error_queue_phantom: PhantomData<EQ>,
-    _storage_phantom: PhantomData<S>,
+    result_dir: PathBuf,
+    tmp_dir: PathBuf,
+
+    indexing_queue: Arc<IQ>,
+    _search_space_generation_queue: Arc<SQ>,
+    _identification_queue: Arc<CQ>,
+    _scoring_queue: Arc<GQ>,
+    _publication_queue: Arc<PQ>,
+    _error_queue: Arc<EQ>,
+    storage: Arc<S>,
+
+    index_stop_flag: Arc<AtomicBool>,
+    search_space_generation_stop_flag: Arc<AtomicBool>,
+    identification_stop_flag: Arc<AtomicBool>,
+    scoring_stop_flag: Arc<AtomicBool>,
+    publication_stop_flag: Arc<AtomicBool>,
+    error_stop_flag: Arc<AtomicBool>,
+
+    indexing_tasks: Vec<tokio::task::JoinHandle<()>>,
+    search_space_generation_tasks: Vec<tokio::task::JoinHandle<()>>,
+    identification_tasks: Vec<tokio::task::JoinHandle<()>>,
+    scoring_tasks: Vec<tokio::task::JoinHandle<()>>,
+    publication_tasks: Vec<tokio::task::JoinHandle<()>>,
+    error_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl<IQ, SQ, CQ, GQ, PQ, EQ, S> LocalPipeline<IQ, SQ, CQ, GQ, PQ, EQ, S>
@@ -86,6 +99,144 @@ where
     EQ: PipelineQueue<ErrorMessage> + 'static,
     S: PipelineStorage + 'static,
 {
+    pub async fn new(
+        result_dir: PathBuf,
+        tmp_dir: PathBuf,
+        config: PipelineConfiguration,
+    ) -> Result<Self> {
+        create_dir_all(&result_dir)
+            .await
+            .context("Could not create result directory")?;
+        create_dir_all(&tmp_dir)
+            .await
+            .context("Could not create temporery directory")?;
+
+        // Create the queues
+        let indexing_queue = Arc::new(IQ::new(&config.index).await?);
+        let search_space_generation_queue =
+            Arc::new(SQ::new(&config.search_space_generation).await?);
+        let identification_queue = Arc::new(CQ::new(&config.identification).await?);
+        let scoring_queue = Arc::new(GQ::new(&config.scoring).await?);
+        let publication_queue = Arc::new(PQ::new(&config.publication).await?);
+        let error_queue = Arc::new(EQ::new(&config.error).await?);
+
+        // Create the storage
+        let storage = Arc::new(S::new(&config.storage).await?);
+
+        let index_stop_flag = Arc::new(AtomicBool::new(false));
+        let search_space_generation_stop_flag = Arc::new(AtomicBool::new(false));
+        let identification_stop_flag = Arc::new(AtomicBool::new(false));
+        let scoring_stop_flag = Arc::new(AtomicBool::new(false));
+        let publication_stop_flag = Arc::new(AtomicBool::new(false));
+        let error_stop_flag = Arc::new(AtomicBool::new(false));
+
+        let indexing_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.index.num_tasks)
+            .map(|_| {
+                tokio::spawn(IndexingTask::start(
+                    result_dir.clone(),
+                    indexing_queue.clone(),
+                    search_space_generation_queue.clone(),
+                    error_queue.clone(),
+                    storage.clone(),
+                    index_stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        let search_space_generation_tasks: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.search_space_generation.num_tasks)
+                .map(|_| {
+                    tokio::spawn(SearchSpaceGenerationTask::start(
+                        Arc::new(config.search_space_generation.clone()),
+                        storage.clone(),
+                        search_space_generation_queue.clone(),
+                        identification_queue.clone(),
+                        error_queue.clone(),
+                        search_space_generation_stop_flag.clone(),
+                    ))
+                })
+                .collect();
+
+        let identification_tasks: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.identification.num_tasks)
+                .map(|comet_proc_idx| {
+                    let comet_tmp_dir = tmp_dir.join(format!("comet_{}", comet_proc_idx));
+                    tokio::spawn(IdentificationTask::start(
+                        comet_tmp_dir,
+                        Arc::new(config.identification.clone()),
+                        storage.clone(),
+                        identification_queue.clone(),
+                        scoring_queue.clone(),
+                        publication_queue.clone(),
+                        error_queue.clone(),
+                        identification_stop_flag.clone(),
+                    ))
+                })
+                .collect();
+
+        let scoring_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.scoring.num_tasks)
+            .map(|_| {
+                tokio::spawn(ScoringTask::start(
+                    scoring_queue.clone(),
+                    publication_queue.clone(),
+                    error_queue.clone(),
+                    scoring_stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        let publication_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.publication.num_tasks)
+            .map(|_| {
+                tokio::spawn(PublicationTask::start(
+                    result_dir.clone(),
+                    publication_queue.clone(),
+                    error_queue.clone(),
+                    storage.clone(),
+                    publication_stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        let error_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.error.num_tasks)
+            .map(|_| {
+                tokio::spawn(ErrorTask::start(
+                    result_dir.clone(),
+                    error_queue.clone(),
+                    error_stop_flag.clone(),
+                ))
+            })
+            .collect();
+
+        Ok(LocalPipeline {
+            // Paths
+            result_dir,
+            tmp_dir,
+            // Queues
+            indexing_queue,
+            _search_space_generation_queue: search_space_generation_queue,
+            _identification_queue: identification_queue,
+            _scoring_queue: scoring_queue,
+            _publication_queue: publication_queue,
+            _error_queue: error_queue,
+            // Storage
+            storage,
+            // Flags
+            index_stop_flag,
+            search_space_generation_stop_flag,
+            identification_stop_flag,
+            scoring_stop_flag,
+            publication_stop_flag,
+            error_stop_flag,
+            // Tasks
+            indexing_tasks,
+            search_space_generation_tasks,
+            identification_tasks,
+            scoring_tasks,
+            publication_tasks,
+            error_tasks,
+        })
+    }
+
     /// Run the pipeline locally for each mzML file
     ///
     /// # Arguments
@@ -97,9 +248,8 @@ where
     /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
     pub async fn run(
-        result_dir: PathBuf,
-        tmp_dir: PathBuf,
-        config: PipelineConfiguration,
+        &self,
+        search_params: SearchParameters,
         mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
         mzml_file_paths: Vec<PathBuf>,
@@ -108,44 +258,14 @@ where
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
 
-        create_dir_all(&result_dir)
-            .await
-            .context("Could not create result directory")?;
-        create_dir_all(&tmp_dir)
-            .await
-            .context("Could not create temporery directory")?;
-
-        comet_config.set_ptms(&ptms, config.search_parameters.max_variable_modifications)?;
+        comet_config.set_ptms(&ptms, search_params.max_variable_modifications)?;
         comet_config.set_num_results(10000)?;
 
-        let storage = S::new(&config.storage).await?;
-        storage
-            .init_search(
-                &uuid,
-                config.search_parameters.clone(),
-                &ptms,
-                &comet_config,
-            )
+        self.storage
+            .init_search(&uuid, search_params.clone(), &ptms, &comet_config)
             .await?;
 
-        let storage = Arc::new(storage);
-
-        // Create the queues
-        let indexing_queue = Arc::new(IQ::new(&config.index).await?);
-        let search_space_generation_queue =
-            Arc::new(SQ::new(&config.search_space_generation).await?);
-        let identification_queue = Arc::new(CQ::new(&config.identification).await?);
-        let scoring_queue = Arc::new(GQ::new(&config.scoring).await?);
-        let publication_queue = Arc::new(PQ::new(&config.publication).await?);
-        let error_queue = Arc::new(EQ::new(&config.error).await?);
-
         // Create the stop flags
-        let index_stop_flag = Arc::new(AtomicBool::new(false));
-        let search_space_generation_stop_flag = Arc::new(AtomicBool::new(false));
-        let identification_stop_flag = Arc::new(AtomicBool::new(false));
-        let scoring_stop_flag = Arc::new(AtomicBool::new(false));
-        let publication_stop_flag = Arc::new(AtomicBool::new(false));
-        let error_stop_flag = Arc::new(AtomicBool::new(false));
 
         let mut metrics_monitor: Option<MetricsMonitor> = None;
         if let Some(metrics_scrape_url) = metrics_scrape_url {
@@ -183,82 +303,6 @@ where
             )?);
         }
 
-        let indexing_handler: tokio::task::JoinHandle<()> = {
-            tokio::spawn(IndexingTask::start(
-                result_dir.clone(),
-                indexing_queue.clone(),
-                search_space_generation_queue.clone(),
-                error_queue.clone(),
-                storage.clone(),
-                index_stop_flag.clone(),
-            ))
-        };
-
-        let search_space_generation_handlers: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.search_space_generation.num_tasks)
-                .map(|_| {
-                    tokio::spawn(SearchSpaceGenerationTask::start(
-                        Arc::new(config.search_space_generation.clone()),
-                        storage.clone(),
-                        search_space_generation_queue.clone(),
-                        identification_queue.clone(),
-                        error_queue.clone(),
-                        search_space_generation_stop_flag.clone(),
-                    ))
-                })
-                .collect();
-
-        let identification_handler: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.identification.num_tasks)
-                .map(|comet_proc_idx| {
-                    let comet_tmp_dir = tmp_dir.join(format!("comet_{}", comet_proc_idx));
-                    tokio::spawn(IdentificationTask::start(
-                        comet_tmp_dir,
-                        Arc::new(config.identification.clone()),
-                        storage.clone(),
-                        identification_queue.clone(),
-                        scoring_queue.clone(),
-                        publication_queue.clone(),
-                        error_queue.clone(),
-                        identification_stop_flag.clone(),
-                    ))
-                })
-                .collect();
-
-        let scoring_handler: Vec<tokio::task::JoinHandle<()>> = (0..config.scoring.num_tasks)
-            .map(|_| {
-                tokio::spawn(ScoringTask::start(
-                    scoring_queue.clone(),
-                    publication_queue.clone(),
-                    error_queue.clone(),
-                    scoring_stop_flag.clone(),
-                ))
-            })
-            .collect();
-
-        let publication_handler: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.publication.num_tasks)
-                .map(|_| {
-                    tokio::spawn(PublicationTask::start(
-                        result_dir.clone(),
-                        publication_queue.clone(),
-                        error_queue.clone(),
-                        storage.clone(),
-                        publication_stop_flag.clone(),
-                    ))
-                })
-                .collect();
-
-        let error_handler: Vec<tokio::task::JoinHandle<()>> = (0..config.error.num_tasks)
-            .map(|_| {
-                tokio::spawn(ErrorTask::start(
-                    result_dir.clone(),
-                    error_queue.clone(),
-                    error_stop_flag.clone(),
-                ))
-            })
-            .collect();
-
         for mzml_file_path in mzml_file_paths {
             let mzml_file_name = mzml_file_path
                 .file_name()
@@ -269,7 +313,7 @@ where
 
             let relative_mzml_file_path =
                 create_file_path_on_ms_run_level(&uuid, &mzml_file_name, "mzML");
-            let absolute_mzml_file_path = result_dir.join(&relative_mzml_file_path);
+            let absolute_mzml_file_path = self.result_dir.join(&relative_mzml_file_path);
             tokio::fs::create_dir_all(absolute_mzml_file_path.parent().unwrap()).await?;
             tokio::fs::copy(&mzml_file_path, &absolute_mzml_file_path).await?;
 
@@ -277,8 +321,11 @@ where
                 IndexingMessage::new(uuid.clone(), mzml_file_name);
 
             loop {
-                indexing_message = match indexing_queue.push(indexing_message).await {
-                    Ok(_) => break,
+                indexing_message = match self.indexing_queue.push(indexing_message).await {
+                    Ok(_) => {
+                        debug!("Sucessfully pushed indexing message");
+                        break;
+                    }
                     Err((err, errored_message)) => match err {
                         QueueError::QueueFullError => *errored_message,
                         _ => {
@@ -290,97 +337,81 @@ where
             }
         }
 
+        info!("Indexing scheduled wait 5s for the indexing to start");
+
         // Wait a couple of seconds for the indexing to start
         sleep(Duration::from_millis(5000)).await;
 
         loop {
-            if storage.get_finished_spectrum_count(&uuid).await?
-                == storage.get_total_spectrum_count(&uuid).await?
-            {
-                trace!(
-                    "Finished indexing {} spectra out of {}",
-                    storage.get_finished_spectrum_count(&uuid).await?,
-                    storage.get_total_spectrum_count(&uuid).await?
-                );
+            info!(
+                "Finished indexing {} spectra out of {}",
+                self.storage.get_finished_spectrum_count(&uuid).await?,
+                self.storage.get_total_spectrum_count(&uuid).await?
+            );
+            if self.storage.is_search_finished(&uuid).await? {
                 break;
             }
             sleep(Duration::from_millis(100)).await;
-        }
-
-        index_stop_flag.store(true, Ordering::Relaxed);
-
-        match indexing_handler.await {
-            Ok(_) => (),
-            Err(e) => {
-                error!("Error joining index thread: {:?}", e);
-            }
-        }
-
-        search_space_generation_stop_flag.store(true, Ordering::Relaxed);
-
-        for search_space_generation_handler in search_space_generation_handlers {
-            match search_space_generation_handler.await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error joining search space generation thread: {:?}", e);
-                }
-            }
-        }
-
-        identification_stop_flag.store(true, Ordering::Relaxed);
-
-        for identification_handler in identification_handler {
-            match identification_handler.await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error identification thread: {:?}", e);
-                }
-            }
-        }
-
-        scoring_stop_flag.store(true, Ordering::Relaxed);
-
-        for goodness_and_resconfing_handler in scoring_handler {
-            match goodness_and_resconfing_handler.await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error joining scoring thread: {:?}", e);
-                }
-            }
-        }
-
-        publication_stop_flag.store(true, Ordering::Relaxed);
-
-        for publication_handler in publication_handler {
-            match publication_handler.await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error joining publication thread: {:?}", e);
-                }
-            }
-        }
-
-        error_stop_flag.store(true, Ordering::Relaxed);
-
-        for error_handler in error_handler {
-            match error_handler.await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error joining error thread: {:?}", e);
-                }
-            }
         }
 
         if let Some(mut metrics_monitor) = metrics_monitor {
             metrics_monitor.stop().await?;
         }
 
-        storage.cleanup_search(&uuid).await?;
-
-        remove_dir_all(&tmp_dir)
-            .await
-            .context("Could not delete temporary directory")?;
-
         Ok(())
+    }
+}
+
+impl<IQ, SQ, CQ, GQ, PQ, EQ, S> Drop for LocalPipeline<IQ, SQ, CQ, GQ, PQ, EQ, S>
+where
+    IQ: PipelineQueue<IndexingMessage> + 'static,
+    SQ: PipelineQueue<SearchSpaceGenerationMessage> + 'static,
+    CQ: PipelineQueue<IdentificationMessage> + 'static,
+    GQ: PipelineQueue<ScoringMessage> + 'static,
+    PQ: PipelineQueue<PublicationMessage> + 'static,
+    EQ: PipelineQueue<ErrorMessage> + 'static,
+    S: PipelineStorage + 'static,
+{
+    fn drop(&mut self) {
+        self.index_stop_flag.store(true, Ordering::Relaxed);
+        self.search_space_generation_stop_flag
+            .store(true, Ordering::Relaxed);
+        self.identification_stop_flag.store(true, Ordering::Relaxed);
+        self.scoring_stop_flag.store(true, Ordering::Relaxed);
+        self.publication_stop_flag.store(true, Ordering::Relaxed);
+        self.error_stop_flag.store(true, Ordering::Relaxed);
+
+        for indexing_task in &self.indexing_tasks {
+            indexing_task.abort();
+        }
+
+        for search_space_generation_task in &self.search_space_generation_tasks {
+            search_space_generation_task.abort();
+        }
+
+        for identification_task in &self.identification_tasks {
+            identification_task.abort();
+        }
+
+        for scoring_task in &self.scoring_tasks {
+            scoring_task.abort();
+        }
+
+        for publication_task in &self.publication_tasks {
+            publication_task.abort();
+        }
+
+        for error_task in &self.error_tasks {
+            error_task.abort();
+        }
+
+        match std::fs::remove_dir_all(&self.tmp_dir) {
+            Ok(_) => {
+                info!("Removed temporary directory");
+            }
+            Err(err) => {
+                error!("Could not remove temporary directory: {}", err);
+            }
+        }
     }
 }

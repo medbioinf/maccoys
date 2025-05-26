@@ -623,9 +623,11 @@ async fn main() -> Result<()> {
                     .as_ref()
                     .map(|address| format!("http://{}/metrics", address));
 
+                let search_params = config.search_parameters.clone();
+
                 if !use_redis {
                     info!("Running local pipeline");
-                    LocalPipeline::<
+                    let pipeline = LocalPipeline::<
                         LocalPipelineQueue<IndexingMessage>,
                         LocalPipelineQueue<SearchSpaceGenerationMessage>,
                         LocalPipelineQueue<IdentificationMessage>,
@@ -633,19 +635,21 @@ async fn main() -> Result<()> {
                         LocalPipelineQueue<PublicationMessage>,
                         LocalPipelineQueue<ErrorMessage>,
                         LocalPipelineStorage,
-                    >::run(
-                        result_dir,
-                        tmp_dir,
-                        config,
-                        comet_config,
-                        ptms,
-                        mzml_file_paths,
-                        scrape_endpoint,
-                    )
+                    >::new(result_dir, tmp_dir, config)
                     .await?;
+
+                    pipeline
+                        .run(
+                            search_params,
+                            comet_config,
+                            ptms,
+                            mzml_file_paths,
+                            scrape_endpoint,
+                        )
+                        .await?;
                 } else {
                     info!("Running redis pipeline");
-                    LocalPipeline::<
+                    let pipeline = LocalPipeline::<
                         RedisPipelineQueue<IndexingMessage>,
                         RedisPipelineQueue<SearchSpaceGenerationMessage>,
                         RedisPipelineQueue<IdentificationMessage>,
@@ -653,16 +657,18 @@ async fn main() -> Result<()> {
                         RedisPipelineQueue<PublicationMessage>,
                         RedisPipelineQueue<ErrorMessage>,
                         RedisPipelineStorage,
-                    >::run(
-                        result_dir,
-                        tmp_dir,
-                        config,
-                        comet_config,
-                        ptms,
-                        mzml_file_paths,
-                        scrape_endpoint,
-                    )
+                    >::new(result_dir, tmp_dir, config)
                     .await?;
+
+                    pipeline
+                        .run(
+                            search_params,
+                            comet_config,
+                            ptms,
+                            mzml_file_paths,
+                            scrape_endpoint,
+                        )
+                        .await?;
                 }
             }
             PipelineCommand::RemoteRun {
