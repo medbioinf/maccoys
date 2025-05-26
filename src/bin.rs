@@ -360,7 +360,8 @@ async fn main() -> Result<()> {
         .add_directive("scylla=error".parse().unwrap())
         .add_directive("tokio_postgres=error".parse().unwrap())
         .add_directive("hyper=error".parse().unwrap())
-        .add_directive("reqwest=error".parse().unwrap());
+        .add_directive("reqwest=error".parse().unwrap())
+        .add_directive("rustis=error".parse().unwrap());
 
     // Tracing layers
     let mut tracing_indicatif_layer = None;
