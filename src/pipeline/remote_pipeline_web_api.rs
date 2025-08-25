@@ -115,10 +115,10 @@ impl RemotePipelineWebApi {
         let index_queue = RedisPipelineQueue::new(&config.index).await?;
         let search_space_generation_queue =
             RedisPipelineQueue::new(&config.search_space_generation).await?;
-        let identification_queue = RedisPipelineQueue::new(&config.comet_search).await?;
-        let scoring_queue = RedisPipelineQueue::new(&config.goodness_and_rescoring).await?;
-        let publication_queue = RedisPipelineQueue::new(&config.cleanup).await?;
-        let error_queue = RedisPipelineQueue::new(&config.cleanup).await?;
+        let identification_queue = RedisPipelineQueue::new(&config.identification).await?;
+        let scoring_queue = RedisPipelineQueue::new(&config.scoring).await?;
+        let publication_queue = RedisPipelineQueue::new(&config.publication).await?;
+        let error_queue = RedisPipelineQueue::new(&config.error).await?;
         let storage = RwLock::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let state: Arc<EntrypointServiceState> = Arc::new(EntrypointServiceState {

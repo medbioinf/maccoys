@@ -218,18 +218,20 @@ impl Default for PipelineConfiguration {
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct RemoteEntypointConfiguration {
+    /// Search parameters
+    pub search_parameters: SearchParameters,
     /// Index task configuration
     pub index: TaskConfiguration,
-    /// Preparation task configuration
-    pub preparation: TaskConfiguration,
     /// Search space generation task configuration
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
-    /// Comet search task configuration
-    pub comet_search: IdentificationTaskConfiguration,
-    /// Goodness and rescoring task configuration
-    pub goodness_and_rescoring: TaskConfiguration,
-    /// Cleanup task configuration
-    pub cleanup: TaskConfiguration,
+    /// Identification task configuration
+    pub identification: IdentificationTaskConfiguration,
+    /// scoring task configuration
+    pub scoring: TaskConfiguration,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
     /// Promtheus base URL
