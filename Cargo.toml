@@ -8,6 +8,7 @@ repository = "https://github.com/medbioinf/maccoys"
 homepage = "https://github.com/medbioinf/maccoys"
 documentation = "https://github.com/medbioinf/maccoys"
 license-file = "../LICENSE"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
