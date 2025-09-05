@@ -8,20 +8,27 @@ use std::{
     },
 };
 
-use dihardts_omicstools::proteomics::io::mzml::{indexer::Indexer, reader::Reader as MzMlReader};
+use dihardts_omicstools::proteomics::io::mzml::{
+    elements::{has_cv_params::HasCvParams, is_list::IsList},
+    indexer::Indexer,
+    reader::Reader as MzMlReader,
+};
 use metrics::counter;
 use tracing::{debug, error};
 
-use crate::pipeline::{
-    configuration::StandaloneIndexingConfiguration,
-    errors::{indexing_error::IndexingError, pipeline_error::PipelineError},
-    messages::{
-        error_message::ErrorMessage, indexing_message::IndexingMessage, is_message::IsMessage,
-        search_space_generation_message::SearchSpaceGenerationMessage,
+use crate::{
+    pipeline::{
+        configuration::StandaloneIndexingConfiguration,
+        errors::{indexing_error::IndexingError, pipeline_error::PipelineError},
+        messages::{
+            error_message::ErrorMessage, indexing_message::IndexingMessage, is_message::IsMessage,
+            search_space_generation_message::SearchSpaceGenerationMessage,
+        },
+        queue::{PipelineQueue, RedisPipelineQueue},
+        storage::{PipelineStorage, RedisPipelineStorage},
+        utils::{get_ms_run_index_path, get_ms_run_mzml_path},
     },
-    queue::{PipelineQueue, RedisPipelineQueue},
-    storage::{PipelineStorage, RedisPipelineStorage},
-    utils::{get_ms_run_index_path, get_ms_run_mzml_path},
+    precursor::Precursor,
 };
 
 use super::task::Task;
@@ -85,6 +92,25 @@ impl IndexingTask {
                     continue 'message_loop;
                 }
             };
+
+            let search_params = match storage.get_search_parameters(message.uuid()).await {
+                Ok(Some(params)) => params,
+                Ok(None) => {
+                    let error_message = message
+                        .to_error_message(IndexingError::SearchParametersNotFoundError().into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(IndexingError::GetSearchParametersError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            };
+
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
             let ms_run_names = message.ms_run_names().clone();
@@ -182,20 +208,6 @@ impl IndexingTask {
                         continue 'spec_id_loop;
                     }
 
-                    let mzml = {
-                        match mzml_file.extract_spectrum(&spec_id, true) {
-                            Ok(content) => content,
-                            Err(e) => {
-                                let error_message = message.to_error_message(
-                                    IndexingError::SpectrumExtractionError(e).into(),
-                                );
-                                error!("{}", &error_message);
-                                Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                                continue 'message_loop;
-                            }
-                        }
-                    };
-
                     // This increases the total spectrum count in the storage by one.
                     // The speach space generation task will increase the count further if the spectrum
                     // has multiple precursors or charge states.
@@ -209,8 +221,112 @@ impl IndexingTask {
                         }
                     }
 
-                    let search_space_generation_message = message
-                        .into_search_space_generation_message(ms_run_name.clone(), spec_id, mzml);
+                    // Collecting precursors (mz, charge)
+                    let precursors = match spectrum.precursor_list.as_ref() {
+                        Some(list) => list.iter().collect::<Vec<_>>(),
+                        None => {
+                            let error_message = message.to_error_message(
+                                IndexingError::NoPrecursorListError(spec_id).into(),
+                            );
+                            error!("{}", &error_message);
+                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                            continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
+                        }
+                    };
+
+                    let ions = precursors
+                        .iter()
+                        .flat_map(|precursor| match precursor.selected_ion_list.as_ref() {
+                            Some(list) => list.iter().collect::<Vec<_>>(),
+                            None => vec![],
+                        })
+                        .collect::<Vec<_>>();
+
+                    if ions.is_empty() {
+                        let error_message = message
+                            .to_error_message(IndexingError::NoSelectedIonError(spec_id).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
+                    };
+
+                    let precursors_result: Result<Vec<Vec<Precursor>>, IndexingError> = ions
+                        .iter()
+                        .map(|ion| {
+                            let mz: f64 = ion
+                                .get_cv_param("MS:1000744")
+                                .first()
+                                .ok_or_else(|| {
+                                    IndexingError::MissingSelectedIonMzError(spec_id.clone())
+                                })?
+                                .value
+                                .parse()
+                                .map_err(|err| {
+                                    IndexingError::MzParsingError(spec_id.clone(), err)
+                                })?;
+                            // Select charge states statess
+                            let mut charge_cv_params = ion.get_cv_param("MS:1000041");
+                            // add possible charge states
+                            charge_cv_params.extend(ion.get_cv_param("MS:1000633"));
+
+                            let charges: Vec<u8> = if !charge_cv_params.is_empty() {
+                                charge_cv_params
+                                    .into_iter()
+                                    .map(|x| {
+                                        x.value.parse().map_err(|err| {
+                                            IndexingError::ChargeParsingError(spec_id.clone(), err)
+                                        })
+                                    })
+                                    .collect::<Result<Vec<u8>, IndexingError>>()?
+                            } else {
+                                (2..=search_params.max_charge).collect()
+                            };
+
+                            Ok::<_, IndexingError>(
+                                charges
+                                    .into_iter()
+                                    .map(|charge| Precursor::new(mz, charge))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect();
+
+                    // Check if everything was ok
+                    let precursors = match precursors_result {
+                        Ok(precursors) => precursors,
+                        Err(e) => {
+                            let error_message = message.to_error_message(e.into());
+                            error!("{}", &error_message);
+                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                            continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
+                        }
+                    };
+
+                    let precursors = precursors.into_iter().flatten().collect::<Vec<_>>();
+
+                    if precursors.is_empty() {
+                        let error_message = message
+                            .to_error_message(IndexingError::NoSelectedIonError(spec_id).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
+                    }
+
+                    let search_space_generation_message = match message
+                        .into_search_space_generation_message(
+                            ms_run_name.clone(),
+                            spec_id,
+                            spectrum,
+                            precursors,
+                        ) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            let error_message = message.to_error_message(e.into());
+                            error!("{}", &error_message);
+                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                            continue 'message_loop;
+                        }
+                    };
 
                     Self::enqueue_message(
                         search_space_generation_message,

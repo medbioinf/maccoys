@@ -12,8 +12,6 @@ use futures::Future;
 use mini_moka::sync::Cache;
 use rustis::commands::{GenericCommands, StringCommands};
 
-use crate::io::comet::configuration::Configuration as CometConfiguration;
-
 use super::{
     configuration::{PipelineStorageConfiguration, SearchParameters},
     errors::storage_error::{LocalStorageError, RedisStorageError, StorageError},
@@ -78,38 +76,12 @@ pub trait PipelineStorage: Send + Sync + Sized {
     ///
     fn remove_ptms(&self, uuid: &str) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Get comet config
-    ///
-    fn get_comet_config(
-        &self,
-        uuid: &str,
-    ) -> impl Future<Output = Result<Option<CometConfiguration>, StorageError>> + Send;
-
-    /// Set comet config
-    ///
-    fn set_comet_config(
-        &self,
-        uuid: &str,
-        config: &CometConfiguration,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    /// Remove comet config
-    ///
-    fn remove_comet_config(
-        &self,
-        uuid: &str,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
     fn get_search_parameters_key(uuid: &str) -> String {
         format!("search_parameter:{}", uuid)
     }
 
     fn get_ptms_key(uuid: &str) -> String {
         format!("ptms:{}", uuid)
-    }
-
-    fn get_comet_config_key(uuid: &str) -> String {
-        format!("comet_config:{}", uuid)
     }
 
     /// Get the total search count key
@@ -135,20 +107,18 @@ pub trait PipelineStorage: Send + Sync + Sized {
     /// * `uuid` - UUID for the counters
     /// * `search_parameters` - Search parameters
     /// * `ptms` - Post translational modifications
-    /// * `comet_config` - Comet configuration
+    /// * `xcorr_config` - Comet configuration
     ///
     fn init_search(
         &self,
         uuid: &str,
         search_parameters: SearchParameters,
         ptms: &[PostTranslationalModification],
-        comet_config: &CometConfiguration,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async {
             // Set configs
             self.set_search_parameters(uuid, search_parameters).await?;
             self.set_ptms(uuid, ptms).await?;
-            self.set_comet_config(uuid, comet_config).await?;
             // Set counters
             self.init_total_spectrum_count(uuid).await?;
             self.init_finished_spectrum_count(uuid).await?;
@@ -167,7 +137,6 @@ pub trait PipelineStorage: Send + Sync + Sized {
             // Remove configs
             self.remove_search_params(uuid).await?;
             self.remove_ptms(uuid).await?;
-            self.remove_comet_config(uuid).await?;
             // Remove counters
             self.remove_total_spectrum_count(uuid).await?;
             self.remove_finished_spectrum_count(uuid).await?;
@@ -313,9 +282,6 @@ pub struct LocalPipelineStorage {
     /// Post translational modifications
     ptms_collections: RwLock<HashMap<String, Vec<PostTranslationalModification>>>,
 
-    /// Comet configurations
-    comet_configs: RwLock<HashMap<String, CometConfiguration>>,
-
     /// Counts
     counters: RwLock<HashMap<String, AtomicU64>>,
 
@@ -328,7 +294,6 @@ impl PipelineStorage for LocalPipelineStorage {
         Ok(Self {
             search_parameters: RwLock::new(HashMap::new()),
             ptms_collections: RwLock::new(HashMap::new()),
-            comet_configs: RwLock::new(HashMap::new()),
             counters: RwLock::new(HashMap::new()),
             flags: Cache::builder()
                 .max_capacity(1000)
@@ -400,42 +365,6 @@ impl PipelineStorage for LocalPipelineStorage {
             .write()
             .map_err(|_| LocalStorageError::PoisenedStorageLock("removing ptms".to_string()))?;
         ptms_guard.remove(&Self::get_ptms_key(uuid));
-        Ok(())
-    }
-
-    async fn get_comet_config(
-        &self,
-        uuid: &str,
-    ) -> Result<Option<CometConfiguration>, StorageError> {
-        Ok(self
-            .comet_configs
-            .read()
-            .map_err(|_| {
-                LocalStorageError::PoisenedStorageLock("reading comet configuration".to_string())
-            })?
-            .get(&Self::get_comet_config_key(uuid))
-            .cloned())
-    }
-
-    async fn set_comet_config(
-        &self,
-        uuid: &str,
-        config: &CometConfiguration,
-    ) -> Result<(), StorageError> {
-        let mut comet_config_guards = self
-            .comet_configs
-            .write()
-            .map_err(|_| LocalStorageError::PoisenedStorageLock("setting ptms".to_string()))?;
-        comet_config_guards.insert(Self::get_comet_config_key(uuid), config.clone());
-        Ok(())
-    }
-
-    async fn remove_comet_config(&self, uuid: &str) -> Result<(), StorageError> {
-        let mut comet_config_guards = self
-            .comet_configs
-            .write()
-            .map_err(|_| LocalStorageError::PoisenedStorageLock("setting ptms".to_string()))?;
-        comet_config_guards.remove(&Self::get_comet_config_key(uuid));
         Ok(())
     }
 
@@ -697,55 +626,6 @@ impl PipelineStorage for RedisPipelineStorage {
             .del(Self::get_ptms_key(uuid))
             .await
             .map_err(|err| RedisStorageError::RedisError("removing PTMs", err))?;
-        Ok(())
-    }
-
-    async fn get_comet_config(
-        &self,
-        uuid: &str,
-    ) -> Result<Option<CometConfiguration>, StorageError> {
-        let comet_params_json: String = self
-            .client
-            .get(Self::get_comet_config_key(uuid))
-            .await
-            .map_err(|err| RedisStorageError::RedisError("getting comet configuration", err))?;
-
-        if comet_params_json.is_empty() {
-            return Ok(None);
-        }
-
-        let config: CometConfiguration =
-            serde_json::from_str(&comet_params_json).map_err(|err| {
-                RedisStorageError::DeserializationError(
-                    "getting comet configuration".to_string(),
-                    err,
-                )
-            })?;
-
-        Ok(Some(config))
-    }
-
-    async fn set_comet_config(
-        &self,
-        uuid: &str,
-        config: &CometConfiguration,
-    ) -> Result<(), StorageError> {
-        let comet_params_json = serde_json::to_string(config).map_err(|err| {
-            RedisStorageError::SerializationError("setting comet configuration".to_string(), err)
-        })?;
-
-        Ok(self
-            .client
-            .set(Self::get_comet_config_key(uuid), comet_params_json)
-            .await
-            .map_err(|err| RedisStorageError::RedisError("setting comet configuration", err))?)
-    }
-
-    async fn remove_comet_config(&self, uuid: &str) -> Result<(), StorageError> {
-        self.client
-            .del(Self::get_comet_config_key(uuid))
-            .await
-            .map_err(|err| RedisStorageError::RedisError("removing comet configuration", err))?;
         Ok(())
     }
 

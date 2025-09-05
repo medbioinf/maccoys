@@ -4,7 +4,10 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{constants::COMET_SEPARATOR, pipeline::errors::pipeline_error::PipelineError};
+use crate::{
+    peptide_spectrum_match::PeptideSpectrumMatch, pipeline::errors::pipeline_error::PipelineError,
+    precursor::Precursor,
+};
 
 use super::{
     error_message::ErrorMessage, is_message::IsMessage, publication_message::PublicationMessage,
@@ -23,7 +26,7 @@ pub struct ScoringMessage {
     /// Spectrum ID
     spectrum_id: String,
     /// Precursor (m/z, charge) used for generating the search space
-    precursor: (f64, u8),
+    precursor: Precursor,
     /// PSMs
     psms: DataFrame,
 }
@@ -35,7 +38,7 @@ impl ScoringMessage {
         uuid: String,
         ms_run_name: String,
         spectrum_id: String,
-        precursor: (f64, u8),
+        precursor: Precursor,
         psms: DataFrame,
     ) -> Self {
         Self {
@@ -66,7 +69,7 @@ impl ScoringMessage {
 
     /// Get the precursor (m/z, charge) used for generating the search space
     ///
-    pub fn precursor(&self) -> &(f64, u8) {
+    pub fn precursor(&self) -> &Precursor {
         &self.precursor
     }
 
@@ -90,13 +93,13 @@ impl ScoringMessage {
         mut self,
         file_path: PathBuf,
     ) -> Result<PublicationMessage, Box<IntoPublicationMessageError>> {
-        // Lets assume the CSV has roughly the same size as the PSMs dataframe
-        let mut content: Vec<u8> =
-            Vec::with_capacity(self.psms.estimated_size() * std::mem::size_of::<u8>());
+        // Lets assume the Parquet file has roughly half the same size as the PSMs due to compression
+        let mut content: Vec<u8> = Vec::with_capacity(
+            self.psms.estimated_size() * std::mem::size_of::<PeptideSpectrumMatch>() / 2,
+        );
 
-        CsvWriter::new(&mut content)
-            .include_header(true)
-            .with_separator(COMET_SEPARATOR.as_bytes()[0])
+        ParquetWriter::new(&mut content)
+            .with_compression(ParquetCompression::Zstd(None))
             .finish(&mut self.psms)
             .unwrap();
 
@@ -117,7 +120,7 @@ impl IsMessage for ScoringMessage {
             self.uuid.clone(),
             Some(self.ms_run_name.clone()),
             Some(self.spectrum_id.clone()),
-            Some(self.precursor),
+            Some(self.precursor.clone()),
             error,
         )
     }
@@ -129,8 +132,8 @@ impl IsMessage for ScoringMessage {
             self.uuid,
             self.ms_run_name,
             self.spectrum_id,
-            self.precursor.0,
-            self.precursor.1,
+            self.precursor.mz(),
+            self.precursor.charge(),
         )
     }
 }

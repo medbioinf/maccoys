@@ -66,6 +66,13 @@ impl ErrorTask {
                 }
             };
 
+            info!(
+                "[error] Got message {}/{}/{}",
+                message.uuid(),
+                message.ms_run_name().as_ref().unwrap_or(&"n/a".to_string()),
+                message.spectrum_id().as_ref().unwrap_or(&"n/a".to_string()),
+            );
+
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
             // Create a file path depending on the level of the message

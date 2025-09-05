@@ -1,5 +1,6 @@
-// std imports
 use std::{ops::Deref, path::PathBuf};
+
+use xcorrrs::configuration::Configuration as XcorrConfiguration;
 
 pub const INDEXING_QUEUE_KEY: &str = "index";
 pub const SEARCH_SPACE_GENERATION_QUEUE_KEY: &str = "search_space_generation";
@@ -32,6 +33,8 @@ pub struct SearchParameters {
 
     /// If true the FASTA files will be kept
     pub keep_fasta_files: bool,
+
+    pub xcorr: XcorrConfiguration,
 }
 
 impl SearchParameters {
@@ -52,6 +55,7 @@ impl Default for SearchParameters {
             decoys_per_peptide: 0,
             score_threshold: 0.1,
             keep_fasta_files: false,
+            xcorr: XcorrConfiguration::default(),
         }
     }
 }

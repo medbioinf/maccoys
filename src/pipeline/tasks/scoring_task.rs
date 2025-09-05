@@ -42,11 +42,11 @@ pub const IONS_MATCHED_RATIO_COL_NAME: &str = "ions_matched_ratio";
 
 /// Name for the new mass diff column
 ///
-pub const MASS_DIFF_COL_NAME: &str = "mass_diff";
+pub const MASS_ERROR_COL_NAME: &str = "mass_error";
 
 /// Features to use for the scoring
 ///
-pub const FEATURES: [&str; 3] = ["xcorr", IONS_MATCHED_RATIO_COL_NAME, MASS_DIFF_COL_NAME];
+pub const FEATURES: [&str; 3] = ["xcorr", IONS_MATCHED_RATIO_COL_NAME, MASS_ERROR_COL_NAME];
 
 /// Name for the LoOP score
 ///
@@ -85,7 +85,6 @@ impl ScoringTask {
                     message
                 }
                 Ok(None) => {
-                    debug!("recv None, retrying");
                     // If the queue is empty, wait for a while before checking again
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     continue 'message_loop;
@@ -97,6 +96,14 @@ impl ScoringTask {
                 }
             };
 
+            info!(
+                "[scoring] Got message {}/{}/{} with {} PSM(s)",
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.psms().height()
+            );
+
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
             let relative_psms_path = create_file_path_on_precursor_level(
@@ -104,7 +111,7 @@ impl ScoringTask {
                 message.ms_run_name(),
                 message.spectrum_id(),
                 message.precursor(),
-                "tsv",
+                "parquet",
             );
 
             if message.psms().is_empty() {
@@ -290,13 +297,13 @@ fn calc_features(psms: &mut DataFrame) -> Result<(), ScoringError> {
     let ions_matched_ratio =
         (ions_matches / ions_total)?.with_name(IONS_MATCHED_RATIO_COL_NAME.into());
 
-    let exp_neutral_mass = psms.column("exp_neutral_mass")?;
-    let calc_neutral_mass = psms.column("calc_neutral_mass")?;
-    let mass_diff = abs((exp_neutral_mass - calc_neutral_mass)?.as_materialized_series())?
-        .with_name(MASS_DIFF_COL_NAME.into());
+    let experimental_mass = psms.column("experimental_mass")?;
+    let theoretical_mass = psms.column("theoretical_mass")?;
+    let mass_error = abs((experimental_mass - theoretical_mass)?.as_materialized_series())?
+        .with_name(MASS_ERROR_COL_NAME.into());
 
     psms.with_column(ions_matched_ratio)?;
-    psms.with_column(mass_diff)?;
+    psms.with_column(mass_error)?;
 
     Ok(())
 }

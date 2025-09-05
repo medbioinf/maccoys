@@ -1,6 +1,11 @@
+use dihardts_omicstools::proteomics::io::mzml::elements::spectrum::Spectrum;
+use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline::errors::pipeline_error::PipelineError;
+use crate::{
+    pipeline::errors::{indexing_error::IndexingError, pipeline_error::PipelineError},
+    precursor::Precursor,
+};
 
 use super::{
     error_message::ErrorMessage, is_message::IsMessage,
@@ -46,9 +51,31 @@ impl IndexingMessage {
         &self,
         ms_run_name: String,
         spectrum_id: String,
-        mzml: String,
-    ) -> SearchSpaceGenerationMessage {
-        SearchSpaceGenerationMessage::new(self.uuid.clone(), ms_run_name, spectrum_id, mzml.into())
+        spectrum: Spectrum,
+        precursors: Vec<Precursor>,
+    ) -> Result<SearchSpaceGenerationMessage, IndexingError> {
+        let mz_list = spectrum
+            .binary_data_array_list
+            .get_mz_array()
+            .map_err(IndexingError::MzListReadError)?
+            .deflate_data()
+            .map_err(IndexingError::MzListReadError)?;
+
+        let intensity_list = spectrum
+            .binary_data_array_list
+            .get_intensity_array()
+            .map_err(IndexingError::IntensityListReadError)?
+            .deflate_data()
+            .map_err(IndexingError::IntensityListReadError)?;
+
+        Ok(SearchSpaceGenerationMessage::new(
+            self.uuid.clone(),
+            ms_run_name,
+            spectrum_id,
+            Array1::from(mz_list),
+            Array1::from(intensity_list),
+            precursors,
+        ))
     }
 }
 

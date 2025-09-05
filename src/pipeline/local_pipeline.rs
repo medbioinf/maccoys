@@ -15,18 +15,14 @@ use tokio::{fs::create_dir_all, time::sleep};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{
-    io::comet::configuration::Configuration as CometConfiguration,
-    pipeline::{
-        errors::queue_error::QueueError,
-        tasks::{
-            error_task::ErrorTask, identification_task::IdentificationTask,
-            indexing_task::IndexingTask, publication_task::PublicationTask,
-            scoring_task::ScoringTask, search_space_generation_task::SearchSpaceGenerationTask,
-            task::Task,
-        },
-        utils::create_file_path_on_ms_run_level,
+use crate::pipeline::{
+    errors::queue_error::QueueError,
+    tasks::{
+        error_task::ErrorTask, identification_task::IdentificationTask,
+        indexing_task::IndexingTask, publication_task::PublicationTask, scoring_task::ScoringTask,
+        search_space_generation_task::SearchSpaceGenerationTask, task::Task,
     },
+    utils::create_file_path_on_ms_run_level,
 };
 
 use super::{
@@ -244,14 +240,13 @@ where
     /// * `result_dir` - Result directory where each search is stored
     /// * `tmp_dir` - Temporary directory for the pipeline
     /// * `config` - Configuration for the pipeline
-    /// * `comet_config` - Configuration for Comet
+    /// * `xcorr_config` - Configuration for Comet
     /// * `ptms` - Post translational modifications
     /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
     pub async fn run(
         &self,
         search_params: SearchParameters,
-        mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
         mzml_file_paths: Vec<PathBuf>,
         metrics_scrape_url: Option<String>,
@@ -259,11 +254,8 @@ where
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
 
-        comet_config.set_ptms(&ptms, search_params.max_variable_modifications)?;
-        comet_config.set_num_results(10000)?;
-
         self.storage
-            .init_search(&uuid, search_params.clone(), &ptms, &comet_config)
+            .init_search(&uuid, search_params.clone(), &ptms)
             .await?;
 
         // Create the stop flags
@@ -352,9 +344,16 @@ where
 
         loop {
             if self.storage.is_search_finished(&uuid).await? {
+                info!("Search finished");
                 break;
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(2000)).await;
+            info!(
+                "progress: {} / {} fully enqueued: {}",
+                self.storage.get_finished_spectrum_count(&uuid).await?,
+                self.storage.get_total_spectrum_count(&uuid).await?,
+                self.storage.is_search_fully_enqueued(&uuid).await?
+            );
         }
 
         if let Some(mut metrics_monitor) = metrics_monitor {

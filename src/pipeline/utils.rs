@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
 
+use crate::precursor::Precursor;
+
 lazy_static! {
     /// Regex for finding illegal path characters:
     /// * Resereved ext4 character and whitespaces
@@ -77,7 +79,7 @@ pub fn create_file_path_on_precursor_level(
     uuid: &str,
     ms_run_name: &str,
     spectrum_id: &str,
-    precursor: &(f64, u8),
+    precursor: &Precursor,
     extension: &str,
 ) -> PathBuf {
     PathBuf::from(uuid)
@@ -85,8 +87,8 @@ pub fn create_file_path_on_precursor_level(
         .join(sanatize_string_for_path(spectrum_id))
         .join(format!(
             "{}_{}.{}",
-            precursor.0,
-            precursor.1,
+            precursor.mz(),
+            precursor.charge(),
             sanatize_string_for_path(extension)
         ))
 }

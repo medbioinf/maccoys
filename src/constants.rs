@@ -18,10 +18,6 @@ pub const FASTA_DECOY_ENTRY_NAME_PREFIX: &str = "D";
 ///
 pub const FASTA_SEQUENCE_LINE_LENGTH: usize = 60;
 
-/// Max number of PSMs for the comet search
-///
-pub const COMET_MAX_PSMS: u32 = 10000;
-
 /// Comet PSMs file header row
 ///
 pub const COMET_HEADER_ROW: u8 = 1;

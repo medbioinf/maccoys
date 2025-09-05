@@ -1,23 +1,22 @@
 use std::{
+    borrow::Cow,
     fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
 use metrics::counter;
-use polars::frame::DataFrame;
 use tokio::fs::create_dir_all;
-use tracing::error;
+use tracing::{error, info};
+use xcorrrs::{
+    configuration::FinalizedConfiguration as FinalizedXcorrConfiguration, fast_xcorr::FastXcorr,
+};
 
 use crate::{
-    functions::run_comet_search,
-    io::comet::{
-        configuration::Configuration as CometConfiguration,
-        peptide_spectrum_match_tsv::PeptideSpectrumMatchTsv,
-    },
+    peptide_spectrum_match::{PeptideSpectrumMatch, PeptideSpectrumMatchCollection},
     pipeline::{
         configuration::{
             IdentificationTaskConfiguration, SearchParameters,
@@ -33,6 +32,7 @@ use crate::{
         storage::{PipelineStorage, RedisPipelineStorage},
         utils::create_file_path_on_precursor_level,
     },
+    precursor::Precursor,
 };
 
 use super::task::Task;
@@ -83,14 +83,8 @@ impl IdentificationTask {
             }
         }
         let mut last_search_uuid = String::new();
-        let mut current_comet_config: Option<CometConfiguration> = None;
         let mut current_search_params = SearchParameters::new();
         let mut metrics_counter_name = COUNTER_PREFIX.to_string();
-
-        let comet_params_file_path = local_work_dir.join("comet.params");
-        let fasta_file_path = local_work_dir.join("search_space.fasta");
-        let psms_file_path = local_work_dir.join("psms.txt");
-        let mzml_file_path = local_work_dir.join("ms_run.mzML");
 
         'message_loop: loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -109,48 +103,16 @@ impl IdentificationTask {
                     continue 'message_loop;
                 }
             };
+
+            info!(
+                "[identification] Got message {}/{}/{} with {} candidate peptide(s)",
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.peptides().len()
+            );
+
             if last_search_uuid != *message.uuid() {
-                current_comet_config = match storage.get_comet_config(message.uuid()).await {
-                    Ok(Some(config)) => Some(config),
-                    Ok(None) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::NoCometCongigurationInStorageError().into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::UnableToGetCometConfigurationFromStorageError(e)
-                                .into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                match current_comet_config
-                    .as_mut()
-                    .unwrap()
-                    .set_option("num_threads", &format!("{}", config.threads))
-                {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            IdentificationError::UnableToSetCometConfigurationAttributeError(
-                                "threads".to_string(),
-                                e,
-                            )
-                            .into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-
                 current_search_params = match storage.get_search_parameters(message.uuid()).await {
                     Ok(Some(params)) => params,
                     Ok(None) => {
@@ -175,21 +137,6 @@ impl IdentificationTask {
                 metrics_counter_name = Self::get_counter_name(message.uuid());
             }
 
-            // Unwrap the current Comet configuration for easier access
-            let comet_config = current_comet_config.as_mut().unwrap();
-
-            match message.write_spectrum_mzml_file(&mzml_file_path).await {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message = message.to_error_message(
-                        IdentificationError::WriteSpectrumMzMLFileError(e).into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
             if current_search_params.keep_fasta_files {
                 let relative_fasta_path = create_file_path_on_precursor_level(
                     message.uuid(),
@@ -198,102 +145,41 @@ impl IdentificationTask {
                     message.precursor(),
                     "fasta",
                 );
-                let fasta_publication_message =
-                    message.into_publication_message(relative_fasta_path, message.fasta().clone());
+                let fasta_publication_message = message.into_publication_message(
+                    relative_fasta_path,
+                    message.peptides().join("\n").into_bytes(),
+                );
                 Self::enqueue_message(fasta_publication_message, publication_queue.as_ref()).await;
             }
 
-            match message.write_fasta_file(&fasta_file_path).await {
-                Ok(_) => (),
+            let peptides = message.take_peptides();
+
+            let psms = match run_xcorr_search(
+                &FinalizedXcorrConfiguration::from(current_search_params.xcorr.clone()),
+                message.spectrum_id(),
+                (message.mz_list(), message.intensity_list()),
+                message.precursor(),
+                peptides,
+                config.threads,
+            ) {
+                Ok(psms) => psms,
                 Err(e) => {
-                    let error_message = message
-                        .to_error_message(IdentificationError::WriteFastaFileError(e).into());
+                    let error_message = message.to_error_message(e.into());
                     error!("{}", &error_message);
                     Self::enqueue_message(error_message, error_queue.as_ref()).await;
                     continue 'message_loop;
-                }
-            }
-
-            match comet_config.set_charge(message.precursor().1) {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message = message.to_error_message(
-                        IdentificationError::CometConfigAttributeError(
-                            "precursor_charge, max_fragment_charge & max_precursor_charge"
-                                .to_string(),
-                            e,
-                        )
-                        .into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            match comet_config.set_num_results(10000) {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message = message.to_error_message(
-                        IdentificationError::CometConfigAttributeError(
-                            "num_results".to_string(),
-                            e,
-                        )
-                        .into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            match comet_config.async_to_file(&comet_params_file_path).await {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message = message
-                        .to_error_message(IdentificationError::WriteCometConfigFileError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            match run_comet_search(
-                &config.comet_exe_path,
-                &comet_params_file_path,
-                &fasta_file_path,
-                &psms_file_path.with_extension(""),
-                &mzml_file_path,
-            )
-            .await
-            {
-                Ok(_) => (),
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(IdentificationError::CometError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            // Add PSM file to the message
-            let psms = match PeptideSpectrumMatchTsv::read(&psms_file_path) {
-                Ok(Some(psms)) => psms,
-                Ok(None) => DataFrame::empty(),
-                Err(e) => {
-                    error!(
-                        "[{} / {}] Error reading PSMs from `{}`: {:?}",
-                        &message.uuid(),
-                        &message.spectrum_id(),
-                        psms_file_path.display(),
-                        e
-                    );
-                    continue;
                 }
             };
 
-            let scoring_message = message.into_scoring_message(psms);
+            let scoring_message = match message.into_scoring_message(psms) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    let error_message = message.to_error_message(e.into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                    continue 'message_loop;
+                }
+            };
 
             Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
             Self::ack_message(&message_id, identification_queue.as_ref()).await;
@@ -370,5 +256,83 @@ impl IdentificationTask {
 impl Task for IdentificationTask {
     fn get_counter_prefix() -> &'static str {
         COUNTER_PREFIX
+    }
+}
+
+/// Runs Comet search with the given parameters.
+///
+/// # Arguments
+/// * `config` - Finalized Xcorr configuration
+/// * `scan_id` - Scan ID
+/// * `experimental_spectrum` - Tuple of m/z and intensity arrays
+/// * `charge` - Charge state
+/// * `peptides` - Peptides to search
+/// * `threads` - Number of threads to use
+///
+pub fn run_xcorr_search(
+    config: &FinalizedXcorrConfiguration,
+    scan_id: &str,
+    experimental_spectrum: (&ndarray::Array1<f64>, &ndarray::Array1<f64>),
+    precursor: &Precursor,
+    peptides: Vec<String>,
+    threads: usize,
+) -> Result<PeptideSpectrumMatchCollection, IdentificationError> {
+    let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollection>> = Arc::new(Mutex::new(
+        PeptideSpectrumMatchCollection::with_capacity(peptides.len()),
+    ));
+
+    let xcorrer = FastXcorr::new(config, experimental_spectrum, precursor.charge() as usize)
+        .map_err(IdentificationError::from)?;
+
+    let errors: Arc<Mutex<Vec<IdentificationError>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(IdentificationError::CreateIdentificationThreadPoolError)?;
+
+    thread_pool.install(|| {
+        peptides
+            .into_iter()
+            .for_each(|peptide| match xcorrer.xcorr_peptide(&peptide) {
+                Ok(scoring_result) => {
+                    let psm = PeptideSpectrumMatch::new(
+                        Cow::Owned(scan_id.to_string()),
+                        Cow::Owned(peptide),
+                        Cow::Owned(precursor.clone()),
+                        scoring_result,
+                    );
+                    let mut guard = psm_collection.lock().unwrap();
+                    guard.push(psm);
+                }
+                Err(e) => {
+                    let mut error_guard = errors.lock().unwrap();
+                    error_guard.push(IdentificationError::from(e));
+                }
+            })
+    });
+
+    let psm_collect = Arc::try_unwrap(psm_collection)
+        .map_err(|_| {
+            IdentificationError::ArcIntoError("PeptideSpectrumMatchCollection".to_string())
+        })?
+        .into_inner()
+        .map_err(|_| {
+            IdentificationError::MutexLockError("PeptideSpectrumMatchCollection".to_string())
+        })?;
+
+    let errors = Arc::try_unwrap(errors)
+        .map_err(|_| IdentificationError::ArcIntoError("Errors".to_string()))?
+        .into_inner()
+        .map_err(|_| IdentificationError::MutexLockError("Errors".to_string()))?;
+
+    if errors.is_empty() {
+        Ok(psm_collect)
+    } else {
+        error!("Errors occurred during XCorr search:");
+        for e in errors.iter() {
+            error!("{}", e);
+        }
+        Err(errors.into_iter().next().unwrap())
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::{env, process};
 
 // 3rd party imports
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use dihardts_omicstools::proteomics::io::mzml::{index::Index, reader::Reader as MzmlReader};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
@@ -26,6 +26,8 @@ use maccoys::pipeline::tasks::indexing_task::IndexingTask;
 use maccoys::pipeline::tasks::publication_task::PublicationTask;
 use maccoys::pipeline::tasks::scoring_task::ScoringTask;
 use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
+use maccoys::search_space::search_space_generator::{FastaSearchSpace, SearchSpaceGenerator};
+use macpepdb::functions::post_translational_modification::PTMCollection;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -39,8 +41,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
-use maccoys::functions::{create_search_space, post_process};
-use maccoys::io::comet::configuration::Configuration as CometConfiguration;
+use maccoys::functions::post_process;
 use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
 use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use maccoys::web::decoy_api::Server as DecoyApiServer;
@@ -133,8 +134,6 @@ enum PipelineCommand {
         result_dir: PathBuf,
         /// Path to the configuration file
         config: PathBuf,
-        /// Default comet params
-        default_comet_params_file: PathBuf,
         /// Paths to mzML files
         /// Glob patterns are allowed. e.g. /path/to/**/*.mzML, put them in quotes if your shell expands them.
         #[arg(value_delimiter = ' ', num_args = 0..)]
@@ -150,8 +149,6 @@ enum PipelineCommand {
         base_url: String,
         /// Search parameters file path, contains `search_parameters`-section of the pipeline configuration
         search_parameters_file: PathBuf,
-        /// Comet params
-        comet_params_file: PathBuf,
         /// Paths to mzML files
         /// Glob patterns are allowed. e.g. /path/to/**/*.mzML, put them in quotes if your shell expands them.
         #[arg(value_delimiter = ' ', num_args = 0..)]
@@ -302,6 +299,8 @@ enum Commands {
         /// Path to goodness of fit output file
         goodness_of_fit_file_path: String,
     },
+    /// Prints a new pipeline configuration to stdout
+    Config {},
     /// MaCcoyS search pipeline
     Pipeline(PipelineCLI),
 }
@@ -504,22 +503,29 @@ async fn main() -> Result<()> {
                 .open(fasta_file_path)
                 .await
                 .context("Error when opening FASTA file")?;
-            let mut fasta_file = Box::pin(fasta_file);
+            let fasta_file = Box::pin(fasta_file);
 
-            create_search_space(
-                &mut fasta_file,
-                &ptms,
-                mass_to_int(mass),
-                lower_mass_tolerance_ppm,
-                upper_mass_tolerance_ppm,
-                max_variable_modifications,
-                decoys_per_peptide,
-                target_url,
+            let mut search_space = FastaSearchSpace::new(fasta_file);
+
+            let search_space_generator = SearchSpaceGenerator::new(
+                &target_url,
                 decoy_url,
                 target_lookup_url,
                 decoy_cache_url,
             )
             .await?;
+
+            search_space_generator
+                .create(
+                    &mut search_space,
+                    mass_to_int(mass),
+                    lower_mass_tolerance_ppm,
+                    upper_mass_tolerance_ppm,
+                    max_variable_modifications,
+                    &ptms,
+                    decoys_per_peptide,
+                )
+                .await?;
         }
         Commands::IndexSpectrumFile {
             spectrum_file_path,
@@ -580,6 +586,10 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Commands::Config {} => {
+            let new_config = PipelineConfiguration::default();
+            println!("{}", toml::to_string_pretty(&new_config)?);
+        }
         Commands::Pipeline(pipeline_command) => match pipeline_command.command {
             PipelineCommand::NewConfig {} => {
                 let new_config = PipelineConfiguration::new();
@@ -591,7 +601,6 @@ async fn main() -> Result<()> {
                 ptms_file,
                 result_dir,
                 config,
-                default_comet_params_file,
                 mzml_file_paths,
             } => {
                 let tmp_dir = match tmp_dir {
@@ -609,14 +618,9 @@ async fn main() -> Result<()> {
                 if let Some(ptms_file) = &ptms_file {
                     ptms =
                         PtmReader::read(Path::new(ptms_file)).context("Fail to read PSM file")?;
+                    // validate PTMs
+                    let _ = PTMCollection::new(&ptms).map_err(|err| anyhow!(err))?;
                 }
-
-                let comet_config = match CometConfiguration::try_from(&default_comet_params_file) {
-                    Ok(config) => config,
-                    Err(e) => {
-                        bail!("Error reading Comet configuration: {:?}", e);
-                    }
-                };
 
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
                 let scrape_endpoint = prometheus_scrape_address
@@ -639,13 +643,7 @@ async fn main() -> Result<()> {
                     .await?;
 
                     pipeline
-                        .run(
-                            search_params,
-                            comet_config,
-                            ptms,
-                            mzml_file_paths,
-                            scrape_endpoint,
-                        )
+                        .run(search_params, ptms, mzml_file_paths, scrape_endpoint)
                         .await?;
                 } else {
                     info!("Running redis pipeline");
@@ -661,13 +659,7 @@ async fn main() -> Result<()> {
                     .await?;
 
                     pipeline
-                        .run(
-                            search_params,
-                            comet_config,
-                            ptms,
-                            mzml_file_paths,
-                            scrape_endpoint,
-                        )
+                        .run(search_params, ptms, mzml_file_paths, scrape_endpoint)
                         .await?;
                 }
             }
@@ -675,7 +667,6 @@ async fn main() -> Result<()> {
                 ptms_file,
                 base_url,
                 search_parameters_file,
-                comet_params_file,
                 mzml_file_paths,
             } => {
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
@@ -684,7 +675,6 @@ async fn main() -> Result<()> {
                 let uuid = RemotePipeline::run(
                     base_url,
                     search_parameters_file,
-                    comet_params_file,
                     mzml_file_paths,
                     ptms_file,
                 )

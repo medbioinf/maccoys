@@ -1,3 +1,4 @@
+use std::cmp::min;
 // std imports
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -8,11 +9,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
 use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::{
-    Position as PtmPosition, PostTranslationalModification as PTM,
+    Position as PtmPosition, PostTranslationalModification,
 };
 use fancy_regex::Regex;
 use futures::{pin_mut, StreamExt};
 use macpepdb::database::generic_client::GenericClient;
+use macpepdb::functions::post_translational_modification::PTMCollection;
 use macpepdb::{
     database::scylla::{
         client::Client as DbClient, configuration_table::ConfigurationTable,
@@ -28,19 +30,205 @@ use tracing::error;
 // internal imports
 use super::decoy_generator::DecoyGenerator;
 use super::decoy_part::DecoyPart;
+use crate::constants::FASTA_SEQUENCE_LINE_LENGTH;
+use crate::constants::{
+    FASTA_DECOY_ENTRY_NAME_PREFIX, FASTA_DECOY_ENTRY_PREFIX, FASTA_TARGET_ENTRY_NAME_PREFIX,
+    FASTA_TARGET_ENTRY_PREFIX,
+};
 use crate::search_space::decoy_cache::DecoyCache;
 use crate::search_space::target_lookup::TargetLookup;
-use crate::{
-    constants::{
-        FASTA_DECOY_ENTRY_NAME_PREFIX, FASTA_DECOY_ENTRY_PREFIX, FASTA_TARGET_ENTRY_NAME_PREFIX,
-        FASTA_TARGET_ENTRY_PREFIX,
-    },
-    functions::gen_fasta_entry,
-};
 
 /// Path to the peptide search endpoint of MaCPepDB
 ///
 const PEPTIDE_SEARCH_PATH: &str = "/api/peptides/search";
+
+/// Trait defining a search space to accumulate target and decoy peptides
+///
+pub trait IsSearchSpace {
+    /// Adds a target peptide sequence to the search space
+    ///
+    /// # Arguments
+    /// * `sequence` - Peptide sequence
+    ///
+    fn add_target(
+        &mut self,
+        seqeunce: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Adds a decoy peptide sequence to the search space
+    ///
+    /// # Arguments
+    /// * `sequence` - Peptide sequence
+    ///
+    fn add_decoys(
+        &mut self,
+        seqeunce: String,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Returns the number of target peptides in the search space
+    ///
+    fn target_count(&self) -> usize;
+
+    /// Returns the number of decoy peptides in the search space
+    ///
+    fn decoy_count(&self) -> usize;
+
+    /// Finalizes the search space, e.g by flushing buffers
+    ///
+    fn done(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+/// In-memory implementation of a search space
+///
+///
+#[derive(Default)]
+pub struct InMemorySearchSpace {
+    targets: Vec<String>,
+    decoys: Vec<String>,
+}
+
+impl InMemorySearchSpace {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl IsSearchSpace for InMemorySearchSpace {
+    async fn add_target(&mut self, sequence: String) -> Result<()> {
+        self.targets.push(sequence);
+        Ok(())
+    }
+
+    async fn add_decoys(&mut self, sequence: String) -> Result<()> {
+        self.decoys.push(sequence);
+        Ok(())
+    }
+
+    fn target_count(&self) -> usize {
+        self.targets.len()
+    }
+
+    fn decoy_count(&self) -> usize {
+        self.decoys.len()
+    }
+
+    async fn done(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[allow(clippy::from_over_into)]
+impl Into<(Vec<String>, Vec<String>)> for InMemorySearchSpace {
+    fn into(self) -> (Vec<String>, Vec<String>) {
+        (self.targets, self.decoys)
+    }
+}
+
+/// FASTA implementation of a search space
+/// Writes target and decoy peptides to a FASTA file
+///
+pub struct FastaSearchSpace {
+    fasta: Pin<Box<dyn AsyncWrite + Send>>,
+    target_ctr: usize,
+    decoy_ctr: usize,
+}
+
+impl FastaSearchSpace {
+    /// Creates a new FastaSearchSpace
+    ///
+    /// # Arguments
+    /// * `fasta` - AsyncWrite to write the FASTA entries to
+    pub fn new(fasta: Pin<Box<dyn AsyncWrite + Send>>) -> Self {
+        Self {
+            fasta,
+            target_ctr: 0,
+            decoy_ctr: 0,
+        }
+    }
+
+    /// Creates a FASTA entry for the given sequence.
+    ///
+    /// # Arguments
+    /// * `sequence` - Sequence
+    /// * `index` - Sequence index
+    /// * `entry_prefix` - Entry prefix
+    /// * `entry_name_prefix` - Entry name prefix
+    ///
+    fn gen_fasta_entry(
+        sequence: &str,
+        index: usize,
+        entry_prefix: &str,
+        entry_name_prefix: &str,
+    ) -> String {
+        let mut entry = format!(
+            ">{}|{entry_name_prefix}{index}|{entry_name_prefix}{index}\n",
+            entry_prefix,
+            entry_name_prefix = entry_name_prefix,
+            index = index
+        );
+        for start in (0..sequence.len()).step_by(FASTA_SEQUENCE_LINE_LENGTH) {
+            let stop = min(start + FASTA_SEQUENCE_LINE_LENGTH, sequence.len());
+            entry.push_str(&sequence[start..stop]);
+            entry.push('\n');
+        }
+        entry
+    }
+}
+
+impl IsSearchSpace for FastaSearchSpace {
+    async fn add_target(&mut self, sequence: String) -> Result<()> {
+        self.fasta
+            .write_all(
+                Self::gen_fasta_entry(
+                    sequence.as_str(),
+                    self.target_ctr + 1,
+                    FASTA_TARGET_ENTRY_PREFIX,
+                    FASTA_TARGET_ENTRY_NAME_PREFIX,
+                )
+                .as_bytes(),
+            )
+            .await?;
+        self.target_ctr += 1;
+        if self.target_ctr % 1000 == 0 {
+            self.fasta.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn add_decoys(&mut self, sequence: String) -> Result<()> {
+        self.fasta
+            .write_all(
+                Self::gen_fasta_entry(
+                    sequence.as_str(),
+                    self.decoy_ctr + 1,
+                    FASTA_DECOY_ENTRY_PREFIX,
+                    FASTA_DECOY_ENTRY_NAME_PREFIX,
+                )
+                .as_bytes(),
+            )
+            .await?;
+        self.decoy_ctr += 1;
+        if self.decoy_ctr % 1000 == 0 {
+            self.fasta.flush().await?;
+        }
+        Ok(())
+    }
+
+    fn target_count(&self) -> usize {
+        self.target_ctr
+    }
+
+    fn decoy_count(&self) -> usize {
+        self.decoy_ctr
+    }
+
+    /// This flushs the underlying writer
+    ///
+    async fn done(&mut self) -> Result<()> {
+        self.fasta.flush().await?;
+        Ok(())
+    }
+}
 
 /// Client for either a MaCPepDB database or a MaCPepDB web API
 ///
@@ -100,7 +288,7 @@ impl SearchSpaceGenerator {
     ///
     /// # Arguments
     /// * `is_target` - Whether the peptides are target or decoy peptides
-    /// * `fasta` - The FASTA file to write the peptides to
+    /// * `search_space` - IsSearchSpace to write the peptides tos
     /// * `mass` - The mass of the peptides
     /// * `lower_mass_tolerance` - The lower mass tolerance
     /// * `upper_mass_tolerance` - The upper mass tolerance
@@ -109,12 +297,13 @@ impl SearchSpaceGenerator {
     /// * `proteome_id` - The proteome id of the peptides
     /// * `is_reviewed` - Whether the peptides are reviewed or not
     /// * `ptms` - The post-translational modifications of the peptides
+    /// * `limit` - The maximum number of peptides to add
     ///
     #[allow(clippy::too_many_arguments)]
-    async fn add_peptides(
+    async fn add_peptides<T>(
         &self,
         is_target: bool,
-        fasta: &mut Pin<Box<impl AsyncWrite>>,
+        search_space: &mut T,
         mass: i64,
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
@@ -122,9 +311,12 @@ impl SearchSpaceGenerator {
         taxonomy_ids: Option<Vec<i64>>,
         proteome_id: Option<String>,
         is_reviewed: Option<bool>,
-        ptms: &[PTM],
+        ptms: &[PostTranslationalModification],
         limit: Option<usize>,
-    ) -> Result<usize> {
+    ) -> Result<()>
+    where
+        T: IsSearchSpace,
+    {
         let proteome_ids = proteome_id.map(|proteome_id| vec![proteome_id]);
 
         // Determine the client
@@ -133,15 +325,8 @@ impl SearchSpaceGenerator {
         } else {
             match self.decoy_client.as_ref() {
                 Some(client) => client,
-                None => return Ok(0),
+                None => return Ok(()),
             }
-        };
-
-        // Determine the entry prefix and entry name prefix
-        let (entry_prefix, entry_name_prefix) = if is_target {
-            (FASTA_TARGET_ENTRY_PREFIX, FASTA_TARGET_ENTRY_NAME_PREFIX)
-        } else {
-            (FASTA_DECOY_ENTRY_PREFIX, FASTA_DECOY_ENTRY_NAME_PREFIX)
         };
 
         // Get URL for HTTP client
@@ -157,42 +342,35 @@ impl SearchSpaceGenerator {
             }
         };
 
-        let mut peptide_ctr: usize = 0;
         match client {
             Client::DbClient(ref client) => {
                 let configuration = ConfigurationTable::select(client.as_ref()).await?;
+                let ptm_collecton = PTMCollection::new(ptms)?;
                 let target_stream = PeptideTable::search(
                     client.clone(),
                     Arc::new(configuration),
                     mass,
                     lower_mass_tolerance_ppm,
                     upper_mass_tolerance_ppm,
-                    max_variable_modifications,
+                    max_variable_modifications as usize,
                     taxonomy_ids,
                     proteome_ids,
                     is_reviewed,
-                    ptms,
+                    &ptm_collecton,
+                    true,
                 )
                 .await?;
                 pin_mut!(target_stream);
                 while let Some(peptide) = target_stream.next().await {
-                    fasta
-                        .write_all(
-                            gen_fasta_entry(
-                                peptide?.get_sequence(),
-                                peptide_ctr,
-                                entry_prefix,
-                                entry_name_prefix,
-                            )
-                            .as_bytes(),
-                        )
-                        .await?;
-                    peptide_ctr += 1;
-                    if peptide_ctr % 1000 == 0 {
-                        fasta.flush().await?;
+                    for sequence in peptide?.get_additional_sequences() {
+                        if is_target {
+                            search_space.add_target(sequence.to_string()).await?;
+                        } else {
+                            search_space.add_decoys(sequence.to_string()).await?;
+                        }
                     }
                     if let Some(limit) = limit {
-                        if peptide_ctr >= limit {
+                        if search_space.target_count() >= limit {
                             break;
                         }
                     }
@@ -202,12 +380,13 @@ impl SearchSpaceGenerator {
                 let response = client
                     .post(http_url.as_str())
                     .header("Connection", "close")
-                    .header("Accept", "text/plain")
+                    .header("Accept", "text/proforma")
                     .json(&json!({
                         "mass": mass_to_float(mass),
                         "lower_mass_tolerance_ppm": lower_mass_tolerance_ppm,
                         "upper_mass_tolerance_ppm": upper_mass_tolerance_ppm,
                         "max_variable_modifications": max_variable_modifications,
+                        "resolve_modifications": true,
                         "modifications": ptms
                     }))
                     .send()
@@ -220,23 +399,16 @@ impl SearchSpaceGenerator {
                 while let Some(chunk) = peptide_stream.next().await {
                     chunk?.iter().for_each(|byte| buffer.push(*byte));
                     if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
-                        fasta
-                            .write_all(
-                                gen_fasta_entry(
-                                    std::str::from_utf8(&buffer[..newline_pos])?,
-                                    peptide_ctr,
-                                    entry_prefix,
-                                    entry_name_prefix,
-                                )
-                                .as_bytes(),
-                            )
-                            .await?;
-                        peptide_ctr += 1;
-                        if peptide_ctr % 1000 == 0 {
-                            fasta.flush().await?;
+                        let sequence = std::str::from_utf8(&buffer[..newline_pos])?.to_string();
+
+                        if is_target {
+                            search_space.add_target(sequence).await?;
+                        } else {
+                            search_space.add_decoys(sequence).await?;
                         }
+
                         if let Some(limit) = limit {
-                            if peptide_ctr >= limit {
+                            if search_space.target_count() >= limit {
                                 break;
                             }
                         }
@@ -246,79 +418,52 @@ impl SearchSpaceGenerator {
                 }
                 // write the rest of the buffer if needed
                 if let Some(limit) = limit {
-                    if peptide_ctr < limit {
+                    if search_space.target_count() < limit {
                         let sequence = std::str::from_utf8(&buffer)?.trim().to_string();
                         if !sequence.is_empty() {
-                            fasta
-                                .write_all(
-                                    gen_fasta_entry(
-                                        std::str::from_utf8(&buffer).unwrap(),
-                                        peptide_ctr,
-                                        entry_prefix,
-                                        entry_name_prefix,
-                                    )
-                                    .as_bytes(),
-                                )
-                                .await?;
-                            peptide_ctr += 1;
+                            if is_target {
+                                search_space.add_target(sequence).await?;
+                            } else {
+                                search_space.add_decoys(sequence).await?;
+                            }
                         }
                     }
                     // Write peptides to FASTA
-                    peptide_ctr += Self::next_peptide_in_http_buffer_to_fasta(
-                        fasta,
+                    Self::next_peptide_in_http_buffer_to_fasta(
+                        search_space,
                         &mut buffer,
-                        peptide_ctr,
-                        entry_prefix,
-                        entry_name_prefix,
                         Some(limit),
                     )
                     .await
                     .context("Writing peptide buffer to FASTA")?;
                 }
                 // Write remaining buffer
-                peptide_ctr += Self::next_peptide_in_http_buffer_to_fasta(
-                    fasta,
-                    &mut buffer,
-                    peptide_ctr,
-                    entry_prefix,
-                    entry_name_prefix,
-                    limit,
-                )
-                .await?;
+                Self::next_peptide_in_http_buffer_to_fasta(search_space, &mut buffer, limit)
+                    .await?;
             }
         }
-        Ok(peptide_ctr)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn next_peptide_in_http_buffer_to_fasta(
-        fasta: &mut Pin<Box<impl AsyncWrite>>,
+    async fn next_peptide_in_http_buffer_to_fasta<T>(
+        fasta: &mut T,
         buffer: &mut Vec<u8>,
-        peptide_ctr: usize,
-        entry_prefix: &str,
-        entry_name_prefix: &str,
         limit: Option<usize>,
-    ) -> Result<usize> {
-        let mut new_peptide_ctr: usize = 0;
+    ) -> Result<()>
+    where
+        T: IsSearchSpace,
+    {
         loop {
             // Break if limit is reached
             if let Some(limit) = limit {
-                if peptide_ctr + new_peptide_ctr >= limit {
+                if fasta.target_count() >= limit {
                     break;
                 }
             }
             if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
-                new_peptide_ctr += 1;
-                let _ = fasta
-                    .write(
-                        gen_fasta_entry(
-                            std::str::from_utf8(&buffer[..newline_pos])?,
-                            peptide_ctr + new_peptide_ctr,
-                            entry_prefix,
-                            entry_name_prefix,
-                        )
-                        .as_bytes(),
-                    )
+                fasta
+                    .add_target(std::str::from_utf8(&buffer[..newline_pos])?.to_string())
                     .await?;
                 *buffer = buffer[newline_pos + 1..].to_vec();
             } else {
@@ -326,21 +471,23 @@ impl SearchSpaceGenerator {
                 break;
             }
         }
-        Ok(new_peptide_ctr)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn generate_missing_decoys(
+    async fn generate_missing_decoys<T>(
         &self,
-        fasta: &mut Pin<Box<impl AsyncWrite>>,
+        fasta: &mut T,
         needed_decoys: usize,
-        decoy_ctr: usize,
         mass: i64,
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
         max_variable_modifications: i8,
-        ptms: &[PTM],
-    ) -> Result<usize> {
+        ptms: &[PostTranslationalModification],
+    ) -> Result<()>
+    where
+        T: IsSearchSpace,
+    {
         let target_lookup: Option<TargetLookup> = match self.target_lookup_url {
             Some(ref url) => Some(TargetLookup::new(url).await?),
             None => None,
@@ -350,8 +497,6 @@ impl SearchSpaceGenerator {
             Some(ref url) => Some(DecoyCache::new(url).await?),
             None => None,
         };
-
-        let mut decoy_ctr = decoy_ctr;
 
         let statically_modified_amino_acids = ptms
             .iter()
@@ -456,43 +601,28 @@ impl SearchSpaceGenerator {
             if let Some(ref decoy_cache) = decoy_cache {
                 decoy_cache.cache(vec![(sequence.clone(), 0)]).await?;
             }
-            fasta
-                .write_all(
-                    gen_fasta_entry(
-                        sequence.as_str(),
-                        decoy_ctr,
-                        FASTA_DECOY_ENTRY_PREFIX,
-                        FASTA_DECOY_ENTRY_NAME_PREFIX,
-                    )
-                    .as_bytes(),
-                )
-                .await?;
-            decoy_ctr += 1;
-            if decoy_ctr % 1000 == 0 {
-                fasta.flush().await?;
-            }
-            if decoy_ctr == needed_decoys {
+            fasta.add_decoys(sequence).await?;
+            if fasta.decoy_count() == needed_decoys {
                 break;
             }
         }
-        Ok(decoy_ctr)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
+    pub async fn create<T>(
         &self,
-        fasta: &mut Pin<Box<impl AsyncWrite>>,
+        fasta: &mut T,
         mass: i64,
         lower_mass_tolerance: i64,
         upper_mass_tolerance: i64,
         max_variable_modifications: i8,
-        ptms: &[PTM],
+        ptms: &[PostTranslationalModification],
         decoys_per_peptide: usize,
-    ) -> Result<(usize, usize)> {
-        #[allow(unused_assignments)]
-        let mut target_ctr = 0;
-        let mut decoy_ctr = 0;
-
+    ) -> Result<()>
+    where
+        T: IsSearchSpace,
+    {
         loop {
             let target_result = self
                 .add_peptides(
@@ -510,8 +640,7 @@ impl SearchSpaceGenerator {
                 )
                 .await;
             match target_result {
-                Ok(ctr) => {
-                    target_ctr = ctr;
+                Ok(_) => {
                     break;
                 }
                 Err(err) => {
@@ -521,7 +650,7 @@ impl SearchSpaceGenerator {
             }
         }
 
-        let needed_decoys = decoys_per_peptide * target_ctr;
+        let needed_decoys = decoys_per_peptide * fasta.target_count();
 
         if needed_decoys > 0 {
             loop {
@@ -543,22 +672,16 @@ impl SearchSpaceGenerator {
                     )
                     .await;
 
-                match cached_decoy_result {
-                    Ok(ctr) => {
-                        decoy_ctr += ctr;
-                    }
-                    Err(err) => {
-                        error!("Error adding cached decoy peptides: `{}, retry... ", err);
-                        continue;
-                    }
+                if let Err(err) = cached_decoy_result {
+                    error!("Error adding cached decoy peptides: `{}, retry... ", err);
+                    continue;
                 }
 
-                if decoy_ctr < needed_decoys {
+                if fasta.decoy_count() < needed_decoys {
                     let decoy_result = self
                         .generate_missing_decoys(
                             fasta,
                             needed_decoys,
-                            needed_decoys - decoy_ctr,
                             mass,
                             lower_mass_tolerance,
                             upper_mass_tolerance,
@@ -568,8 +691,7 @@ impl SearchSpaceGenerator {
                         .await;
 
                     match decoy_result {
-                        Ok(ctr) => {
-                            decoy_ctr += ctr;
+                        Ok(_) => {
                             break;
                         }
                         Err(err) => {
@@ -581,7 +703,7 @@ impl SearchSpaceGenerator {
             }
         }
 
-        fasta.flush().await?;
-        Ok((target_ctr, decoy_ctr))
+        fasta.done().await?;
+        Ok(())
     }
 }

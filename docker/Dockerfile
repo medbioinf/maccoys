@@ -13,9 +13,6 @@ RUN apt-get update -y \
     pkg-config \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/* \
-    # Install external tools
-    && curl -L -o /usr/local/bin/comet https://github.com/UWPR/Comet/releases/download/v2024.01.1/comet.linux.exe \
-    && chmod +x /usr/local/bin/comet \
     # Install rustup and compile maccoys
     && curl https://sh.rustup.rs -sSf | bash -s -- -y \
     && cargo install --path . --root /usr/local \

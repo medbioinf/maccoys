@@ -54,7 +54,6 @@ impl RemotePipeline {
     pub async fn run(
         base_url: String,
         search_parameters_path: PathBuf,
-        comet_params_path: PathBuf,
         mzml_file_paths: Vec<PathBuf>,
         ptms_path: Option<PathBuf>,
     ) -> Result<String> {
@@ -66,20 +65,10 @@ impl RemotePipeline {
                 tokio_util::codec::BytesCodec::new(),
             ));
 
-        let comet_params_reader = reqwest::Body::wrap_stream(tokio_util::codec::FramedRead::new(
-            tokio::fs::File::open(comet_params_path).await?,
-            tokio_util::codec::BytesCodec::new(),
-        ));
-
-        let mut form = reqwest::multipart::Form::new()
-            .part(
-                "search_params",
-                reqwest::multipart::Part::stream(search_parameters_reader),
-            )
-            .part(
-                "comet_params",
-                reqwest::multipart::Part::stream(comet_params_reader),
-            );
+        let mut form = reqwest::multipart::Form::new().part(
+            "search_params",
+            reqwest::multipart::Part::stream(search_parameters_reader),
+        );
 
         if let Some(ptms_path) = ptms_path {
             let ptms_reader = reqwest::Body::wrap_stream(tokio_util::codec::FramedRead::new(
