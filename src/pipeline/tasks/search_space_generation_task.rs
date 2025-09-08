@@ -147,6 +147,8 @@ impl SearchSpaceGenerationTask {
 
             // Generate the search space for each precursor
             'precursor_loop: for precursor in message.precursors() {
+                let now = std::time::Instant::now();
+
                 let mass = mass_to_int(precursor.to_dalton());
 
                 let mut search_space = InMemorySearchSpace::new();
@@ -199,6 +201,19 @@ impl SearchSpaceGenerationTask {
 
                 let mut candidates = target;
                 candidates.extend(decoys);
+
+                let elapsed = now.elapsed();
+
+                info!(
+                    "[search space generation] Took {:.4}s to process message {}/{}/{} with {} m/z & {} charge. Found {} candidate peptides",
+                    elapsed.as_secs_f32(),
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor.mz(),
+                    precursor.charge(),
+                    candidates.len(),
+                );
 
                 let identification_message =
                     message.into_identification_message(precursor.clone(), candidates);

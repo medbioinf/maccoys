@@ -152,6 +152,8 @@ impl IdentificationTask {
                 Self::enqueue_message(fasta_publication_message, publication_queue.as_ref()).await;
             }
 
+            let now = std::time::Instant::now();
+
             let peptides = message.take_peptides();
 
             let psms = match run_xcorr_search(
@@ -185,6 +187,18 @@ impl IdentificationTask {
             Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
             Self::ack_message(&message_id, identification_queue.as_ref()).await;
             counter!(metrics_counter_name.clone()).increment(1);
+
+            let elapsed = now.elapsed();
+
+            info!(
+                "[identification] Took {:.4}s to process message {}/{}/{} with {} candidate peptide(s)",
+                elapsed.as_secs_f32(),
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.peptides().len()
+            );
+
             // wait before checking the queue again
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }

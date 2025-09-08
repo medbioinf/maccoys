@@ -11,7 +11,7 @@ use local_outlier_probabilities::local_outlier_probabilities;
 use metrics::counter;
 use polars::prelude::*;
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::pipeline::{
     configuration::StandaloneScoringConfiguration,
@@ -130,6 +130,8 @@ impl ScoringTask {
                 continue 'message_loop;
             }
 
+            let now = std::time::Instant::now();
+
             match calc_features(message.psms_mut()) {
                 Ok(_) => {}
                 Err(e) => {
@@ -162,7 +164,6 @@ impl ScoringTask {
                 }
             };
 
-            let now = std::time::Instant::now();
             let loop_score = match local_outlier_probabilities(feature_array, N_NEIGHBORS, 3, None)
             {
                 Ok(loop_score) => loop_score,
@@ -174,11 +175,6 @@ impl ScoringTask {
                     continue 'message_loop;
                 }
             };
-            debug!(
-                "[{}] loop score calculated in {} ms",
-                &message_id,
-                now.elapsed().as_millis()
-            );
 
             match message
                 .psms_mut()
@@ -196,6 +192,17 @@ impl ScoringTask {
 
             drop(loop_score);
 
+            let elapsed = now.elapsed();
+
+            info!(
+                "[scoring] Took {:.4}s to process message {}/{}/{} with {} PSM(s)",
+                elapsed.as_secs_f32(),
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.psms().height()
+            );
+
             let publication_message = match message.into_publication_message(relative_psms_path) {
                 Ok(publication_message) => publication_message,
                 Err(e) => {
@@ -210,12 +217,7 @@ impl ScoringTask {
             };
 
             Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
-
-            trace!("[{}] enqueued for publication", &message_id,);
-
             Self::ack_message(&message_id, scoring_queue.as_ref()).await;
-
-            debug!("[{}] ack", &message_id,);
 
             counter!(metrics_counter_name.clone()).increment(1);
         }
