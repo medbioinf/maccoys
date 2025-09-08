@@ -161,6 +161,7 @@ impl IdentificationTask {
                 message.precursor(),
                 peptides,
                 config.threads,
+                None,
             ) {
                 Ok(psms) => psms,
                 Err(e) => {
@@ -259,7 +260,7 @@ impl Task for IdentificationTask {
     }
 }
 
-/// Runs Comet search with the given parameters.
+/// Runs Xcorr search with the given parameters.
 ///
 /// # Arguments
 /// * `config` - Finalized Xcorr configuration
@@ -268,6 +269,7 @@ impl Task for IdentificationTask {
 /// * `charge` - Charge state
 /// * `peptides` - Peptides to search
 /// * `threads` - Number of threads to use
+/// * `score_threshold` - xcorr needs to be equals or above this threshold to be reported.
 ///
 pub fn run_xcorr_search(
     config: &FinalizedXcorrConfiguration,
@@ -276,7 +278,10 @@ pub fn run_xcorr_search(
     precursor: &Precursor,
     peptides: Vec<String>,
     threads: usize,
+    score_threshold: Option<f64>,
 ) -> Result<PeptideSpectrumMatchCollection, IdentificationError> {
+    let score_threshold = score_threshold.unwrap_or(f64::NEG_INFINITY);
+
     let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollection>> = Arc::new(Mutex::new(
         PeptideSpectrumMatchCollection::with_capacity(peptides.len()),
     ));
@@ -296,14 +301,16 @@ pub fn run_xcorr_search(
             .into_iter()
             .for_each(|peptide| match xcorrer.xcorr_peptide(&peptide) {
                 Ok(scoring_result) => {
-                    let psm = PeptideSpectrumMatch::new(
-                        Cow::Owned(scan_id.to_string()),
-                        Cow::Owned(peptide),
-                        Cow::Owned(precursor.clone()),
-                        scoring_result,
-                    );
-                    let mut guard = psm_collection.lock().unwrap();
-                    guard.push(psm);
+                    if scoring_result.score >= score_threshold {
+                        let psm = PeptideSpectrumMatch::new(
+                            Cow::Owned(scan_id.to_string()),
+                            Cow::Owned(peptide),
+                            Cow::Owned(precursor.clone()),
+                            scoring_result,
+                        );
+                        let mut guard = psm_collection.lock().unwrap();
+                        guard.push(psm);
+                    }
                 }
                 Err(e) => {
                     let mut error_guard = errors.lock().unwrap();
