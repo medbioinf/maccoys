@@ -258,33 +258,32 @@ where
             .init_search(&uuid, search_params.clone(), &ptms)
             .await?;
 
-        // Create the stop flags
-
         let mut metrics_monitor: Option<MetricsMonitor> = None;
         if let Some(metrics_scrape_url) = metrics_scrape_url {
+            let corrected_uuid = uuid.clone().replace('-', "_"); // scrape endpoint replaces dashes with underscores
             let monitorable_metrics = vec![
                 MonitorableMetric::new(
-                    IndexingTask::get_counter_name(&uuid).to_string(),
+                    IndexingTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    SearchSpaceGenerationTask::get_counter_name(&uuid).to_string(),
+                    SearchSpaceGenerationTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    IdentificationTask::get_counter_name(&uuid).to_string(),
+                    IdentificationTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    ScoringTask::get_counter_name(&uuid).to_string(),
+                    ScoringTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    PublicationTask::get_counter_name(&uuid).to_string(),
+                    PublicationTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    ErrorTask::get_counter_name(&uuid).to_string(),
+                    ErrorTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
             ];
