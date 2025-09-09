@@ -10,9 +10,11 @@ use std::{
 use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::future::join_all;
+use indicatif::ProgressStyle;
 use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
 use tokio::{fs::create_dir_all, time::sleep};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, info_span};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 use uuid::Uuid;
 
 use crate::pipeline::{
@@ -341,19 +343,29 @@ where
         // Wait a couple of seconds for the indexing to start
         sleep(Duration::from_millis(5000)).await;
 
+        let progress_span = info_span!("progress");
+        progress_span.pb_set_message("Finished spectra");
+        progress_span.pb_set_style(
+            &ProgressStyle::with_template("        {msg} {wide_bar} {pos}/{len} {per_sec} ")
+                .unwrap(),
+        );
+
         loop {
             if self.storage.is_search_finished(&uuid).await? {
                 info!("Search finished");
                 break;
             }
-            sleep(Duration::from_millis(2000)).await;
-            info!(
-                "progress: {} / {} fully enqueued: {}",
-                self.storage.get_finished_spectrum_count(&uuid).await?,
-                self.storage.get_total_spectrum_count(&uuid).await?,
-                self.storage.is_search_fully_enqueued(&uuid).await?
-            );
+            sleep(Duration::from_millis(1000)).await;
+            let _ = progress_span.enter();
+            progress_span.pb_set_length(self.storage.get_total_spectrum_count(&uuid).await?);
+            progress_span.pb_set_position(self.storage.get_finished_spectrum_count(&uuid).await?);
+            if self.storage.is_search_fully_enqueued(&uuid).await? {
+                progress_span.pb_set_message("Finished spectra");
+            } else {
+                progress_span.pb_set_message("Finished spectra (enqueuing still in progress)");
+            }
         }
+        drop(progress_span);
 
         if let Some(mut metrics_monitor) = metrics_monitor {
             metrics_monitor.stop().await?;
