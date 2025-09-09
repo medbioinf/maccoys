@@ -85,11 +85,12 @@ impl ScoringMessage {
         &mut self.psms
     }
 
-    /// Get the PSMs as a CSV
+    /// Create publication message for the PSMs
     ///
     /// # Arguments
     /// * `file_path` - The relative path to the file to write content to
-    pub fn into_publication_message(
+    ///
+    pub fn into_final_publication_message(
         mut self,
         file_path: PathBuf,
     ) -> Result<PublicationMessage, Box<IntoPublicationMessageError>> {
@@ -111,6 +112,27 @@ impl ScoringMessage {
             true,
             content,
         ))
+    }
+
+    /// Creates a publication message for non result publication
+    ///
+    /// # Arguments
+    /// * `file_path` - The relative path to the file to write content to
+    /// * `content` - The content of the CSV file
+    ///
+    pub fn into_publication_message(
+        &self,
+        file_path: PathBuf,
+        content: Vec<u8>,
+    ) -> PublicationMessage {
+        PublicationMessage::new(
+            self.uuid.clone(),
+            self.ms_run_name.clone(),
+            self.spectrum_id.clone(),
+            file_path,
+            false,
+            content,
+        )
     }
 }
 

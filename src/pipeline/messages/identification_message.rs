@@ -106,6 +106,12 @@ impl IdentificationMessage {
         std::mem::take(&mut self.peptides)
     }
 
+    /// Creates a publication message for non result publication
+    ///
+    /// # Arguments
+    /// * `file_path` - The relative path to the file to write content to
+    /// * `content` - The content of the CSV file
+    ///
     pub fn into_publication_message(
         &self,
         file_path: PathBuf,

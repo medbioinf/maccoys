@@ -9,7 +9,7 @@ lazy_static! {
     /// Regex for finding illegal path characters:
     /// * Resereved ext4 character and whitespaces
     ///
-    static ref ILLEGAL_PATH_CHARACTER_REGEX: Regex = fancy_regex::Regex::new(r"[\s\/\.\u0000]+").unwrap();
+    static ref ILLEGAL_PATH_CHARACTER_REGEX: Regex = fancy_regex::Regex::new(r"[\s\/\u0000]+").unwrap();
 }
 
 /// Sanitizes the given string by replacing all illegal path characters with `_`.
@@ -85,6 +85,34 @@ pub fn create_file_path_on_precursor_level(
     PathBuf::from(uuid)
         .join(sanatize_string_for_path(ms_run_name))
         .join(sanatize_string_for_path(spectrum_id))
+        .join(format!(
+            "{}_{}.{}",
+            precursor.mz(),
+            precursor.charge(),
+            sanatize_string_for_path(extension)
+        ))
+}
+
+/// Creates a metric file path on precursor level, e.g. `<uuid>/<ms_run>/<spectrum_id>/metrics/<precursor_mz>_<precursor_charge>.<extension>`
+///
+/// # Arguments
+/// * `uuid` - Search UUID
+/// * `ms_run_name` - MS run name
+/// * `spectrum_id` - Spectrum ID
+/// * `precursor` - Precursor mass to charge ratio and charge
+/// * `extension` - File extension
+///
+pub fn create_metrics_file_path_on_precursor_level(
+    uuid: &str,
+    ms_run_name: &str,
+    spectrum_id: &str,
+    precursor: &Precursor,
+    extension: &str,
+) -> PathBuf {
+    PathBuf::from(uuid)
+        .join(sanatize_string_for_path(ms_run_name))
+        .join(sanatize_string_for_path(spectrum_id))
+        .join("metrics")
         .join(format!(
             "{}_{}.{}",
             precursor.mz(),

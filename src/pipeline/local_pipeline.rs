@@ -150,6 +150,7 @@ where
                         storage.clone(),
                         search_space_generation_queue.clone(),
                         identification_queue.clone(),
+                        publication_queue.clone(),
                         error_queue.clone(),
                         search_space_generation_stop_flag.clone(),
                     ))

@@ -24,10 +24,12 @@ use crate::{
         },
         messages::{
             error_message::ErrorMessage, identification_message::IdentificationMessage,
-            is_message::IsMessage, search_space_generation_message::SearchSpaceGenerationMessage,
+            is_message::IsMessage, publication_message::PublicationMessage,
+            search_space_generation_message::SearchSpaceGenerationMessage,
         },
         queue::{PipelineQueue, RedisPipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
+        utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
     },
     search_space::search_space_generator::{InMemorySearchSpace, SearchSpaceGenerator},
 };
@@ -58,17 +60,19 @@ impl SearchSpaceGenerationTask {
     /// * `I` - Type of the identification queue
     /// * `E` - Type of the error queue
     ///
-    pub async fn start<S, G, I, E>(
+    pub async fn start<S, G, I, P, E>(
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
         search_space_generation_queue: Arc<G>,
         identification_queue: Arc<I>,
+        publication_queue: Arc<P>,
         error_queue: Arc<E>,
         stop_flag: Arc<AtomicBool>,
     ) where
         S: PipelineStorage + Send + Sync + 'static,
         G: PipelineQueue<SearchSpaceGenerationMessage> + Send + Sync + 'static,
         I: PipelineQueue<IdentificationMessage> + Send + Sync + 'static,
+        P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
         E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
     {
         let mut last_search_uuid = String::new();
@@ -202,6 +206,10 @@ impl SearchSpaceGenerationTask {
                 let mut candidates = target;
                 candidates.extend(decoys);
 
+                let cadidates_size =
+                    candidates.iter().map(|p| p.len()).sum::<usize>() * std::mem::size_of::<char>();
+                let candidates_len = candidates.len();
+
                 let elapsed = now.elapsed();
 
                 info!(
@@ -221,6 +229,59 @@ impl SearchSpaceGenerationTask {
                 Self::enqueue_message(identification_message, identification_queue.as_ref()).await;
                 Self::ack_message(&message_id, search_space_generation_queue.as_ref()).await;
                 counter!(metrics_counter_name.clone()).increment(1);
+
+                // sending metrics
+
+                let metrics_path = create_metrics_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor,
+                    "search_space_generation.time",
+                );
+
+                Self::enqueue_message(
+                    message.into_publication_message(
+                        metrics_path,
+                        elapsed.as_millis().to_string().into_bytes(),
+                    ),
+                    publication_queue.as_ref(),
+                )
+                .await;
+
+                let metrics_path = create_metrics_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor,
+                    "search_space_generation.size",
+                );
+
+                Self::enqueue_message(
+                    message.into_publication_message(
+                        metrics_path,
+                        cadidates_size.to_string().into_bytes(),
+                    ),
+                    publication_queue.as_ref(),
+                )
+                .await;
+
+                let metrics_path = create_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor,
+                    "search_space_generation.len",
+                );
+
+                Self::enqueue_message(
+                    message.into_publication_message(
+                        metrics_path,
+                        candidates_len.to_string().into_bytes(),
+                    ),
+                    publication_queue.as_ref(),
+                )
+                .await;
             }
         }
         // wait before checking the queue again
@@ -257,6 +318,9 @@ impl SearchSpaceGenerationTask {
             RedisPipelineQueue::<IdentificationMessage>::new(&config.identification).await?,
         );
 
+        let publication_queue =
+            Arc::new(RedisPipelineQueue::<PublicationMessage>::new(&config.publication).await?);
+
         let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
         let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
@@ -273,6 +337,7 @@ impl SearchSpaceGenerationTask {
                         storage.clone(),
                         search_space_generation_queue.clone(),
                         identification_queue.clone(),
+                        publication_queue.clone(),
                         error_queue.clone(),
                         stop_flag.clone(),
                     ))

@@ -23,7 +23,7 @@ use crate::pipeline::{
         scoring_message::{IntoPublicationMessageError, ScoringMessage},
     },
     queue::{PipelineQueue, RedisPipelineQueue},
-    utils::create_file_path_on_precursor_level,
+    utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
 };
 
 use super::task::Task;
@@ -124,7 +124,7 @@ impl ScoringTask {
                     message.precursor()
                 );
                 let publication_message = message
-                    .into_publication_message(relative_psms_path)
+                    .into_final_publication_message(relative_psms_path)
                     .unwrap();
                 Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
                 continue 'message_loop;
@@ -176,9 +176,13 @@ impl ScoringTask {
                 }
             };
 
+            let loop_score = loop_score
+                .into_iter() // convert outlier probability to inlier probability
+                .collect::<Vec<f64>>();
+
             match message
                 .psms_mut()
-                .with_column(Series::new(LOOP_COL_NAME.into(), loop_score.to_vec()))
+                .with_column(Series::new(LOOP_COL_NAME.into(), loop_score))
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -189,8 +193,6 @@ impl ScoringTask {
                     continue 'message_loop;
                 }
             }
-
-            drop(loop_score);
 
             let elapsed = now.elapsed();
 
@@ -203,7 +205,22 @@ impl ScoringTask {
                 message.psms().height()
             );
 
-            let publication_message = match message.into_publication_message(relative_psms_path) {
+            let metrics_path = create_metrics_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.precursor(),
+                "scoring.time",
+            );
+
+            let metrics_message = message.into_publication_message(
+                metrics_path,
+                elapsed.as_millis().to_string().into_bytes(),
+            );
+
+            let publication_message = match message
+                .into_final_publication_message(relative_psms_path)
+            {
                 Ok(publication_message) => publication_message,
                 Err(e) => {
                     let error_message = match *e {
@@ -218,8 +235,11 @@ impl ScoringTask {
 
             Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
             Self::ack_message(&message_id, scoring_queue.as_ref()).await;
-
             counter!(metrics_counter_name.clone()).increment(1);
+
+            // send some metrics
+
+            Self::enqueue_message(metrics_message, publish_queue.as_ref()).await;
         }
     }
 

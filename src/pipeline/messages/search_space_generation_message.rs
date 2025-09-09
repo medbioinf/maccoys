@@ -1,9 +1,14 @@
-use std::io::Cursor;
+use std::{io::Cursor, path::PathBuf};
 
 use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 
-use crate::{pipeline::errors::pipeline_error::PipelineError, precursor::Precursor};
+use crate::{
+    pipeline::{
+        errors::pipeline_error::PipelineError, messages::publication_message::PublicationMessage,
+    },
+    precursor::Precursor,
+};
 
 use super::{
     error_message::ErrorMessage, identification_message::IdentificationMessage,
@@ -105,6 +110,27 @@ impl SearchSpaceGenerationMessage {
             self.intensity_list.clone(),
             precursor,
             peptides,
+        )
+    }
+
+    /// Creates a publication message for non result publication
+    ///
+    /// # Arguments
+    /// * `file_path` - The relative path to the file to write content to
+    /// * `content` - The content of the CSV file
+    ///
+    pub fn into_publication_message(
+        &self,
+        file_path: PathBuf,
+        content: Vec<u8>,
+    ) -> PublicationMessage {
+        PublicationMessage::new(
+            self.uuid.clone(),
+            self.ms_run_name.clone(),
+            self.spectrum_id.clone(),
+            file_path,
+            false,
+            content,
         )
     }
 

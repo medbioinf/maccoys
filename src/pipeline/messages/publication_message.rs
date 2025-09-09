@@ -70,6 +70,12 @@ impl PublicationMessage {
         &self.file_path
     }
 
+    /// Mutable reference to the relative target file path
+    ///
+    pub fn file_path_mut(&mut self) -> &mut PathBuf {
+        &mut self.file_path
+    }
+
     /// Is the publication successful
     ///
     pub fn update_spectrum_count(&self) -> bool {
@@ -86,6 +92,10 @@ impl PublicationMessage {
     ///
     pub fn take_content(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.content)
+    }
+
+    pub fn content_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.content
     }
 }
 

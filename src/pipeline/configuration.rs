@@ -264,6 +264,8 @@ pub struct StandaloneSearchSpaceGenerationConfiguration {
     pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
     /// Comet search task configuration
     pub identification: IdentificationTaskConfiguration,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
     /// Error task configuration
     pub error: TaskConfiguration,
     /// Storage configuration

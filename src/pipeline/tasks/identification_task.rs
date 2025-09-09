@@ -30,7 +30,7 @@ use crate::{
         },
         queue::{PipelineQueue, RedisPipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
-        utils::create_file_path_on_precursor_level,
+        utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
     },
     precursor::Precursor,
 };
@@ -174,6 +174,9 @@ impl IdentificationTask {
                 }
             };
 
+            let elapsed = now.elapsed();
+            let psms_len = psms.len();
+
             let scoring_message = match message.into_scoring_message(psms) {
                 Ok(msg) => msg,
                 Err(e) => {
@@ -184,12 +187,6 @@ impl IdentificationTask {
                 }
             };
 
-            Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
-            Self::ack_message(&message_id, identification_queue.as_ref()).await;
-            counter!(metrics_counter_name.clone()).increment(1);
-
-            let elapsed = now.elapsed();
-
             info!(
                 "[identification] Took {:.4}s to process message {}/{}/{} with {} candidate peptide(s)",
                 elapsed.as_secs_f32(),
@@ -199,8 +196,42 @@ impl IdentificationTask {
                 message.peptides().len()
             );
 
-            // wait before checking the queue again
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
+            Self::ack_message(&message_id, identification_queue.as_ref()).await;
+            counter!(metrics_counter_name.clone()).increment(1);
+
+            // sending metrics
+
+            let metrics_path = create_metrics_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.precursor(),
+                "identification.time",
+            );
+
+            Self::enqueue_message(
+                message.into_publication_message(
+                    metrics_path,
+                    elapsed.as_millis().to_string().into_bytes(),
+                ),
+                publication_queue.as_ref(),
+            )
+            .await;
+
+            let metrics_path = create_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.precursor(),
+                "identification.len",
+            );
+
+            Self::enqueue_message(
+                message.into_publication_message(metrics_path, psms_len.to_string().into_bytes()),
+                publication_queue.as_ref(),
+            )
+            .await;
         }
     }
 
