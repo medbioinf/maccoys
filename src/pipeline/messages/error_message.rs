@@ -2,7 +2,7 @@ use std::{fmt::Display, io::Cursor};
 
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline::errors::pipeline_error::PipelineError;
+use crate::{pipeline::errors::pipeline_error::PipelineError, precursor::Precursor};
 
 use super::is_message::IsMessage;
 
@@ -17,7 +17,7 @@ pub struct ErrorMessage {
     /// spectrum id
     spectrum_id: Option<String>,
     /// Precursor (m/z, charge)
-    precursor: Option<(f64, u8)>,
+    precursor: Option<Precursor>,
     /// Error message
     error: String,
 }
@@ -27,7 +27,7 @@ impl ErrorMessage {
         uuid: String,
         ms_run_name: Option<String>,
         spectrum_id: Option<String>,
-        precursor: Option<(f64, u8)>,
+        precursor: Option<Precursor>,
         error: PipelineError,
     ) -> Self {
         let error = format!("{}", error);
@@ -60,7 +60,7 @@ impl ErrorMessage {
 
     /// Get the precursor
     ///
-    pub fn precursor(&self) -> &Option<(f64, u8)> {
+    pub fn precursor(&self) -> &Option<Precursor> {
         &self.precursor
     }
 
@@ -77,7 +77,7 @@ impl IsMessage for ErrorMessage {
             self.uuid.clone(),
             self.ms_run_name.clone(),
             self.spectrum_id.clone(),
-            self.precursor,
+            self.precursor.clone(),
             error,
         )
     }
@@ -90,8 +90,9 @@ impl IsMessage for ErrorMessage {
             self.uuid,
             self.ms_run_name.as_deref().unwrap_or(""),
             self.spectrum_id.as_deref().unwrap_or(""),
-            self.precursor
-                .map(|(mz, charge)| format!("{}_{}", mz, charge))
+            self.precursor()
+                .as_ref()
+                .map(|p| format!("{}:{}", p.mz(), p.charge()))
                 .unwrap_or_default(),
             murmur3::murmur3_x64_128(&mut cursor, 0).unwrap_or(self.error.len() as u128),
         )
@@ -108,7 +109,11 @@ impl Display for ErrorMessage {
             location.push_str(&format!(" / {}", spectrum_id));
         }
         if let Some(precursor) = &self.precursor {
-            location.push_str(&format!(" / ({}, {})", precursor.0, precursor.1));
+            location.push_str(&format!(
+                " / ({} m/z, {} charge)",
+                precursor.mz(),
+                precursor.charge()
+            ));
         }
         write!(f, "[{}] {}", location, self.error)
     }

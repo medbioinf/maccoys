@@ -10,23 +10,21 @@ use std::{
 use anyhow::{Context, Result};
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::future::join_all;
+use indicatif::ProgressStyle;
 use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
 use tokio::{fs::create_dir_all, time::sleep};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, info_span};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 use uuid::Uuid;
 
-use crate::{
-    io::comet::configuration::Configuration as CometConfiguration,
-    pipeline::{
-        errors::queue_error::QueueError,
-        tasks::{
-            error_task::ErrorTask, identification_task::IdentificationTask,
-            indexing_task::IndexingTask, publication_task::PublicationTask,
-            scoring_task::ScoringTask, search_space_generation_task::SearchSpaceGenerationTask,
-            task::Task,
-        },
-        utils::create_file_path_on_ms_run_level,
+use crate::pipeline::{
+    errors::queue_error::QueueError,
+    tasks::{
+        error_task::ErrorTask, identification_task::IdentificationTask,
+        indexing_task::IndexingTask, publication_task::PublicationTask, scoring_task::ScoringTask,
+        search_space_generation_task::SearchSpaceGenerationTask, task::Task,
     },
+    utils::create_file_path_on_ms_run_level,
 };
 
 use super::{
@@ -152,6 +150,7 @@ where
                         storage.clone(),
                         search_space_generation_queue.clone(),
                         identification_queue.clone(),
+                        publication_queue.clone(),
                         error_queue.clone(),
                         search_space_generation_stop_flag.clone(),
                     ))
@@ -244,14 +243,13 @@ where
     /// * `result_dir` - Result directory where each search is stored
     /// * `tmp_dir` - Temporary directory for the pipeline
     /// * `config` - Configuration for the pipeline
-    /// * `comet_config` - Configuration for Comet
+    /// * `xcorr_config` - Configuration for Comet
     /// * `ptms` - Post translational modifications
     /// * `mzml_file_paths` - Paths to the mzML files to search
     ///
     pub async fn run(
         &self,
         search_params: SearchParameters,
-        mut comet_config: CometConfiguration,
         ptms: Vec<PostTranslationalModification>,
         mzml_file_paths: Vec<PathBuf>,
         metrics_scrape_url: Option<String>,
@@ -259,40 +257,36 @@ where
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
 
-        comet_config.set_ptms(&ptms, search_params.max_variable_modifications)?;
-        comet_config.set_num_results(10000)?;
-
         self.storage
-            .init_search(&uuid, search_params.clone(), &ptms, &comet_config)
+            .init_search(&uuid, search_params.clone(), &ptms)
             .await?;
-
-        // Create the stop flags
 
         let mut metrics_monitor: Option<MetricsMonitor> = None;
         if let Some(metrics_scrape_url) = metrics_scrape_url {
+            let corrected_uuid = uuid.clone().replace('-', "_"); // scrape endpoint replaces dashes with underscores
             let monitorable_metrics = vec![
                 MonitorableMetric::new(
-                    IndexingTask::get_counter_name(&uuid).to_string(),
+                    IndexingTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    SearchSpaceGenerationTask::get_counter_name(&uuid).to_string(),
+                    SearchSpaceGenerationTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    IdentificationTask::get_counter_name(&uuid).to_string(),
+                    IdentificationTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    ScoringTask::get_counter_name(&uuid).to_string(),
+                    ScoringTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    PublicationTask::get_counter_name(&uuid).to_string(),
+                    PublicationTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
                 MonitorableMetric::new(
-                    ErrorTask::get_counter_name(&uuid).to_string(),
+                    ErrorTask::get_counter_name(&corrected_uuid).to_string(),
                     MonitorableMetricType::Rate,
                 ),
             ];
@@ -350,12 +344,29 @@ where
         // Wait a couple of seconds for the indexing to start
         sleep(Duration::from_millis(5000)).await;
 
+        let progress_span = info_span!("progress");
+        progress_span.pb_set_message("Finished spectra");
+        progress_span.pb_set_style(
+            &ProgressStyle::with_template("        {msg} {wide_bar} {pos}/{len} {per_sec} ")
+                .unwrap(),
+        );
+
         loop {
             if self.storage.is_search_finished(&uuid).await? {
+                info!("Search finished");
                 break;
             }
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(1000)).await;
+            let _ = progress_span.enter();
+            progress_span.pb_set_length(self.storage.get_total_spectrum_count(&uuid).await?);
+            progress_span.pb_set_position(self.storage.get_finished_spectrum_count(&uuid).await?);
+            if self.storage.is_search_fully_enqueued(&uuid).await? {
+                progress_span.pb_set_message("Finished spectra");
+            } else {
+                progress_span.pb_set_message("Finished spectra (enqueuing still in progress)");
+            }
         }
+        drop(progress_span);
 
         if let Some(mut metrics_monitor) = metrics_monitor {
             metrics_monitor.stop().await?;

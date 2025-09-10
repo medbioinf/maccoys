@@ -1,32 +1,18 @@
 use std::{
     fs,
-    io::Cursor,
     path::PathBuf,
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    vec,
 };
 
-use dihardts_omicstools::{
-    mass_spectrometry::unit_conversions::mass_to_charge_to_dalton,
-    proteomics::{
-        io::mzml::{
-            elements::{has_cv_params::HasCvParams, is_list::IsList},
-            reader::Reader,
-        },
-        post_translational_modifications::PostTranslationalModification,
-    },
-};
+use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use macpepdb::mass::convert::to_int as mass_to_int;
 use metrics::counter;
-use tokio::io::AsyncWriteExt;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
-    functions::create_search_space,
     pipeline::{
         configuration::{
             SearchParameters, SearchSpaceGenerationTaskConfiguration,
@@ -38,11 +24,14 @@ use crate::{
         },
         messages::{
             error_message::ErrorMessage, identification_message::IdentificationMessage,
-            is_message::IsMessage, search_space_generation_message::SearchSpaceGenerationMessage,
+            is_message::IsMessage, publication_message::PublicationMessage,
+            search_space_generation_message::SearchSpaceGenerationMessage,
         },
         queue::{PipelineQueue, RedisPipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
+        utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
     },
+    search_space::search_space_generator::{InMemorySearchSpace, SearchSpaceGenerator},
 };
 
 use super::task::Task;
@@ -71,17 +60,19 @@ impl SearchSpaceGenerationTask {
     /// * `I` - Type of the identification queue
     /// * `E` - Type of the error queue
     ///
-    pub async fn start<S, G, I, E>(
+    pub async fn start<S, G, I, P, E>(
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
         search_space_generation_queue: Arc<G>,
         identification_queue: Arc<I>,
+        publication_queue: Arc<P>,
         error_queue: Arc<E>,
         stop_flag: Arc<AtomicBool>,
     ) where
         S: PipelineStorage + Send + Sync + 'static,
         G: PipelineQueue<SearchSpaceGenerationMessage> + Send + Sync + 'static,
         I: PipelineQueue<IdentificationMessage> + Send + Sync + 'static,
+        P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
         E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
     {
         let mut last_search_uuid = String::new();
@@ -106,6 +97,14 @@ impl SearchSpaceGenerationTask {
                     continue 'message_loop;
                 }
             };
+            info!(
+                "[search space generation] Got message {}/{}/{} with {} precursor(s)",
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.precursors().len()
+            );
+
             if last_search_uuid != *message.uuid() {
                 current_search_params = match storage.get_search_parameters(message.uuid()).await {
                     Ok(Some(params)) => params,
@@ -150,189 +149,51 @@ impl SearchSpaceGenerationTask {
                 metrics_counter_name = Self::get_counter_name(message.uuid());
             }
 
-            let mut mzml_bytes_reader = Cursor::new(message.mzml());
-
-            let mut mzml_file =
-                match Reader::read_indexed(&mut mzml_bytes_reader, None, true, false) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            SearchSpaceGenerationError::ReadingSpectrumMzMlError(e).into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-            let spectrum = match mzml_file.get_spectrum(message.spectrum_id()) {
-                Ok(spectrum) => spectrum,
-                Err(e) => {
-                    let error_message = message.to_error_message(
-                        SearchSpaceGenerationError::SpectrumReadError(
-                            message.spectrum_id().clone(),
-                            e,
-                        )
-                        .into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
-
-            // Free up some memory and release borrowed message
-            drop(mzml_file);
-
-            // Get all the m/z / charge pairs from the spectrum
-            let precursors = match spectrum.precursor_list.as_ref() {
-                Some(list) => list.iter().collect::<Vec<_>>(),
-                None => {
-                    let error_message = message.to_error_message(
-                        SearchSpaceGenerationError::NoPrecursorListError(
-                            message.spectrum_id().clone(),
-                        )
-                        .into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
-                }
-            };
-
-            let ions = precursors
-                .iter()
-                .flat_map(|precursor| match precursor.selected_ion_list.as_ref() {
-                    Some(list) => list.iter().collect::<Vec<_>>(),
-                    None => vec![],
-                })
-                .collect::<Vec<_>>();
-
-            if ions.is_empty() {
-                let error_message = message.to_error_message(
-                    SearchSpaceGenerationError::NoSelectedIonError(message.spectrum_id().clone())
-                        .into(),
-                );
-                error!("{}", &error_message);
-                Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
-            };
-
-            let precursors_result: Result<Vec<Vec<(f64, u8)>>, SearchSpaceGenerationError> = ions
-                .iter()
-                .map(|ion| {
-                    let mz: f64 = ion
-                        .get_cv_param("MS:1000744")
-                        .first()
-                        .ok_or_else(|| {
-                            SearchSpaceGenerationError::MissingSelectedIonMzError(
-                                message.spectrum_id().clone(),
-                            )
-                        })?
-                        .value
-                        .parse()
-                        .map_err(|err| {
-                            SearchSpaceGenerationError::MzParsingError(
-                                message.spectrum_id().clone(),
-                                err,
-                            )
-                        })?;
-                    // Select charge states statess
-                    let mut charge_cv_params = ion.get_cv_param("MS:1000041");
-                    // add possible charge states
-                    charge_cv_params.extend(ion.get_cv_param("MS:1000633"));
-
-                    let charges: Vec<u8> = if !charge_cv_params.is_empty() {
-                        charge_cv_params
-                            .into_iter()
-                            .map(|x| {
-                                x.value.parse().map_err(|err| {
-                                    SearchSpaceGenerationError::ChargeParsingError(
-                                        message.spectrum_id().clone(),
-                                        err,
-                                    )
-                                })
-                            })
-                            .collect::<Result<Vec<u8>, SearchSpaceGenerationError>>()?
-                    } else {
-                        (2..=current_search_params.max_charge).collect()
-                    };
-
-                    Ok::<_, SearchSpaceGenerationError>(
-                        charges
-                            .into_iter()
-                            .map(|charge| (mz, charge))
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-
-            // Check if everything was ok
-            let precursors = match precursors_result {
-                Ok(precursors) => precursors,
-                Err(e) => {
-                    let error_message = message.to_error_message(e.into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
-                }
-            };
-
-            let precursors = precursors.into_iter().flatten().collect::<Vec<_>>();
-
-            if precursors.is_empty() {
-                let error_message = message.to_error_message(
-                    SearchSpaceGenerationError::NoSelectedIonError(message.spectrum_id().clone())
-                        .into(),
-                );
-                error!("{}", &error_message);
-                Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                continue 'message_loop; // as this was the only MS2 spectrum we can continue with the next message
-            }
-
-            if precursors.len() > 1 {
-                for _ in precursors.iter().skip(1) {
-                    match storage.increase_total_spectrum_count(message.uuid()).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            let error_message = message.to_error_message(
-                                SearchSpaceGenerationError::IncreaseTotalSpectrumCountError(e)
-                                    .into(),
-                            );
-                            error!("{}", &error_message);
-                            Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                            continue 'message_loop;
-                        }
-                    }
-                }
-            }
-
             // Generate the search space for each precursor
-            'precursor_loop: for (precursor_mz, precursor_charge) in precursors.into_iter() {
-                let mass = mass_to_int(mass_to_charge_to_dalton(precursor_mz, precursor_charge));
+            'precursor_loop: for precursor in message.precursors() {
+                let now = std::time::Instant::now();
 
-                let mut fasta = Box::pin(Cursor::new(Vec::new()));
+                let mass = mass_to_int(precursor.to_dalton());
 
-                match create_search_space(
-                    &mut fasta,
-                    &current_ptms,
-                    mass,
-                    current_search_params.lower_mass_tolerance_ppm,
-                    current_search_params.upper_mass_tolerance_ppm,
-                    current_search_params.max_variable_modifications,
-                    current_search_params.decoys_per_peptide,
-                    config.target_url.to_owned(),
+                let mut search_space = InMemorySearchSpace::new();
+
+                let search_space_generator = match SearchSpaceGenerator::new(
+                    &config.target_url,
                     config.decoy_url.clone(),
                     config.target_lookup_url.clone(),
                     config.decoy_cache_url.clone(),
                 )
                 .await
                 {
+                    Ok(generator) => generator,
+                    Err(e) => {
+                        let error_message = message.to_error_message_with_precursor(
+                            SearchSpaceGenerationError::FastaGenerationError(e).into(),
+                            precursor.clone(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'precursor_loop;
+                    }
+                };
+
+                match search_space_generator
+                    .create(
+                        &mut search_space,
+                        mass,
+                        current_search_params.lower_mass_tolerance_ppm,
+                        current_search_params.upper_mass_tolerance_ppm,
+                        current_search_params.max_variable_modifications,
+                        &current_ptms,
+                        current_search_params.decoys_per_peptide,
+                    )
+                    .await
+                {
                     Ok(_) => (),
                     Err(e) => {
                         let error_message = message.to_error_message_with_precursor(
                             SearchSpaceGenerationError::FastaGenerationError(e).into(),
-                            (precursor_mz, precursor_charge),
+                            precursor.clone(),
                         );
                         error!("{}", &error_message);
                         Self::enqueue_message(error_message, error_queue.as_ref()).await;
@@ -340,29 +201,87 @@ impl SearchSpaceGenerationTask {
                     }
                 };
 
-                match fasta.flush().await {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let error_message = message.to_error_message_with_precursor(
-                            SearchSpaceGenerationError::FastaFlushError(e).into(),
-                            (precursor_mz, precursor_charge),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'precursor_loop;
-                    }
-                };
-                fasta.set_position(0);
+                let (target, decoys): (Vec<String>, Vec<String>) = search_space.into();
 
-                // Get the fasta content
-                let fasta = Pin::into_inner(fasta).into_inner();
+                let mut candidates = target;
+                candidates.extend(decoys);
+
+                let cadidates_size =
+                    candidates.iter().map(|p| p.len()).sum::<usize>() * std::mem::size_of::<char>();
+                let candidates_len = candidates.len();
+
+                let elapsed = now.elapsed();
+
+                info!(
+                    "[search space generation] Took {:.4}s to process message {}/{}/{} with {} m/z & {} charge. Found {} candidate peptides",
+                    elapsed.as_secs_f32(),
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor.mz(),
+                    precursor.charge(),
+                    candidates.len(),
+                );
 
                 let identification_message =
-                    message.into_identification_message(fasta, (precursor_mz, precursor_charge));
+                    message.into_identification_message(precursor.clone(), candidates);
 
                 Self::enqueue_message(identification_message, identification_queue.as_ref()).await;
                 Self::ack_message(&message_id, search_space_generation_queue.as_ref()).await;
                 counter!(metrics_counter_name.clone()).increment(1);
+
+                // sending metrics
+
+                let metrics_path = create_metrics_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor,
+                    "search_space_generation.time",
+                );
+
+                Self::enqueue_message(
+                    message.into_publication_message(
+                        metrics_path,
+                        elapsed.as_millis().to_string().into_bytes(),
+                    ),
+                    publication_queue.as_ref(),
+                )
+                .await;
+
+                let metrics_path = create_metrics_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor,
+                    "search_space_generation.size",
+                );
+
+                Self::enqueue_message(
+                    message.into_publication_message(
+                        metrics_path,
+                        cadidates_size.to_string().into_bytes(),
+                    ),
+                    publication_queue.as_ref(),
+                )
+                .await;
+
+                let metrics_path = create_file_path_on_precursor_level(
+                    message.uuid(),
+                    message.ms_run_name(),
+                    message.spectrum_id(),
+                    precursor,
+                    "search_space_generation.len",
+                );
+
+                Self::enqueue_message(
+                    message.into_publication_message(
+                        metrics_path,
+                        candidates_len.to_string().into_bytes(),
+                    ),
+                    publication_queue.as_ref(),
+                )
+                .await;
             }
         }
         // wait before checking the queue again
@@ -399,6 +318,9 @@ impl SearchSpaceGenerationTask {
             RedisPipelineQueue::<IdentificationMessage>::new(&config.identification).await?,
         );
 
+        let publication_queue =
+            Arc::new(RedisPipelineQueue::<PublicationMessage>::new(&config.publication).await?);
+
         let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
         let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
@@ -415,6 +337,7 @@ impl SearchSpaceGenerationTask {
                         storage.clone(),
                         search_space_generation_queue.clone(),
                         identification_queue.clone(),
+                        publication_queue.clone(),
                         error_queue.clone(),
                         stop_flag.clone(),
                     ))

@@ -1,9 +1,0 @@
-name: maccoys
-channels:
-  - defaults
-dependencies:
-  - python=3.11
-  - pip
-  - setuptools
-  - pip:
-    - -e ./[dev]

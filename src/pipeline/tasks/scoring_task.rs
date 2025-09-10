@@ -11,7 +11,7 @@ use local_outlier_probabilities::local_outlier_probabilities;
 use metrics::counter;
 use polars::prelude::*;
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::pipeline::{
     configuration::StandaloneScoringConfiguration,
@@ -23,7 +23,7 @@ use crate::pipeline::{
         scoring_message::{IntoPublicationMessageError, ScoringMessage},
     },
     queue::{PipelineQueue, RedisPipelineQueue},
-    utils::create_file_path_on_precursor_level,
+    utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
 };
 
 use super::task::Task;
@@ -42,11 +42,11 @@ pub const IONS_MATCHED_RATIO_COL_NAME: &str = "ions_matched_ratio";
 
 /// Name for the new mass diff column
 ///
-pub const MASS_DIFF_COL_NAME: &str = "mass_diff";
+pub const MASS_ERROR_COL_NAME: &str = "mass_error";
 
 /// Features to use for the scoring
 ///
-pub const FEATURES: [&str; 3] = ["xcorr", IONS_MATCHED_RATIO_COL_NAME, MASS_DIFF_COL_NAME];
+pub const FEATURES: [&str; 3] = ["xcorr", IONS_MATCHED_RATIO_COL_NAME, MASS_ERROR_COL_NAME];
 
 /// Name for the LoOP score
 ///
@@ -85,7 +85,6 @@ impl ScoringTask {
                     message
                 }
                 Ok(None) => {
-                    debug!("recv None, retrying");
                     // If the queue is empty, wait for a while before checking again
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     continue 'message_loop;
@@ -97,6 +96,14 @@ impl ScoringTask {
                 }
             };
 
+            info!(
+                "[scoring] Got message {}/{}/{} with {} PSM(s)",
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.psms().height()
+            );
+
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
             let relative_psms_path = create_file_path_on_precursor_level(
@@ -104,7 +111,7 @@ impl ScoringTask {
                 message.ms_run_name(),
                 message.spectrum_id(),
                 message.precursor(),
-                "tsv",
+                "parquet",
             );
 
             if message.psms().is_empty() {
@@ -117,11 +124,13 @@ impl ScoringTask {
                     message.precursor()
                 );
                 let publication_message = message
-                    .into_publication_message(relative_psms_path)
+                    .into_final_publication_message(relative_psms_path)
                     .unwrap();
                 Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
                 continue 'message_loop;
             }
+
+            let now = std::time::Instant::now();
 
             match calc_features(message.psms_mut()) {
                 Ok(_) => {}
@@ -155,7 +164,6 @@ impl ScoringTask {
                 }
             };
 
-            let now = std::time::Instant::now();
             let loop_score = match local_outlier_probabilities(feature_array, N_NEIGHBORS, 3, None)
             {
                 Ok(loop_score) => loop_score,
@@ -167,15 +175,14 @@ impl ScoringTask {
                     continue 'message_loop;
                 }
             };
-            debug!(
-                "[{}] loop score calculated in {} ms",
-                &message_id,
-                now.elapsed().as_millis()
-            );
+
+            let loop_score = loop_score
+                .into_iter() // convert outlier probability to inlier probability
+                .collect::<Vec<f64>>();
 
             match message
                 .psms_mut()
-                .with_column(Series::new(LOOP_COL_NAME.into(), loop_score.to_vec()))
+                .with_column(Series::new(LOOP_COL_NAME.into(), loop_score))
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -187,9 +194,33 @@ impl ScoringTask {
                 }
             }
 
-            drop(loop_score);
+            let elapsed = now.elapsed();
 
-            let publication_message = match message.into_publication_message(relative_psms_path) {
+            info!(
+                "[scoring] Took {:.4}s to process message {}/{}/{} with {} PSM(s)",
+                elapsed.as_secs_f32(),
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.psms().height()
+            );
+
+            let metrics_path = create_metrics_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.precursor(),
+                "scoring.time",
+            );
+
+            let metrics_message = message.into_publication_message(
+                metrics_path,
+                elapsed.as_millis().to_string().into_bytes(),
+            );
+
+            let publication_message = match message
+                .into_final_publication_message(relative_psms_path)
+            {
                 Ok(publication_message) => publication_message,
                 Err(e) => {
                     let error_message = match *e {
@@ -203,14 +234,12 @@ impl ScoringTask {
             };
 
             Self::enqueue_message(publication_message, publish_queue.as_ref()).await;
-
-            trace!("[{}] enqueued for publication", &message_id,);
-
             Self::ack_message(&message_id, scoring_queue.as_ref()).await;
-
-            debug!("[{}] ack", &message_id,);
-
             counter!(metrics_counter_name.clone()).increment(1);
+
+            // send some metrics
+
+            Self::enqueue_message(metrics_message, publish_queue.as_ref()).await;
         }
     }
 
@@ -290,13 +319,13 @@ fn calc_features(psms: &mut DataFrame) -> Result<(), ScoringError> {
     let ions_matched_ratio =
         (ions_matches / ions_total)?.with_name(IONS_MATCHED_RATIO_COL_NAME.into());
 
-    let exp_neutral_mass = psms.column("exp_neutral_mass")?;
-    let calc_neutral_mass = psms.column("calc_neutral_mass")?;
-    let mass_diff = abs((exp_neutral_mass - calc_neutral_mass)?.as_materialized_series())?
-        .with_name(MASS_DIFF_COL_NAME.into());
+    let experimental_mass = psms.column("experimental_mass")?;
+    let theoretical_mass = psms.column("theoretical_mass")?;
+    let mass_error = abs((experimental_mass - theoretical_mass)?.as_materialized_series())?
+        .with_name(MASS_ERROR_COL_NAME.into());
 
     psms.with_column(ions_matched_ratio)?;
-    psms.with_column(mass_diff)?;
+    psms.with_column(mass_error)?;
 
     Ok(())
 }

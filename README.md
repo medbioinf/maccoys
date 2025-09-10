@@ -47,9 +47,9 @@ Great for testing and playing around
     * docker: `docker run --rm -it local/maccoys:dev pipeline new-config`
 3. Adjust both configs to your MS-parameter and experimental design
 4. Run the pipeline
-    * native: `maccoys -vvvvvv -l <PATH_TO_LOG_FILE> pipeline local-run  <RESULT_FOLDER_PATH> <PATH_TO_MACCOYS_CONFIG_TOML> <PATH_TO_COMET_CONFIG> <MZML_FILES_0> <MZML_FILE_1> ...`
+    * native: `maccoys -vvvvvv -l <PATH_TO_LOG_FILE> pipeline local-run  <RESULT_FOLDER_PATH> <PATH_TO_MACCOYS_CONFIG_TOML> <PATH_TO_xcorr_config> <MZML_FILES_0> <MZML_FILE_1> ...`
     * docker: `docker run --rm -it local/maccoys:dev pipeline new-config`
-5. `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv -l /data/logs/maccoys.log pipeline local-run  /data/results /data/<PATH_TO_MACCOYS_CONFIG_TOML> /data/<PATH_TO_COMET_CONFIG> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
+5. `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv -l /data/logs/maccoys.log pipeline local-run  /data/results /data/<PATH_TO_MACCOYS_CONFIG_TOML> /data/<PATH_TO_xcorr_config> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
 
 Checkout `... pipline --help` and have a look on the optional parameter and the parameter descriptions which might be helpful.
 
@@ -61,8 +61,8 @@ You can test it via:
 2. Shell 2: `ultraman start` (you can use any Procfile manager, like (ultraman)[https://github.com/yukihirop/ultraman], (foreman)[https://github.com/ddollar/foreman] or (honcho)[https://github.com/nickstenning/honcho/tree/main])
 
 Using the following command, the search is send to the remote entrypoint and scheduled:
-* native: `maccoys -vvvvvv pipeline remote-run <API_BASE_URL> <PATH_TO_SEARCH_PARAMETER_TOML> <PATH_TO_COMET_CONFIG> <MZML_FILES_0> <MZML_FILE_1> ...`
-* docker: `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv pipeline local-run <API_BASE_URL> /data/<PATH_TO_SEARCH_PARAMETER_TOML> /data/<PATH_TO_COMET_CONFIG> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
+* native: `maccoys -vvvvvv pipeline remote-run <API_BASE_URL> <PATH_TO_SEARCH_PARAMETER_TOML> <PATH_TO_xcorr_config> <MZML_FILES_0> <MZML_FILE_1> ...`
+* docker: `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv pipeline local-run <API_BASE_URL> /data/<PATH_TO_SEARCH_PARAMETER_TOML> /data/<PATH_TO_xcorr_config> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
 
 MaCcoyS will print an UUID to identify the search, e.g. to recheck the progress with `... -vvvvvvv pipeline search-monitor <API_BASE_URL> <UUID>` and find the results.
 
@@ -70,11 +70,6 @@ MaCcoyS will print an UUID to identify the search, e.g. to recheck the progress 
 
 ### Requirements
 * Rust: The recommended way is to use [rustup](https://rustup.rs/)
-* Conda | Mamba | Micromamba: All three have the same CLI. Just use Micromamba, it's the fastest.
 
 ### Preparation
-1. `micromamba env create -f environment.yaml`
-2. `micromamba activate maccoys`
-3. `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(dirname $(dirname $(which python)))/lib`,
-    this will add environments Python libraries into the `LD_LIBRARY_PATH`-variable so they ara available for the Rust compiler. On macOS use `DYLD_FALLBACK_LIBRARY_PATH=...`
-3. `cargo build`, rustup should install the needed Rust version and compile
+1. `cargo build`, rustup should install the needed Rust version and compile

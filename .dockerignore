@@ -13,6 +13,6 @@
 !/Cargo.toml
 !/Cargo.lock
 !/LICENSE
-!/Readme.md
+!/README.md
 !/rust-toolchain.toml
 !/src/**/*.rs

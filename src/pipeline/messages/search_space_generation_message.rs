@@ -1,8 +1,14 @@
-use std::io::Cursor;
+use std::{io::Cursor, path::PathBuf};
 
+use ndarray::Array1;
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline::errors::pipeline_error::PipelineError;
+use crate::{
+    pipeline::{
+        errors::pipeline_error::PipelineError, messages::publication_message::PublicationMessage,
+    },
+    precursor::Precursor,
+};
 
 use super::{
     error_message::ErrorMessage, identification_message::IdentificationMessage,
@@ -21,19 +27,32 @@ pub struct SearchSpaceGenerationMessage {
     ms_run_name: String,
     /// Spectrum ID
     spectrum_id: String,
-    /// mzML containing only one MS/MS spectrum and the related MS spectrum
-    mzml: Vec<u8>,
+    /// m/z
+    mz_list: Array1<f64>,
+    /// Intensity
+    intensity_list: Array1<f64>,
+    /// Precursor Vec<(m/z, charge)> used for generating the search space
+    precursors: Vec<Precursor>,
 }
 
 impl SearchSpaceGenerationMessage {
     /// Create a new search space generation message
     ///
-    pub fn new(uuid: String, ms_run_name: String, spectrum_id: String, mzml: Vec<u8>) -> Self {
+    pub fn new(
+        uuid: String,
+        ms_run_name: String,
+        spectrum_id: String,
+        mz_list: Array1<f64>,
+        intensity_list: Array1<f64>,
+        precursors: Vec<Precursor>,
+    ) -> Self {
         Self {
             uuid,
             ms_run_name,
             spectrum_id,
-            mzml,
+            mz_list,
+            intensity_list,
+            precursors,
         }
     }
 
@@ -54,30 +73,64 @@ impl SearchSpaceGenerationMessage {
         &self.spectrum_id
     }
 
-    /// Get the spectrum mzML
+    /// Get the m/z list
     ///
-    pub fn mzml(&self) -> &Vec<u8> {
-        &self.mzml
+    pub fn mz_list(&self) -> &Array1<f64> {
+        &self.mz_list
+    }
+
+    /// Get the intensity list
+    ///
+    pub fn intensity_list(&self) -> &Array1<f64> {
+        &self.intensity_list
+    }
+
+    /// Get the precursors (m/z, charge) used for generating the search space
+    ///
+    pub fn precursors(&self) -> &[Precursor] {
+        &self.precursors
     }
 
     /// Converts this into a IdenitificationMessage
     ///
     /// # Arguments
-    /// * `fasta` - Fasta file
     /// * `precursor` - Precursor (m/z, charge) used for generating the search space
+    /// * `peptides` - peptide candidates in ProForma format
     ///
     pub fn into_identification_message(
         &self,
-        fasta: Vec<u8>,
-        precursor: (f64, u8),
+        precursor: Precursor,
+        peptides: Vec<String>,
     ) -> IdentificationMessage {
         IdentificationMessage::new(
             self.uuid.clone(),
             self.ms_run_name.clone(),
             self.spectrum_id.clone(),
-            self.mzml.clone(),
-            fasta,
+            self.mz_list.clone(),
+            self.intensity_list.clone(),
             precursor,
+            peptides,
+        )
+    }
+
+    /// Creates a publication message for non result publication
+    ///
+    /// # Arguments
+    /// * `file_path` - The relative path to the file to write content to
+    /// * `content` - The content of the CSV file
+    ///
+    pub fn into_publication_message(
+        &self,
+        file_path: PathBuf,
+        content: Vec<u8>,
+    ) -> PublicationMessage {
+        PublicationMessage::new(
+            self.uuid.clone(),
+            self.ms_run_name.clone(),
+            self.spectrum_id.clone(),
+            file_path,
+            false,
+            content,
         )
     }
 
@@ -90,7 +143,7 @@ impl SearchSpaceGenerationMessage {
     pub fn to_error_message_with_precursor(
         &self,
         error: PipelineError,
-        precursor: (f64, u8),
+        precursor: Precursor,
     ) -> ErrorMessage {
         ErrorMessage::new(
             self.uuid.clone(),
@@ -114,7 +167,26 @@ impl IsMessage for SearchSpaceGenerationMessage {
     }
 
     fn get_id(&self) -> String {
-        let mut cursor = Cursor::new(&self.mzml);
+        let spectrum_characteristics_string = format!(
+            "{}|{}|{}",
+            self.mz_list()
+                .iter()
+                .map(|x| format!("{x}"))
+                .collect::<Vec<String>>()
+                .join(","),
+            self.intensity_list()
+                .iter()
+                .map(|x| format!("{x}"))
+                .collect::<Vec<String>>()
+                .join(","),
+            self.precursors()
+                .iter()
+                .map(|p| format!("{}:{}", p.mz(), p.charge()))
+                .collect::<Vec<String>>()
+                .join(","),
+        );
+
+        let mut cursor = Cursor::new(&spectrum_characteristics_string);
         format!(
             "{}_{}_{}_{}_{}",
             ID_PREFIX,

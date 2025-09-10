@@ -10,16 +10,14 @@ use axum::{
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::future::join_all;
 use http::StatusCode;
+use macpepdb::functions::post_translational_modification::PTMCollection;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
     errors::axum::web_error::AnyhowWebError,
-    io::{
-        axum::multipart::write_streamed_file,
-        comet::configuration::Configuration as CometConfiguration,
-    },
+    io::axum::multipart::write_streamed_file,
     pipeline::{
         queue::RedisPipelineQueue,
         storage::{PipelineStorage, RedisPipelineStorage},
@@ -162,7 +160,7 @@ impl RemotePipelineWebApi {
     /// ### Body
     /// * `mzml_*` - Every fields starting with `mzml_` is considered as a mzML file
     /// * `search_parameters` - Search parameters in TOML format (section `search_parameters` from the configuration file without the section name)
-    /// * `comet_params` - Comet parameter file
+    /// * `xcorr_config` - Comet parameter file
     /// * `ptms` - CSV file containing PTMs
     ///
     /// ## Response
@@ -177,7 +175,6 @@ impl RemotePipelineWebApi {
         // Manifest files
         let uuid = Uuid::new_v4().to_string();
         let mut search_params: Option<SearchParameters> = None;
-        let mut comet_params: Option<CometConfiguration> = None;
         let mut ptms: Vec<PostTranslationalModification> = Vec::new();
         let mut mzml_file_names: Vec<String> = Vec::new();
 
@@ -216,16 +213,6 @@ impl RemotePipelineWebApi {
                 continue;
             }
 
-            if field_name == "comet_params" {
-                comet_params = match &field.text().await {
-                    Ok(text) => Some(CometConfiguration::new(text.to_string())?),
-                    Err(err) => {
-                        return Err(anyhow!("Error reading Comet params field: {:?}", err).into())
-                    }
-                };
-                continue;
-            }
-
             // Optional PTMs
             if field_name == "ptms" {
                 let ptm_csv = match field.bytes().await {
@@ -248,7 +235,11 @@ impl RemotePipelineWebApi {
             }
         }
 
-        if ptms.is_empty() {
+        if !ptms.is_empty() {
+            // validate PTMs
+            let _ =
+                PTMCollection::new(&ptms).map_err(|e| anyhow!("Error validating PTMs: {:?}", e))?;
+        } else {
             warn!("Not PTMs submitted, which is unusual")
         }
 
@@ -274,23 +265,12 @@ impl RemotePipelineWebApi {
             }
         };
 
-        let mut comet_params = match comet_params {
-            Some(comet_params) => comet_params,
-            None => {
-                tokio::fs::remove_dir_all(&state.work_dir.join(&uuid)).await?;
-                return Err(anyhow!("Comet parameters not uploaded").into());
-            }
-        };
-
-        comet_params.set_num_results(10000)?;
-        comet_params.set_ptms(&ptms, search_params.max_variable_modifications)?;
-
         // Init new search
         match state
             .storage
             .write()
             .await
-            .init_search(&uuid, search_params, &ptms, &comet_params)
+            .init_search(&uuid, search_params, &ptms)
             .await
         {
             Ok(_) => (),

@@ -71,6 +71,15 @@ impl PublicationTask {
                     continue 'message_loop;
                 }
             };
+            info!(
+                "[publication] Got message {}/{}/{} with {} bytes to publish in {}",
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                message.content().len(),
+                message.file_path().display(),
+            );
+
             let metrics_counter_name = Self::get_counter_name(message.uuid());
 
             let absolute_file_path = work_dir.join(message.file_path());
