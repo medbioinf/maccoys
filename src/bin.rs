@@ -325,6 +325,9 @@ struct Cli {
     /// Tracing log rotation. Only used if `file` is set in `tracing_target`.
     #[arg(short, long, value_enum, default_value = "never")]
     rotation: TracingLogRotation,
+    /// Max log files. Only used if `file` is set in `tracing_target`.
+    #[arg(short, long, value_enum, default_value = "1")]
+    number_of_log_files: usize,
     /// Remote address of Loki endpoint for logging.
     /// Only used if `loki` is set in `tracing_target`.
     #[arg(short, long, default_value = "127.0.0.1:3100")]
@@ -395,11 +398,16 @@ async fn main() -> Result<()> {
     if args.tracing_target.contains(&TracingTarget::File)
         || args.tracing_target.contains(&TracingTarget::All)
     {
-        let file_appender = RollingFileAppender::new(
-            args.rotation.into(),
-            args.file.parent().unwrap(),
-            args.file.file_name().unwrap(),
-        );
+        let file_appender = RollingFileAppender::builder()
+            .max_log_files(args.number_of_log_files)
+            .rotation(args.rotation.into())
+            .filename_prefix(args.file.file_stem().unwrap().to_string_lossy())
+            .filename_suffix(
+                args.file
+                    .extension()
+                    .map_or("log", |ext| ext.to_str().unwrap()),
+            )
+            .build(args.file.parent().unwrap())?;
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         tracing_file_layer = Some(tracing_subscriber::fmt::layer().with_writer(non_blocking));
         _tracing_log_writer_guard = Some(guard);
