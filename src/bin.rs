@@ -303,6 +303,8 @@ enum Commands {
     Config {},
     /// MaCcoyS search pipeline
     Pipeline(PipelineCLI),
+    /// Prints the version
+    Version {},
 }
 
 #[derive(Debug, Parser)]
@@ -743,6 +745,11 @@ async fn main() -> Result<()> {
                 config_file_path,
             } => ErrorTask::run_standalone(work_dir, config_file_path).await?,
         },
+        Commands::Version {} => {
+            println!("-- MaCcoyS - Mass Centric Decoy Search  --");
+            println!("Version: {}", env!("CARGO_PKG_VERSION"));
+            println!("Repository: {}", env!("CARGO_PKG_REPOSITORY"));
+        }
     };
     Ok(())
 }
