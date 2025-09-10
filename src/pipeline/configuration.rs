@@ -1,4 +1,4 @@
-use std::{ops::Deref, path::PathBuf};
+use std::ops::Deref;
 
 use xcorrrs::configuration::Configuration as XcorrConfiguration;
 
@@ -109,8 +109,6 @@ pub struct IdentificationTaskConfiguration {
     /// General task configuration
     #[serde(flatten)]
     pub general: TaskConfiguration,
-    /// Path to comet executable
-    pub comet_exe_path: PathBuf,
     /// Number of threads to use
     pub threads: usize,
 }
@@ -189,7 +187,6 @@ impl Default for PipelineConfiguration {
                     queue_capacity: 100,
                     redis_url: None,
                 },
-                comet_exe_path: PathBuf::from("/usr/local/bin/comet"),
                 threads: 2,
             },
             scoring: TaskConfiguration {
