@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,35 +8,18 @@ use std::{
 
 use anyhow::{anyhow, bail, Result};
 use indicatif::ProgressStyle;
-use lazy_static::lazy_static;
 use tokio::{spawn, task::JoinHandle, time::sleep_until};
-use tracing::{error, info, info_span, Span};
+use tracing::{error, info, info_span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
-use super::tasks::{
-    error_task::ErrorTask, identification_task::IdentificationTask, indexing_task::IndexingTask,
-    publication_task::PublicationTask, scoring_task::ScoringTask,
-    search_space_generation_task::SearchSpaceGenerationTask, task::Task,
-};
+use crate::pipeline::remote_pipeline_web_api::ProgressRepsonse;
 
 /// Interval to refresh the monitored metrics
 ///
 const REFRESH_INTERVAL: u64 = 1000;
 
-/// Span style for simple metrics
-///
-const SIMPLE_STYLE: &str = "{msg} {pos}/s";
-
-lazy_static! {
-    static ref METRICS_RENDER_ORDER: [&'static str; 6] = [
-        IndexingTask::get_counter_prefix(),
-        SearchSpaceGenerationTask::get_counter_prefix(),
-        IdentificationTask::get_counter_prefix(),
-        ScoringTask::get_counter_prefix(),
-        PublicationTask::get_counter_prefix(),
-        ErrorTask::get_counter_prefix(),
-    ];
-}
+/// Progress bar style
+const PROGRESS_STYLE: &str = "\t{msg} {wide_bar} {pos}/{len} {per_sec} ";
 
 pub struct RemotePipeline {}
 
@@ -134,24 +116,24 @@ impl RemotePipeline {
     /// * `uuid` - UUID of the search
     ///
     pub async fn start_remote_search_monitor(base_url: String, uuid: &str) -> Result<()> {
-        let metrics_monitor = RemotePiplineMetricsMonitor::new(uuid, base_url);
+        let progress_monitor = RemotePipelineProgressMonitor::new(uuid, base_url);
 
         tokio::signal::ctrl_c().await?;
 
-        metrics_monitor.stop().await?;
+        progress_monitor.stop().await?;
 
         Ok(())
     }
 }
 
-struct RemotePiplineMetricsMonitor {
+struct RemotePipelineProgressMonitor {
     stop_flag: Arc<AtomicBool>,
     handle: JoinHandle<Result<()>>,
 }
 
-impl RemotePiplineMetricsMonitor {
+impl RemotePipelineProgressMonitor {
     pub fn new(search_uuid: &str, remote_pipline_api: String) -> Self {
-        let url = format!("{remote_pipline_api}/api/pipeline/monitor/{search_uuid}");
+        let url = format!("{remote_pipline_api}/api/pipeline/progress/{search_uuid}");
         let stop_flag = Arc::new(AtomicBool::new(false));
         let handle = spawn(Self::view(stop_flag.clone(), url));
 
@@ -159,39 +141,49 @@ impl RemotePiplineMetricsMonitor {
     }
 
     async fn view(stop_flag: Arc<AtomicBool>, monitor_endpoint_url: String) -> Result<()> {
-        let spans: HashMap<String, Span> = METRICS_RENDER_ORDER
-            .iter()
-            .map(|metric| {
-                let span = info_span!("");
-                let _ = span.enter();
-                span.pb_set_position(0);
-                span.pb_set_message(metric);
-                span.pb_set_style(&ProgressStyle::with_template(SIMPLE_STYLE).unwrap());
-                (metric.to_string(), span)
-            })
-            .collect();
+        let progress_span = info_span!("progress");
+        progress_span.pb_set_message("Finished spectra");
+        progress_span.pb_set_style(&ProgressStyle::with_template(PROGRESS_STYLE).unwrap());
 
         while !stop_flag.load(Ordering::Relaxed) {
             let next_refresh =
                 tokio::time::Instant::now() + tokio::time::Duration::from_millis(REFRESH_INTERVAL);
-            let response = reqwest::get(&monitor_endpoint_url).await?;
+
+            let response = match reqwest::get(&monitor_endpoint_url).await {
+                Ok(response) => response,
+                Err(e) => {
+                    error!("Error getting progress: {:?}", e);
+                    sleep_until(next_refresh).await;
+                    continue;
+                }
+            };
             if !response.status().is_success() {
+                error!(
+                    "Error getting progress - Status Code: {} {:?}",
+                    response.status(),
+                    response.text().await?
+                );
+                sleep_until(next_refresh).await;
                 continue;
             }
-            let counter: HashMap<String, usize> = match response.json().await {
-                Ok(counter) => counter,
+            let progress: ProgressRepsonse = match response.json().await {
+                Ok(progress) => progress,
                 Err(e) => {
-                    error!("Error reading metrics line: {:?}", e);
+                    error!("Error converting progress: {:?}", e);
+                    sleep_until(next_refresh).await;
                     continue;
                 }
             };
 
-            for metrics in METRICS_RENDER_ORDER.iter() {
-                let value = counter.get(*metrics).unwrap_or(&0);
-                let span = spans.get(*metrics).unwrap();
-                let _ = span.enter();
-                span.pb_set_position(*value as u64);
+            let _ = progress_span.enter();
+            progress_span.pb_set_length(progress.total_spectrum_count());
+            progress_span.pb_set_position(progress.finished_spectrum_count());
+            if progress.is_search_fully_enqueued() {
+                progress_span.pb_set_message("Finished spectra");
+            } else {
+                progress_span.pb_set_message("Finished spectra (enqueuing still in progress)");
             }
+
             sleep_until(next_refresh).await;
         }
 

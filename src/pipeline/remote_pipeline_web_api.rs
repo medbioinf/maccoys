@@ -5,12 +5,12 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, State},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
-use futures::future::join_all;
 use http::StatusCode;
 use macpepdb::functions::post_translational_modification::PTMCollection;
+use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -21,7 +21,6 @@ use crate::{
     pipeline::{
         queue::RedisPipelineQueue,
         storage::{PipelineStorage, RedisPipelineStorage},
-        tasks::task::Task,
     },
     web::web_error::WebError,
 };
@@ -36,11 +35,6 @@ use super::{
         search_space_generation_message::SearchSpaceGenerationMessage,
     },
     queue::PipelineQueue,
-    tasks::{
-        error_task::ErrorTask, identification_task::IdentificationTask,
-        indexing_task::IndexingTask, publication_task::PublicationTask, scoring_task::ScoringTask,
-        search_space_generation_task::SearchSpaceGenerationTask,
-    },
     utils::create_file_path_on_ms_run_level,
 };
 
@@ -55,22 +49,21 @@ struct EntrypointServiceState {
     error_queue: RedisPipelineQueue<ErrorMessage>,
     storage: RwLock<RedisPipelineStorage>,
     work_dir: PathBuf,
-    prometheus_base_url: String,
 }
 
 /// Struct to share pipeline workload
 ///
 #[derive(serde::Deserialize, serde::Serialize)]
-struct PipelineWorkload {
-    pub index_queue: usize,
-    pub search_space_generation_queue: usize,
-    pub identification_queue: usize,
-    pub scoring_queue: usize,
-    pub publication_queue: usize,
-    pub error_queue: usize,
+pub struct QueueResponse {
+    index_queue: usize,
+    search_space_generation_queue: usize,
+    identification_queue: usize,
+    scoring_queue: usize,
+    publication_queue: usize,
+    error_queue: usize,
 }
 
-impl PipelineWorkload {
+impl QueueResponse {
     pub async fn new(
         index_queue: &impl PipelineQueue<IndexingMessage>,
         search_space_generation_queue: &impl PipelineQueue<SearchSpaceGenerationMessage>,
@@ -78,15 +71,72 @@ impl PipelineWorkload {
         scoring_queue: &impl PipelineQueue<ScoringMessage>,
         publication_queue: &impl PipelineQueue<PublicationMessage>,
         error_queue: &impl PipelineQueue<ErrorMessage>,
+    ) -> Result<Self, QueueError> {
+        Ok(Self {
+            index_queue: index_queue.len().await?,
+            search_space_generation_queue: search_space_generation_queue.len().await?,
+            identification_queue: identification_queue.len().await?,
+            scoring_queue: scoring_queue.len().await?,
+            publication_queue: publication_queue.len().await?,
+            error_queue: error_queue.len().await?,
+        })
+    }
+
+    pub fn index_queue(&self) -> usize {
+        self.index_queue
+    }
+
+    pub fn search_space_generation_queue(&self) -> usize {
+        self.search_space_generation_queue
+    }
+
+    pub fn identification_queue(&self) -> usize {
+        self.identification_queue
+    }
+
+    pub fn scoring_queue(&self) -> usize {
+        self.scoring_queue
+    }
+
+    pub fn publication_queue(&self) -> usize {
+        self.publication_queue
+    }
+
+    pub fn error_queue(&self) -> usize {
+        self.error_queue
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct ProgressRepsonse {
+    total_spectrum_count: u64,
+    finished_spectrum_count: u64,
+    is_search_fully_enqueued: bool,
+}
+
+impl ProgressRepsonse {
+    pub fn new(
+        total_spectrum_count: u64,
+        finished_spectrum_count: u64,
+        is_search_fully_enqueued: bool,
     ) -> Self {
         Self {
-            index_queue: index_queue.len().await.unwrap_or(0),
-            search_space_generation_queue: search_space_generation_queue.len().await.unwrap_or(0),
-            identification_queue: identification_queue.len().await.unwrap_or(0),
-            scoring_queue: scoring_queue.len().await.unwrap_or(0),
-            publication_queue: publication_queue.len().await.unwrap_or(0),
-            error_queue: error_queue.len().await.unwrap_or(0),
+            total_spectrum_count,
+            finished_spectrum_count,
+            is_search_fully_enqueued,
         }
+    }
+
+    pub fn total_spectrum_count(&self) -> u64 {
+        self.total_spectrum_count
+    }
+
+    pub fn finished_spectrum_count(&self) -> u64 {
+        self.finished_spectrum_count
+    }
+
+    pub fn is_search_fully_enqueued(&self) -> bool {
+        self.is_search_fully_enqueued
     }
 }
 
@@ -131,8 +181,8 @@ impl RemotePipelineWebApi {
         // Build our application with route
         let app = Router::new()
             .route("/api/pipeline/enqueue", post(Self::enqueue))
-            .route("/api/pipeline/monitor/:uuid", get(Self::monitor))
             .route("/api/pipeline/queues", get(Self::queue_monitor))
+            .route("/api/pipeline/progress/:uuid", get(Self::progress_monitor))
             .layer(DefaultBodyLimit::disable())
             .with_state(state);
 
@@ -295,58 +345,6 @@ impl RemotePipelineWebApi {
         Ok((StatusCode::OK, uuid).into_response())
     }
 
-    /// Entrypoint for monitoring the progress of a search
-    ///
-    /// # API
-    /// ## Request
-    /// * Path: `/api/pipeline/monitor/:uuid`
-    /// * Method: `GET`
-    ///
-    /// ## Response
-    /// RSV with metrics
-    /// ```tsv
-    /// started_searches        prepared        search_space_generation comet_search    goodness_and_rescoring  cleanup
-    /// 13852   10357   286     64      47      47
-    /// ```
-    ///
-    async fn monitor(
-        State(state): State<Arc<EntrypointServiceState>>,
-        axum::extract::Path(uuid): axum::extract::Path<String>,
-    ) -> Result<(StatusCode, String), WebError> {
-        let counters: Vec<f64> = join_all(vec![
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &ErrorTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &PublicationTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &ScoringTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &IdentificationTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &SearchSpaceGenerationTask::get_counter_name(&uuid),
-            ),
-            Self::get_prometheus_counter_rate(
-                &state.prometheus_base_url,
-                &IndexingTask::get_counter_name(&uuid),
-            ),
-        ])
-        .await;
-
-        match serde_json::to_string(&counters) {
-            Ok(counters) => Ok((StatusCode::OK, counters)),
-            Err(e) => Err(anyhow!("Error serializing counters: {:?}", e).into()),
-        }
-    }
-
     /// Entrypoint for monitoring the queue occupation
     ///
     /// # API
@@ -355,14 +353,18 @@ impl RemotePipelineWebApi {
     /// * Method: `GET`
     ///
     /// ## Response
-    /// CSV with metrics
-    /// ```tsv
+    /// ```json
+    /// {
+    ///  "index_queue": 0,
+    ///  "search_space_generation_queue": 0,
+    ///  ...
+    /// }
     /// ```
     ///
     async fn queue_monitor(
         State(state): State<Arc<EntrypointServiceState>>,
-    ) -> Result<Response<String>, AnyhowWebError> {
-        let workload = PipelineWorkload::new(
+    ) -> Result<Json<JsonValue>, WebError> {
+        let response = QueueResponse::new(
             &state.index_queue,
             &state.search_space_generation_queue,
             &state.identification_queue,
@@ -370,80 +372,63 @@ impl RemotePipelineWebApi {
             &state.publication_queue,
             &state.error_queue,
         )
-        .await;
+        .await
+        .map_err(|e| {
+            WebError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error getting queue lengths: {:?}", e),
+            )
+        })?;
 
-        let response = axum::response::Response::builder()
-            .header("Content-Type", "application/json")
-            .status(StatusCode::OK)
-            .body(serde_json::to_string(&workload)?)?;
-
-        Ok(response)
+        Ok(Json(serde_json::to_value(response)?))
     }
 
-    async fn get_prometheus_counter_rate(prometheus_url: &str, metric_name: &str) -> f64 {
-        let url = format!("{}/api/v1/query", prometheus_url);
-        let from =
-            reqwest::multipart::Form::new().text("query", format!("rate({}[5m])", metric_name));
-        let response = reqwest::Client::new()
-            .post(&url)
-            .multipart(from)
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(e) => {
-                error!("Error getting Prometheus counter rate: {:?}", e);
-                return -1.0;
-            }
-        };
-        if !response.status().is_success() {
-            error!(
-                "Error getting Prometheus counter rate: {:?}",
-                response.text().await
-            );
-            return -1.0;
-        }
-        let data = match response.json::<serde_json::Value>().await {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Error parsing Prometheus counter rate: {:?}", e);
-                return -1.0;
-            }
-        };
+    /// Entrypoint for monitoring the progress of a search
+    ///
+    /// # API
+    /// ## Request
+    /// * Path: `/api/pipeline/progress/:uuid`
+    /// * Method: `GET`
+    ///
+    /// ## Response
+    ///
+    /// ```tsv
+    /// {
+    ///  "total_spectrum_count": 100,
+    ///  "finished_spectrum_count": 50,
+    ///  "is_search_fully_enqueued": false
+    /// }
+    /// ```
+    ///
+    async fn progress_monitor(
+        State(state): State<Arc<EntrypointServiceState>>,
+        axum::extract::Path(uuid): axum::extract::Path<String>,
+    ) -> Result<Json<JsonValue>, WebError> {
+        let storage = state.storage.read().await;
+        let response = ProgressRepsonse::new(
+            storage.get_total_spectrum_count(&uuid).await.map_err(|e| {
+                WebError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Error getting total spectrum count: {:?}", e),
+                )
+            })?,
+            storage
+                .get_finished_spectrum_count(&uuid)
+                .await
+                .map_err(|e| {
+                    WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error getting finished spectrum count: {:?}", e),
+                    )
+                })?,
+            storage.is_search_fully_enqueued(&uuid).await.map_err(|e| {
+                WebError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Error getting total spectrum count: {:?}", e),
+                )
+            })?,
+        );
 
-        let mut data = data.get("data");
-        if data.is_none() {
-            error!("Error parsing Prometheus counter rate: {:?}", data);
-            return -1.0;
-        }
-
-        data = data.unwrap().get("result");
-        if data.is_none() {
-            error!("Error parsing Prometheus counter rate: {:?}", data);
-            return -1.0;
-        }
-
-        data = data.unwrap().get(0);
-        if data.is_none() {
-            error!("Error parsing Prometheus counter rate: {:?}", data);
-            return -1.0;
-        }
-
-        data = data.unwrap().get("value");
-        if data.is_none() {
-            error!("Error parsing Prometheus counter rate: {:?}", data);
-            return -1.0;
-        }
-
-        let data: (f64, f64) = match serde_json::from_value(data.unwrap().clone()) {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Error parsing Prometheus counter rate: {:?}", e);
-                return -1.0;
-            }
-        };
-
-        // Prometheus is queried for the last 5 minutes, so we need to divide by 300 to get the rate per second
-        data.1 / 300.0
+        Ok(Json(serde_json::to_value(response)?))
     }
 }
