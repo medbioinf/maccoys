@@ -219,8 +219,6 @@ impl Default for PipelineConfiguration {
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct RemoteEntypointConfiguration {
-    /// Search parameters
-    pub search_parameters: SearchParameters,
     /// Index task configuration
     pub index: TaskConfiguration,
     /// Search space generation task configuration
