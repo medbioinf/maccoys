@@ -266,7 +266,7 @@ impl SearchSpaceGenerationTask {
                 )
                 .await;
 
-                let metrics_path = create_file_path_on_precursor_level(
+                let metrics_path = create_metrics_file_path_on_precursor_level(
                     message.uuid(),
                     message.ms_run_name(),
                     message.spectrum_id(),
