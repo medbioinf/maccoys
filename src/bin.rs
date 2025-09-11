@@ -160,8 +160,6 @@ enum PipelineCommand {
         interface: String,
         /// Port where the service is spawned
         port: u16,
-        /// Directory where each search is stored
-        work_dir: PathBuf,
         /// Contains `index`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
@@ -174,8 +172,6 @@ enum PipelineCommand {
     },
     /// Standalone indexing for distributed processing
     Index {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
         /// Path to the indexing configuration file.
         /// Contains `index`-, `preparation`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
@@ -203,16 +199,12 @@ enum PipelineCommand {
     },
     /// Standalone publication for distributed processing. Should run on the same machine which hosts the file system
     Publication {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
         /// Path to the indexing configuration file.
         /// Contains `goodness_and_rescoring`-, `cleanup`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
     /// Standalone error task for distributed processing. Should run on the same machine which hosts the file system
     Error {
-        /// Work directroy where each MS run will get a subdirectory
-        work_dir: PathBuf,
         /// Path to the indexing configuration file.
         /// Contains `goodness_and_rescoring`-, `cleanup`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
@@ -695,7 +687,6 @@ async fn main() -> Result<()> {
             PipelineCommand::RemoteEntrypoint {
                 interface,
                 port,
-                work_dir,
                 config_file_path,
             } => {
                 let config: RemoteEntypointConfiguration = toml::from_str(
@@ -703,7 +694,7 @@ async fn main() -> Result<()> {
                 )
                 .context("Deserialize config")?;
 
-                RemotePipelineWebApi::start(interface, port, work_dir, config).await?;
+                RemotePipelineWebApi::start(interface, port, config).await?;
             }
             PipelineCommand::SearchMonitor { base_url, uuid } => {
                 info!("Running search monitor");
@@ -716,10 +707,9 @@ async fn main() -> Result<()> {
             // TODO: Is there a more generic way to implment the standalone tasks?
             // Only thing which changes is the configuration type and config attributes to call for the input and output queues
             // Except the cleanup task, which does not have an output queue
-            PipelineCommand::Index {
-                work_dir,
-                config_file_path,
-            } => IndexingTask::run_standalone(work_dir, config_file_path).await?,
+            PipelineCommand::Index { config_file_path } => {
+                IndexingTask::run_standalone(config_file_path).await?
+            }
             PipelineCommand::SearchSpaceGeneration { config_file_path } => {
                 SearchSpaceGenerationTask::run_standalone(config_file_path).await?
             }
@@ -736,14 +726,12 @@ async fn main() -> Result<()> {
             PipelineCommand::Scoring { config_file_path } => {
                 ScoringTask::run_standalone(config_file_path).await?
             }
-            PipelineCommand::Publication {
-                work_dir,
-                config_file_path,
-            } => PublicationTask::run_standalone(work_dir, config_file_path).await?,
-            PipelineCommand::Error {
-                work_dir,
-                config_file_path,
-            } => ErrorTask::run_standalone(work_dir, config_file_path).await?,
+            PipelineCommand::Publication { config_file_path } => {
+                PublicationTask::run_standalone(config_file_path).await?
+            }
+            PipelineCommand::Error { config_file_path } => {
+                ErrorTask::run_standalone(config_file_path).await?
+            }
         },
         Commands::Version {} => {
             println!("-- MaCcoyS - Mass Centric Decoy Search  --");

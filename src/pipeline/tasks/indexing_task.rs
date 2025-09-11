@@ -356,13 +356,9 @@ impl IndexingTask {
     /// Run the indexing task by itself
     ///
     /// # Arguments
-    /// * `work_dir` - Working directory
     /// * `config_file_path` - Path to the configuration file
     ///
-    pub async fn run_standalone(
-        work_dir: PathBuf,
-        config_file_path: PathBuf,
-    ) -> Result<(), PipelineError> {
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<(), PipelineError> {
         let config = &fs::read_to_string(&config_file_path).map_err(|err| {
             PipelineError::FileReadError(config_file_path.to_string_lossy().to_string(), err)
         })?;
@@ -393,7 +389,7 @@ impl IndexingTask {
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.index.num_tasks)
             .map(|_| {
                 tokio::spawn(IndexingTask::start(
-                    work_dir.clone(),
+                    config.work_directory.clone(),
                     indexing_queue.clone(),
                     search_space_generation_queue.clone(),
                     error_queue.clone(),

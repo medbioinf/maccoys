@@ -149,10 +149,9 @@ impl ErrorTask {
     /// Run the error handling task by itself
     ///
     /// # Arguments
-    /// * `work_dir` - Working directory
     /// * `config_file_path` - Path to the configuration file
     ///
-    pub async fn run_standalone(work_dir: PathBuf, config_file_path: PathBuf) -> Result<()> {
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<()> {
         let config: StandaloneErrorConfiguration =
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
@@ -176,7 +175,7 @@ impl ErrorTask {
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.error.num_tasks)
             .map(|_| {
                 tokio::spawn(ErrorTask::start(
-                    work_dir.clone(),
+                    config.work_directory.clone(),
                     error_queue.clone(),
                     stop_flag.clone(),
                 ))

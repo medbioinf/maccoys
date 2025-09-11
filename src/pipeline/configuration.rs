@@ -1,4 +1,4 @@
-use std::ops::Deref;
+use std::{ops::Deref, path::PathBuf};
 
 use xcorrrs::configuration::Configuration as XcorrConfiguration;
 
@@ -237,6 +237,8 @@ pub struct RemoteEntypointConfiguration {
     pub storage: PipelineStorageConfiguration,
     /// Promtheus base URL
     pub prometheus_base_url: String,
+    /// Work directory
+    pub work_directory: PathBuf,
 }
 
 /// Configuration for standalone indexing
@@ -251,6 +253,8 @@ pub struct StandaloneIndexingConfiguration {
     pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
+    /// Work directory
+    pub work_directory: PathBuf,
 }
 
 /// Configuration for standalone search space generation
@@ -307,6 +311,8 @@ pub struct StandalonePublicationConfiguration {
     pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
+    /// Work directory
+    pub work_directory: PathBuf,
 }
 
 /// Configuration for standalone error handling
@@ -315,4 +321,6 @@ pub struct StandalonePublicationConfiguration {
 pub struct StandaloneErrorConfiguration {
     /// Error task configuration
     pub error: TaskConfiguration,
+    /// Work directory
+    pub work_directory: PathBuf,
 }

@@ -101,13 +101,11 @@ impl RemotePipelineWebApi {
     /// # Arguments
     /// * `interface` - Interface to bind the service to
     /// * `port` - Port to bind the service to
-    /// * `work_dir` - Work directory where the results are stored
     /// * `config` - Configuration for the remote entrypoint
     ///
     pub async fn start(
         interface: String,
         port: u16,
-        work_dir: PathBuf,
         config: RemoteEntypointConfiguration,
     ) -> Result<()> {
         let index_queue = RedisPipelineQueue::new(&config.index).await?;
@@ -127,8 +125,7 @@ impl RemotePipelineWebApi {
             publication_queue,
             error_queue,
             storage,
-            work_dir,
-            prometheus_base_url: config.prometheus_base_url.clone(),
+            work_dir: config.work_directory.clone(),
         });
 
         // Build our application with route

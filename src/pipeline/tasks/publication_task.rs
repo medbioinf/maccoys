@@ -154,13 +154,9 @@ impl PublicationTask {
     /// Run the publication task by itself
     ///
     /// # Arguments
-    /// * `work_dir` - Working directory
     /// * `config_file_path` - Path to the configuration file
     ///
-    pub async fn run_standalone(
-        work_dir: PathBuf,
-        config_file_path: PathBuf,
-    ) -> Result<(), PipelineError> {
+    pub async fn run_standalone(config_file_path: PathBuf) -> Result<(), PipelineError> {
         let config = &fs::read_to_string(&config_file_path).map_err(|err| {
             PipelineError::FileReadError(config_file_path.to_string_lossy().to_string(), err)
         })?;
@@ -196,7 +192,7 @@ impl PublicationTask {
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.publication.num_tasks)
             .map(|_| {
                 tokio::spawn(PublicationTask::start(
-                    work_dir.clone(),
+                    config.work_directory.clone(),
                     publication_queue.clone(),
                     error_queue.clone(),
                     storage.clone(),
