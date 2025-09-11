@@ -29,7 +29,7 @@ use crate::{
         },
         queue::{PipelineQueue, RedisPipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
-        utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
+        utils::create_metrics_file_path_on_precursor_level,
     },
     search_space::search_space_generator::{InMemorySearchSpace, SearchSpaceGenerator},
 };
