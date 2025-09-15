@@ -1,0 +1,22 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for monitored
+- name: Pull node exporter image
+  community.docker.docker_image_pull:
+    name: quay.io/prometheus/node-exporter
+    tag: latest
+    pull: always
+
+- name: Ensure node exporter is running
+  community.docker.docker_container:
+    name: node-exporter
+    image: quay.io/prometheus/node-exporter:latest
+    state: started
+    restart_policy: unless-stopped
+    pid_mode: host
+    network_mode: host
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+    command: --path.rootfs=/host

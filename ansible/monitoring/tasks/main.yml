@@ -1,0 +1,209 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for monitoring
+- name: Pull prometheus image
+  community.docker.docker_image_pull:
+    name: prom/prometheus
+    tag: latest
+    pull: always
+
+- name: Pull grafana image
+  community.docker.docker_image_pull:
+    name: grafana/grafana
+    tag: latest
+    pull: always
+
+- name: Pull loki image
+  community.docker.docker_image_pull:
+    name: grafana/loki
+    tag: latest
+    pull: always
+
+# - name: Delete old images
+#   ansible.builtin.command:
+#     cmd: sh -c "docker rmi $(docker images | grep '<none>' | awk '{print $3}')"
+
+- name: Delete grafana config directory
+  ansible.builtin.file:
+    path: "{{ grafana_config_dir }}"
+    state: absent
+
+- name: Create grafana config directory
+  ansible.builtin.file:
+    path: "{{ grafana_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '755'
+
+- name: Create prometheus config directory
+  ansible.builtin.file:
+    path: "{{ prometheus_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '755'
+
+- name: Create grafana data directory
+  ansible.builtin.file:
+    path: "{{ hostvars[inventory_hostname]['monitoring_data_dir'] }}/grafana"
+    state: directory
+    owner: root
+    group: root
+    mode: '777'
+
+- name: Create loki data directory
+  ansible.builtin.file:
+    path: "{{ hostvars[inventory_hostname]['monitoring_data_dir'] }}/loki"
+    state: directory
+    owner: root
+    group: root
+    mode: '777'
+
+- name: Create prometheus data directory
+  ansible.builtin.file:
+    path: "{{ hostvars[inventory_hostname]['monitoring_data_dir'] }}/prometheus"
+    state: directory
+    owner: root
+    group: root
+    mode: '777'
+
+- name: Copy prometheus config
+  ansible.builtin.copy:
+    src: ./prometheus/prometheus.yml
+    dest: "{{ prometheus_config_dir }}/prometheus.yml"
+    mode: '644'
+    force: true
+
+- name: Copy grafana config
+  ansible.builtin.copy:
+    src: ./grafana/
+    dest: "{{ grafana_config_dir }}"
+    mode: '644'
+    force: true
+
+- name: Set redis server in datasoruces
+  ansible.builtin.replace:
+    path: "{{ grafana_config_dir }}/provisioning/datasources/default.yaml"
+    regexp: <STORAGE_SERVER>
+    replace: "{{ groups['storage'][0] }}"
+
+- name: Add MacCoyS services to prometheus config
+  ansible.builtin.include_tasks:
+    file: add_host_group_to_prometheus.yml
+  vars:
+    host_group: "{{ item.name }}"
+    scraping_port: "{{ item.port }}"
+    insertlabel: maccoys-monitoring-targets
+  loop:
+    - name: entrypoint
+      port: 9490
+    - name: indexing
+      port: 9491
+    - name: search_space_generation
+      port: 9492
+    - name: identification
+      port: 9493
+    - name: scoring
+      port: 9494
+    - name: publishing
+      port: 9495
+    - name: error
+      port: 9496
+
+- name: Add hosts to prometheus config
+  ansible.builtin.lineinfile:
+    insertbefore: "    # os-monitoring-targets"
+    path: "{{ prometheus_config_dir }}/prometheus.yml"
+    line: "    - {{ host_name }}:9100"
+  loop: "{{ query('inventory_hostnames', 'all') }}"
+  loop_control:
+    loop_var: host_name
+
+- name: Create network
+  community.docker.docker_network:
+    name: maccoys-monitoring-stack
+    state: present
+
+- name: Check if loki container exists
+  community.docker.docker_container_info:
+    name: maccoys-loki
+  register: loki_container_info
+  ignore_errors: true
+
+- name: Remove existing loki container if not running
+  when: loki_container_info.exists
+  community.docker.docker_container:
+    name: maccoys-loki
+    state: absent
+    stop_timeout: 60
+
+- name: Check loki container is running
+  community.docker.docker_container:
+    image: grafana/loki
+    name: maccoys-loki
+    # auto_remove: true
+    networks:
+      - name: maccoys-monitoring-stack
+    volumes:
+      - "{{ hostvars[inventory_hostname]['monitoring_data_dir'] }}/loki:/loki"
+    published_ports:
+      - "3100:3100"
+
+- name: Check if prometheus container exists
+  community.docker.docker_container_info:
+    name: maccoys-prometheus
+  register: prometheus_container_info
+  ignore_errors: true
+
+- name: Remove existing prometheus container if not running
+  when: prometheus_container_info.exists
+  community.docker.docker_container:
+    name: maccoys-prometheus
+    state: absent
+    stop_timeout: 60
+
+- name: Check prometheus container is running
+  community.docker.docker_container:
+    image: prom/prometheus
+    name: maccoys-prometheus
+    # auto_remove: true
+    networks:
+      - name: maccoys-monitoring-stack
+    volumes:
+      - "{{ hostvars[inventory_hostname]['monitoring_data_dir'] }}/prometheus:/prometheus"
+      - "{{ prometheus_config_dir }}:/etc/prometheus"
+    command: --config.file=/etc/prometheus/prometheus.yml
+    published_ports:
+      - "9090:9090"
+
+- name: Check if grafana container exists
+  community.docker.docker_container_info:
+    name: maccoys-grafana
+  register: grafana_container_info
+  ignore_errors: true
+
+- name: Remove existing grafana container if not running
+  when: grafana_container_info.exists
+  community.docker.docker_container:
+    name: maccoys-grafana
+    state: absent
+    stop_timeout: 60
+
+- name: Check grafana container is running
+  community.docker.docker_container:
+    image: grafana/grafana
+    name: maccoys-grafana
+    # auto_remove: true
+    networks:
+      - name: maccoys-monitoring-stack
+    volumes:
+      - "{{ hostvars[inventory_hostname]['monitoring_data_dir'] }}/grafana:/var/lib/grafana"
+      - "{{ grafana_config_dir }}/provisioning:/etc/grafana/provisioning:ro"
+      - "{{ grafana_config_dir }}/assets:/usr/local/etc/grafana/assets/dashboards:ro"
+    env:
+      GF_SECURITY_ADMIN_USER={{ hostvars[inventory_hostname]['user'] }}
+      GF_SECURITY_ADMIN_PASSWORD={{ hostvars[inventory_hostname]['password'] }}
+      GF_PLUGINS_PREINSTALL=redis-datasource
+    published_ports:
+      - "3000:3000"

@@ -1,0 +1,9 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for storage
+- name: Deploy redis container
+  community.docker.docker_container:
+    image: redis:8-alpine
+    name: maccoys-redis
+    published_ports:
+      - "6379:6379"

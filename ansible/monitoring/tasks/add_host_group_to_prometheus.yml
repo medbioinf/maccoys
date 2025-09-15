@@ -1,0 +1,8 @@
+- name: Add host to prometheus config
+  ansible.builtin.lineinfile:
+    insertbefore: "    # maccoys-monitoring-targets"
+    path: "{{ prometheus_config_dir }}/prometheus.yml"
+    line: "    - {{ host_name }}:{{ scraping_port }}"
+  loop: "{{ query('inventory_hostnames', host_group) }}"
+  loop_control:
+    loop_var: host_name

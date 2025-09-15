@@ -1,0 +1,10 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for maccoys-search-space-generation
+- name: Run MaCcoyS search space generation
+  ansible.builtin.include_role:
+    name: maccoys
+  vars:
+    maccoys_id: search-space-generation
+    maccoys_cmd: search-space-generation
+    prometheus_scraping_port: 9492

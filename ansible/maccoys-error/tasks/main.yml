@@ -1,0 +1,10 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for maccoys-error
+- name: Run MaCcoyS error handling
+  ansible.builtin.include_role:
+    name: maccoys
+  vars:
+    maccoys_id: error
+    maccoys_cmd: error
+    prometheus_scraping_port: 9496

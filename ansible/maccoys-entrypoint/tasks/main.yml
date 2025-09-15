@@ -1,0 +1,11 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for maccoys-entrypoint
+- name: Run MaCcoyS entrypoint
+  ansible.builtin.include_role:
+    name: maccoys
+  vars:
+    maccoys_id: entrypoint
+    maccoys_cmd: remote-entrypoint
+    maccoys_opts: "0.0.0.0 8000"
+    prometheus_scraping_port: 9490

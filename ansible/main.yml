@@ -1,0 +1,99 @@
+- name: Init
+  hosts: new
+  roles:
+   - common
+  tags:
+   - common
+
+- name: Storage
+  hosts: storage
+  become: true
+  roles:
+   - storage
+  tags:
+   - storage
+
+- name: Monitored
+  hosts: all
+  become: true
+  roles:
+   - monitored
+  tags:
+   - monitored
+
+- name: Monitoring
+  hosts: monitoring
+  become: true
+  roles:
+   - monitoring
+  tags:
+   - monitoring
+
+- name: MaCcoyS indexing
+  hosts:
+   - indexing
+  become: true
+  roles:
+   - maccoys-indexing
+  tags:
+   - indexing
+
+
+- name: MaCcoyS search space generation
+  hosts:
+   - search_space_generation
+  become: true
+  roles:
+   - maccoys-search-space-generation
+  tags:
+   - search-space-generation
+
+
+- name: MaCcoyS identification
+  hosts:
+   - identification
+  become: true
+  roles:
+   - maccoys-identification
+  tags:
+   - identification
+
+
+- name: MaCcoyS scoring
+  hosts:
+   - scoring
+  become: true
+  roles:
+   - maccoys-scoring
+  tags:
+   - scoring
+
+
+- name: MaCcoyS publishing
+  hosts:
+   - publishing
+  become: true
+  roles:
+   - maccoys-publishing
+  tags:
+   - publishing
+
+
+- name: MaCcoyS error handling
+  hosts:
+   - error
+  become: true
+  roles:
+   - maccoys-error
+  tags:
+   - error
+
+
+- name: MaCcoyS entrypoint
+  hosts:
+   - entrypoint
+  become: true
+  roles:
+   - maccoys-entrypoint
+  tags:
+   - entrypoint

@@ -1,0 +1,18 @@
+#SPDX-License-Identifier: MIT-0
+---
+# vars file for maccoys
+
+log_dir: /var/log/maccoys
+config_file: /usr/local/etc/maccoys.toml
+
+volumes:
+  - "{{ config_file }}:{{ config_file }}:ro"
+  - "{{ log_dir }}:{{ log_dir }}"
+
+# Default values, shoult be overridden in inventory
+maccoys_id: version
+maccoys_cmd: version
+maccoys_opts: ""
+
+# monitoring
+prometheus_scraping_port: 9494
