@@ -411,7 +411,7 @@ async fn main() -> Result<()> {
         || args.tracing_target.contains(&TracingTarget::All)
     {
         let (layer, task) = tracing_loki::builder()
-            .label("macpepdb", "development")?
+            .label("maccoys", "development")?
             .extra_field("pid", format!("{}", process::id()))?
             .build_url(Url::parse(&format!("http://{}", args.loki)).unwrap())?;
         tracing_loki_layer = Some(layer);
