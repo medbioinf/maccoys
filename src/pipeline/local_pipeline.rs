@@ -181,6 +181,7 @@ where
                     publication_queue.clone(),
                     error_queue.clone(),
                     scoring_stop_flag.clone(),
+                    config.scoring.threads,
                 ))
             })
             .collect();

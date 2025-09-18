@@ -34,7 +34,7 @@ glob = "0.3.1"
 http = "1.1.0"
 indicatif = "0.17.7"
 lazy_static = "1.4.0"
-local-outlier-probabilities = "1.0.1"
+local-outlier-probabilities = { git = "https://github.com/medbioinf/loop-rs", branch = "feature-parallelism" }
 maccoys-exchange-entities = { git = "https://github.com/medbioinf/maccoys-exchange-entities", rev = "405e0f1692a32b05ac1ada684975afd503e1feb3" }
 macpepdb = "1.1.0"
 metrics = "0.24.1"

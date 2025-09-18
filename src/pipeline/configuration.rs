@@ -121,6 +121,25 @@ impl Deref for IdentificationTaskConfiguration {
     }
 }
 
+/// Comet configuration
+///
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ScoringTaskConfiguration {
+    /// General task configuration
+    #[serde(flatten)]
+    pub general: TaskConfiguration,
+    /// Number of threads to use
+    pub threads: usize,
+}
+
+impl Deref for ScoringTaskConfiguration {
+    type Target = TaskConfiguration;
+
+    fn deref(&self) -> &TaskConfiguration {
+        &self.general
+    }
+}
+
 /// Configuration for the pipeline
 ///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -134,7 +153,7 @@ pub struct PipelineConfiguration {
     /// Identification task configuration
     pub identification: IdentificationTaskConfiguration,
     /// scoring task configuration
-    pub scoring: TaskConfiguration,
+    pub scoring: ScoringTaskConfiguration,
     /// Publication task configuration
     pub publication: TaskConfiguration,
     /// Error task configuration
@@ -189,11 +208,14 @@ impl Default for PipelineConfiguration {
                 },
                 threads: 2,
             },
-            scoring: TaskConfiguration {
-                num_tasks: 2,
-                queue_name: SCORING_QUEUE_KEY.to_string(),
-                queue_capacity: 100,
-                redis_url: None,
+            scoring: ScoringTaskConfiguration {
+                general: TaskConfiguration {
+                    num_tasks: 2,
+                    queue_name: SCORING_QUEUE_KEY.to_string(),
+                    queue_capacity: 100,
+                    redis_url: None,
+                },
+                threads: 1,
             },
             publication: TaskConfiguration {
                 num_tasks: 1,
@@ -292,7 +314,7 @@ pub struct StandaloneIdentificationConfiguration {
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct StandaloneScoringConfiguration {
     /// Scoring task configuration
-    pub scoring: TaskConfiguration,
+    pub scoring: ScoringTaskConfiguration,
     /// Publication task configuration
     pub publication: TaskConfiguration,
     /// Error task configuration

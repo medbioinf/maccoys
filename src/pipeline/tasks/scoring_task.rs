@@ -70,6 +70,7 @@ impl ScoringTask {
         publish_queue: Arc<P>,
         error_queue: Arc<E>,
         stop_flag: Arc<AtomicBool>,
+        threads: usize,
     ) where
         S: PipelineQueue<ScoringMessage> + Send + Sync + 'static,
         P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
@@ -164,8 +165,13 @@ impl ScoringTask {
                 }
             };
 
-            let loop_score = match local_outlier_probabilities(feature_array, N_NEIGHBORS, 3, None)
-            {
+            let loop_score = match local_outlier_probabilities(
+                &feature_array,
+                N_NEIGHBORS,
+                3,
+                None,
+                Some(threads),
+            ) {
                 Ok(loop_score) => loop_score,
                 Err(err) => {
                     let error_message =
@@ -290,6 +296,7 @@ impl ScoringTask {
                     publication_queue.clone(),
                     error_queue.clone(),
                     stop_flag.clone(),
+                    config.scoring.threads,
                 ))
             })
             .collect();
