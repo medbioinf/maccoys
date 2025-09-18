@@ -9,6 +9,7 @@ use std::{
 };
 
 use metrics::counter;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tokio::fs::create_dir_all;
 use tracing::{error, info};
 use xcorrrs::{
@@ -155,6 +156,7 @@ impl IdentificationTask {
             let now = std::time::Instant::now();
 
             let peptides = message.take_peptides();
+            let peptides_len = peptides.len();
 
             let psms = match run_xcorr_search(
                 &FinalizedXcorrConfiguration::from(current_search_params.xcorr.clone()),
@@ -193,7 +195,7 @@ impl IdentificationTask {
                 message.uuid(),
                 message.ms_run_name(),
                 message.spectrum_id(),
-                message.peptides().len()
+                peptides_len
             );
 
             Self::enqueue_message(scoring_message, scoring_queue.as_ref()).await;
@@ -343,7 +345,7 @@ pub fn run_xcorr_search(
 
     thread_pool.install(|| {
         peptides
-            .into_iter()
+            .into_par_iter()
             .for_each(|peptide| match xcorrer.xcorr_peptide(&peptide) {
                 Ok(scoring_result) => {
                     if scoring_result.score >= score_threshold {
