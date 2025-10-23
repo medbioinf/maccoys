@@ -38,6 +38,10 @@ use super::{
     utils::create_file_path_on_ms_run_level,
 };
 
+/// Loki tracing label value for the remote pipeline web api
+///
+static LOKI_TRACING_LABEL_VALUE: &str = "remote_pipeline_web_api";
+
 /// Shared state for the remote entrypoint service
 ///
 struct EntrypointServiceState {
@@ -430,5 +434,9 @@ impl RemotePipelineWebApi {
         );
 
         Ok(Json(serde_json::to_value(response)?))
+    }
+
+    pub fn loki_tracing_label_value() -> &'static str {
+        LOKI_TRACING_LABEL_VALUE
     }
 }

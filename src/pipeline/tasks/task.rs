@@ -11,6 +11,13 @@ pub trait Task {
         format!("{}_{}", Self::get_counter_prefix(), uuid)
     }
 
+    /// Returns the Loki tracing label value for this task.
+    /// By default, it is the same as the counter prefix.
+    ///
+    fn loki_tracing_label_value() -> &'static str {
+        Self::get_counter_prefix()
+    }
+
     /// Tries to enqueue the message to the queue.
     /// If it fails, it will log the error and try again
     ///

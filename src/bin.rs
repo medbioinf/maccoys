@@ -26,6 +26,7 @@ use maccoys::pipeline::tasks::indexing_task::IndexingTask;
 use maccoys::pipeline::tasks::publication_task::PublicationTask;
 use maccoys::pipeline::tasks::scoring_task::ScoringTask;
 use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
+use maccoys::pipeline::tasks::task::Task;
 use maccoys::search_space::search_space_generator::{FastaSearchSpace, SearchSpaceGenerator};
 use macpepdb::functions::post_translational_modification::PTMCollection;
 use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
@@ -46,6 +47,9 @@ use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
 use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use maccoys::web::decoy_api::Server as DecoyApiServer;
 use maccoys::web::results_api::Server as ResultApiServer;
+
+static DEFAULT_LOKI_TRACING_LABEL_KEY: &str = "maccoys";
+static DEFAULT_LOKI_TRACING_LABEL_VALUE: &str = "general";
 
 /// Target for tracing
 ///
@@ -411,7 +415,10 @@ async fn main() -> Result<()> {
         || args.tracing_target.contains(&TracingTarget::All)
     {
         let (layer, task) = tracing_loki::builder()
-            .label("maccoys", "development")?
+            .label(
+                DEFAULT_LOKI_TRACING_LABEL_KEY,
+                loki_tracing_label(&args.command),
+            )?
             .extra_field("pid", format!("{}", process::id()))?
             .build_url(Url::parse(&format!("http://{}", args.loki)).unwrap())?;
         tracing_loki_layer = Some(layer);
@@ -765,4 +772,45 @@ fn convert_str_paths_and_resolve_globs(paths: Vec<String>) -> Result<Vec<PathBuf
         .into_iter()
         .flatten() // flatten the vectors which
         .collect())
+}
+
+fn loki_tracing_label(commands: &Commands) -> &'static str {
+    match commands {
+        Commands::Web(web_command) => match &web_command.command {
+            WebCommand::ResultApi {
+                interface: _,
+                port: _,
+                result_dir: _,
+            } => ResultApiServer::loki_tracing_label_value(),
+            _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
+        },
+        Commands::Pipeline(pipeline_command) => match &pipeline_command.command {
+            PipelineCommand::RemoteEntrypoint {
+                interface: _,
+                port: _,
+                config_file_path: _,
+            } => RemotePipelineWebApi::loki_tracing_label_value(),
+            PipelineCommand::Index {
+                config_file_path: _,
+            } => IndexingTask::loki_tracing_label_value(),
+            PipelineCommand::SearchSpaceGeneration {
+                config_file_path: _,
+            } => SearchSpaceGenerationTask::loki_tracing_label_value(),
+            PipelineCommand::Identification {
+                tmp_dir: _,
+                config_file_path: _,
+            } => IdentificationTask::loki_tracing_label_value(),
+            PipelineCommand::Scoring {
+                config_file_path: _,
+            } => ScoringTask::loki_tracing_label_value(),
+            PipelineCommand::Publication {
+                config_file_path: _,
+            } => PublicationTask::loki_tracing_label_value(),
+            PipelineCommand::Error {
+                config_file_path: _,
+            } => ErrorTask::loki_tracing_label_value(),
+            _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
+        },
+        _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
+    }
 }
