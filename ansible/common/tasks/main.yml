@@ -1,0 +1,137 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for common
+- name: Disable apparmor
+  become: true
+  ansible.builtin.systemd:
+    name: apparmor
+    enabled: false
+    state: stopped
+    masked: true
+
+- name: Remove apparmor
+  become: true
+  ansible.builtin.apt:
+    name: apparmor
+    state: absent
+
+- name: Update
+  become: true
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Upgrade
+  become: true
+  ansible.builtin.apt:
+    upgrade: "dist"
+
+- name: Install packages
+  become: true
+  ansible.builtin.apt:
+    name:
+      - zsh
+      - curl
+      - git
+      - vim
+    state: present
+
+- name: Create keyring directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: '755'
+
+- name: Add keyring
+  become: true
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    owner: root
+    group: root
+    mode: '644'
+    force: false
+
+- name: Add docker repo
+  become: true
+  ansible.builtin.lineinfile:
+    path: /etc/apt/sources.list.d/docker.list
+    line: deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+    state: present
+    create: true
+    mode: '644'
+
+- name: Install docker
+  become: true
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: Configure docker daemon
+  become: true
+  ansible.builtin.copy:
+    src: ./daemon.json
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    mode: '644'
+    force: true
+
+- name: Ensure docker is started and enabled
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+    enabled: true
+
+- name: Download oh-my-zsh install script
+  ansible.builtin.get_url:
+    url: https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh
+    dest: /tmp/omz_install.sh
+    mode: '0755'
+
+- name: Install oh-my-zsh
+  ansible.builtin.command:
+    cmd: sh /tmp/omz_install.sh --unattended
+  register: omz_output
+  changed_when: omz_output.rc == 0
+  ignore_errors: true
+
+- name: Install powerlevel10k
+  ansible.builtin.git:
+    repo: https://github.com/romkatv/powerlevel10k.git
+    dest: "{{ ansible_env.HOME }}/.oh-my-zsh/custom/themes/powerlevel10k"
+    depth: 1
+    version: master
+    single_branch: true
+
+- name: Copy zshrc
+  ansible.builtin.copy:
+    src: ./zshrc-basic
+    dest: /home/ubuntu/.zshrc
+    mode: '0644'
+
+- name: Copy powerlevel10k config
+  ansible.builtin.copy:
+    src: ./p10kzsh-basic
+    dest: /home/ubuntu/.p10k.zsh
+    mode: '0644'
+
+- name: Change shell to zsh
+  become: true
+  ansible.builtin.command:
+    cmd: chsh -s /bin/zsh ubuntu
+  register: chsh_output
+  changed_when: chsh_output.rc == 0
+
+- name: Reboot the system
+  become: true
+  ansible.builtin.reboot:
+    msg: "Rebooting the system to apply changes"

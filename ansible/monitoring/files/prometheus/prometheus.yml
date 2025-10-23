@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+scrape_configs:
+- job_name: maccoys-monitoring
+  honor_timestamps: true
+  scrape_interval: 60s
+  scrape_timeout: 10s
+  metrics_path: /metrics
+  scheme: http
+  static_configs:
+  - targets:
+    # maccoys-monitoring-targets
+- job_name: os-monitoring
+  honor_timestamps: true
+  scrape_interval: 60s
+  scrape_timeout: 10s
+  metrics_path: /metrics
+  scheme: http
+  static_configs:
+  - targets:
+    # os-monitoring-targets

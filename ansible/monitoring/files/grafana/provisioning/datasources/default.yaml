@@ -1,0 +1,24 @@
+apiVersion: 1
+
+datasources:
+- name: MaCcoyS Prometheus
+  type: prometheus
+  uid: maccoys-prometheus
+  url: http://maccoys-prometheus:9090 
+  isDefault: true
+  access: proxy
+  editable: false
+- name: MaCcoyS Loki
+  type: loki
+  uid: maccoys-loki
+  url: http://maccoys-loki:3100 
+  isDefault: false
+  access: proxy
+  editable: false
+- name: MaCcoyS Redis
+  type: redis-datasource
+  uid: maccoy-redis
+  url: redis://<STORAGE_SERVER>:6379
+  isDefault: false
+  access: proxy
+  editable: false

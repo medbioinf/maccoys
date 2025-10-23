@@ -1,0 +1,10 @@
+- name: Foo
+  hosts: all
+
+  tasks:
+    - name: Bar
+      ansible.builtin.debug:
+        msg: "    - {{ host_name }}:9100"
+      loop: "{{ query('inventory_hostnames', 'all') }}"
+      loop_control:
+        loop_var: host_name

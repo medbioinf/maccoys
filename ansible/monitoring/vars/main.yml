@@ -1,0 +1,5 @@
+#SPDX-License-Identifier: MIT-0
+---
+# vars file for monitoring
+grafana_config_dir: /usr/local/etc/maccoys-grafana
+prometheus_config_dir: /usr/local/etc/maccoys-prometheus

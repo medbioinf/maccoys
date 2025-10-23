@@ -1,0 +1,61 @@
+# FOLDER_FOR_SEARCH_RESULTS Need to have the same content on all hosts, 
+# e.g via NFS or one server which is running all MaCcoyS components using this folder.
+
+# new hosts which need a base installation
+new:
+  hosts:
+
+# ONE storage host which is exchanging data with all other hosts
+storage:
+  hosts:
+
+# ONE monitoring host running Loki, Prometheus and Grafana
+monitoring:
+  vars:
+    monitoring_data_dir: <FOLDER_FOR_LOGGING>
+    user: admin
+    password: admin
+  hosts:
+
+# Indexing hosts
+indexing:
+  vars:
+    volumes:
+      - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+  hosts:
+
+# Search space generation hosts
+search_space_generation:
+  hosts:
+
+# Identification hosts
+identification:
+  hosts:
+    
+# Scoring hosts
+scoring:
+  hosts:
+
+# Publishing hosts
+publishing:
+  vars:
+    volumes:
+      - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+  hosts:
+
+# Error handling hosts
+error:
+  vars:
+    volumes:
+      - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+  hosts:
+
+# Web API for MaCcoyS
+entrypoint:
+  vars:
+    volumes:
+      - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+    entrypoint_ports: 
+      - "<PORT_YOU_LIKE>:8000"
+  hosts:
+

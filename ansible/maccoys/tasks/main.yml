@@ -1,0 +1,76 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for maccoys
+- name: Pull image
+  when: action == "start"
+  community.docker.docker_image_pull:
+    name: ghcr.io/medbioinf/maccoys
+    tag: dev
+    pull: always
+
+- name: Copy MaCcoyS config
+  when: action == "start"
+  ansible.builtin.copy:
+    src: ./maccoys.toml
+    dest: "{{ config_file }}"
+    mode: '644'
+    force: true
+
+- name: Set storage server
+  when: action == "start"
+  ansible.builtin.replace:
+    path: "{{ config_file }}"
+    regexp: '<STORAGE_SERVER>'
+    replace: "{{ groups['storage'][0] }}"
+
+- name: Set target peptide URL
+  when: action == "start"
+  ansible.builtin.replace:
+    path: "{{ config_file }}"
+    regexp: '<TARGET_PEPTIDE_URL>'
+    replace: "{{ target_peptide_url }}"
+
+- name: Create log directory
+  when: action == "start"
+  ansible.builtin.file:
+    path: "{{ log_dir }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: '755'
+
+- name: Check if container exists
+  community.docker.docker_container_info:
+    name: maccoys-{{ maccoys_id }}
+  register: container_info
+  ignore_errors: true
+
+- name: Stopping existing container
+  when: container_info.exists
+  community.docker.docker_container:
+    name: maccoys-{{ maccoys_id }}
+    state: absent
+    stop_timeout: 60
+
+- name: Start container
+  when: action == "start"
+  community.docker.docker_container:
+    image: ghcr.io/medbioinf/maccoys:dev
+    name: maccoys-{{ maccoys_id }}
+    # auto_remove: true
+    user: 1000:1000
+    volumes: "{{ volumes + (hostvars[inventory_hostname]['volumes'] | default([])) }}"
+    published_ports: "{{ (ports | default([])) + ['0.0.0.0:' ~ prometheus_scraping_port|string ~ ':' ~ prometheus_scraping_port|string] }}"
+    command: >
+      -vv -t loki -m prometheus -n 7 -r daily
+      -l {{ groups['monitoring'][0] }}:3100
+      -p 0.0.0.0:{{ prometheus_scraping_port }}
+      -f {{ log_dir }}/{{ maccoys_id }}.log
+      pipeline {{ maccoys_cmd }} {{ maccoys_opts }} {{ config_file }}
+
+- name: Remove dangling images
+  when: action == "start"
+  community.docker.docker_prune:
+    images: true
+    images_filters:
+      dangling: true

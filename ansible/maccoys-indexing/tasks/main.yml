@@ -1,0 +1,10 @@
+#SPDX-License-Identifier: MIT-0
+---
+# tasks file for maccoys-indexing
+- name: Run MaCcoyS indexing
+  ansible.builtin.include_role:
+    name: maccoys
+  vars:
+    maccoys_id: indexing
+    maccoys_cmd: index
+    prometheus_scraping_port: 9491

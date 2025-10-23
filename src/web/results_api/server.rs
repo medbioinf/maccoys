@@ -10,6 +10,10 @@ use tower_http::cors::{Any, CorsLayer};
 // internal modules
 use crate::web::results_api::ResultController;
 
+/// Loki tracing label value for the results api server
+///
+static LOKI_TRACING_LABEL_VALUE: &str = "results_api_server";
+
 pub struct Server;
 
 impl Server {
@@ -50,5 +54,9 @@ impl Server {
         axum::serve(listener, app).await.unwrap();
 
         Ok(())
+    }
+
+    pub fn loki_tracing_label_value() -> &'static str {
+        LOKI_TRACING_LABEL_VALUE
     }
 }

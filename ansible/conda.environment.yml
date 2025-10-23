@@ -1,0 +1,8 @@
+name: ansible
+channels:
+  - defaults
+dependencies:
+  - python=3.13
+  - pip:
+    - ansible
+    - ansible-lint

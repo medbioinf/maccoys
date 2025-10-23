@@ -56,6 +56,12 @@ Checkout `... pipline --help` and have a look on the optional parameter and the 
 #### Distributed
 The pipeline can also be deployed on multiple machines. Have a look into `Procfile` do get an idea of the setup. The only requirement for the deployment is that each part of the pipeline has access to the results folder, e.g. via NFS, and has access to a central redis server.
 
+##### Try it
+Requirements: 
+* Rust: The recommended way is to use [rustup](https://rustup.rs/)
+* [Ultraman](https://github.com/yukihirop/ultraman?tab=readme-ov-file#-installation)
+* Docker
+
 You can test it via:
 1. Shell 1: `docker compose up`
 2. Shell 2: `ultraman start` (you can use any Procfile manager, like (ultraman)[https://github.com/yukihirop/ultraman], (foreman)[https://github.com/ddollar/foreman] or (honcho)[https://github.com/nickstenning/honcho/tree/main])
@@ -65,6 +71,26 @@ Using the following command, the search is send to the remote entrypoint and sch
 * docker: `docker run --rm -it -v <ABSOLUTE_PATH_ON_HOST_>:/data local/maccoys:dev -vvvvvv pipeline local-run <API_BASE_URL> /data/<PATH_TO_SEARCH_PARAMETER_TOML> /data/<PATH_TO_xcorr_config> /data/experiment/<MZML_FILES_0> /data/experiment/<MZML_FILE_1> ...`
 
 MaCcoyS will print an UUID to identify the search, e.g. to recheck the progress with `... -vvvvvvv pipeline search-monitor <API_BASE_URL> <UUID>` and find the results.
+
+##### Deployment
+```shell
+conda env create -f ansible/conda.environment.yml
+conda activate ansible
+ansible-galaxy collection install community.docker 
+```
+
+Copy `ansible/hosts.template.yml` to a persistant place and fill in the needed information.
+
+Start the services with: 
+```shell
+ansible-playbook ansible/main.yml -i <YOUR_HOSTS_YML> -e "action=start target_peptide_url=macpepdb.cubimed.rub.de"
+```
+
+Stop the services with:
+```shell
+ansible-playbook ansible/main.yml -i <YOUR_HOSTS_YML> -e "action=stop"
+```
+
 
 ## Development
 
