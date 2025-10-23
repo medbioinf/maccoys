@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
 use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::{
@@ -13,16 +13,11 @@ use dihardts_omicstools::proteomics::post_translational_modifications::{
 };
 use fancy_regex::Regex;
 use futures::{pin_mut, StreamExt};
-use macpepdb::database::generic_client::GenericClient;
 use macpepdb::functions::post_translational_modification::PTMCollection;
 use macpepdb::{
-    database::scylla::{
-        client::Client as DbClient, configuration_table::ConfigurationTable,
-        peptide_table::PeptideTable,
-    },
+    database::scylla::peptide_table::PeptideTable,
     mass::convert::{to_float as mass_to_float, to_int as mass_to_int},
 };
-use reqwest::Client as HttpClient;
 use serde_json::json;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::error;
@@ -36,6 +31,7 @@ use crate::constants::{
     FASTA_TARGET_ENTRY_PREFIX,
 };
 use crate::search_space::decoy_cache::DecoyCache;
+use crate::search_space::macpepdb_client::MaCPepDBClient;
 use crate::search_space::target_lookup::TargetLookup;
 
 /// Path to the peptide search endpoint of MaCPepDB
@@ -230,20 +226,13 @@ impl IsSearchSpace for FastaSearchSpace {
     }
 }
 
-/// Client for either a MaCPepDB database or a MaCPepDB web API
-///
-enum Client {
-    DbClient(Arc<DbClient>),
-    HttpClient(HttpClient),
-}
-
 /// Generator for the search space
 ///
 pub struct SearchSpaceGenerator {
     target_url: String,
     decoy_url: Option<String>,
-    target_client: Client,
-    decoy_client: Option<Client>,
+    target_client: MaCPepDBClient,
+    decoy_client: Option<MaCPepDBClient>,
     target_lookup_url: Option<String>,
     decoy_cache_url: Option<String>,
 }
@@ -255,9 +244,9 @@ impl SearchSpaceGenerator {
         target_lookup_url: Option<String>,
         decoy_cache_url: Option<String>,
     ) -> Result<Self> {
-        let target_client = Self::create_client(target_url).await?;
+        let target_client = MaCPepDBClient::from_url(target_url).await?;
         let decoy_client = match decoy_url.as_ref() {
-            Some(url) => Some(Self::create_client(url).await?),
+            Some(url) => Some(MaCPepDBClient::from_url(url).await?),
             None => None,
         };
 
@@ -271,16 +260,6 @@ impl SearchSpaceGenerator {
             decoy_url,
             target_url: target_url.to_owned(),
         })
-    }
-
-    async fn create_client(url: &str) -> Result<Client> {
-        if url.starts_with("http") {
-            Ok(Client::HttpClient(HttpClient::new()))
-        } else if url.starts_with("scylla") {
-            Ok(Client::DbClient(Arc::new(DbClient::new(url).await?)))
-        } else {
-            Err(anyhow!("Invalid protocol in URL: {}", url))
-        }
     }
 
     /// Add peptides to the FASTA file adn returns the number of added peptides.
@@ -331,8 +310,8 @@ impl SearchSpaceGenerator {
 
         // Get URL for HTTP client
         let http_url = match client {
-            Client::DbClient(_) => "".to_string(),
-            Client::HttpClient(_) => {
+            MaCPepDBClient::Db(..) => "".to_string(),
+            MaCPepDBClient::Http(_) => {
                 let base_url = if is_target {
                     &self.target_url
                 } else {
@@ -343,12 +322,11 @@ impl SearchSpaceGenerator {
         };
 
         match client {
-            Client::DbClient(ref client) => {
-                let configuration = ConfigurationTable::select(client.as_ref()).await?;
+            MaCPepDBClient::Db(ref client, configuration) => {
                 let ptm_collecton = PTMCollection::new(ptms)?;
                 let target_stream = PeptideTable::search(
                     client.clone(),
-                    Arc::new(configuration),
+                    Arc::new(configuration.clone()),
                     mass,
                     lower_mass_tolerance_ppm,
                     upper_mass_tolerance_ppm,
@@ -376,7 +354,7 @@ impl SearchSpaceGenerator {
                     }
                 }
             }
-            Client::HttpClient(ref client) => {
+            MaCPepDBClient::Http(ref client) => {
                 let response = client
                     .post(http_url.as_str())
                     .header("Connection", "close")
