@@ -4,7 +4,7 @@ use anyhow::Result;
 use axum::{body::Bytes, BoxError};
 use futures::{pin_mut, Stream, TryStreamExt};
 use tokio::fs::File;
-use tokio::io::{copy, BufWriter, Error as IoError, ErrorKind as IoErrorKind};
+use tokio::io::{copy, BufWriter, Error as IoError};
 use tokio_util::io::StreamReader;
 
 /// Writes a streamed file to disk.
@@ -20,7 +20,7 @@ where
 {
     async {
         // Convert the stream into an `AsyncRead`.
-        let body_with_io_error = stream.map_err(|err| IoError::new(IoErrorKind::Other, err));
+        let body_with_io_error = stream.map_err(IoError::other);
         let body_reader = StreamReader::new(body_with_io_error);
         pin_mut!(body_reader);
         let mut file = BufWriter::new(File::create(path).await?);
