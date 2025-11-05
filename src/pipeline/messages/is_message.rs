@@ -1,10 +1,14 @@
+use std::fmt::Debug;
+
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::pipeline::errors::pipeline_error::PipelineError;
 
 /// Trait to sum up the common properties of all messages
 ///
-pub trait IsMessage: Sized + Send + Sync + Serialize + DeserializeOwned {
+pub trait IsMessage:
+    Sized + Send + Sync + Debug + Clone + PartialEq + Serialize + DeserializeOwned
+{
     /// Converts message to an error message with the given error
     ///
     /// # Arguments

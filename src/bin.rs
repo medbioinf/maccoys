@@ -1,5 +1,5 @@
 // std imports
-use std::fs::{read_to_string, write as write_file, File};
+use std::fs::{self, read_to_string, write as write_file, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::{env, process};
@@ -11,13 +11,8 @@ use dihardts_omicstools::proteomics::io::mzml::{index::Index, reader::Reader as 
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
-use maccoys::pipeline::local_pipeline::LocalPipeline;
-use maccoys::pipeline::messages::error_message::ErrorMessage;
-use maccoys::pipeline::messages::identification_message::IdentificationMessage;
-use maccoys::pipeline::messages::indexing_message::IndexingMessage;
-use maccoys::pipeline::messages::publication_message::PublicationMessage;
-use maccoys::pipeline::messages::scoring_message::ScoringMessage;
-use maccoys::pipeline::messages::search_space_generation_message::SearchSpaceGenerationMessage;
+use maccoys::pipeline::local_pipeline::{build_and_run_local_pipeline, QueueTarget, StorageTarget};
+use maccoys::pipeline::queue_server::QueueServer;
 use maccoys::pipeline::remote_pipeline::RemotePipeline;
 use maccoys::pipeline::remote_pipeline_web_api::RemotePipelineWebApi;
 use maccoys::pipeline::tasks::error_task::ErrorTask;
@@ -43,8 +38,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 // internal imports
 use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::post_process;
-use maccoys::pipeline::queue::{LocalPipelineQueue, RedisPipelineQueue};
-use maccoys::pipeline::storage::{LocalPipelineStorage, RedisPipelineStorage};
 use maccoys::web::decoy_api::Server as DecoyApiServer;
 use maccoys::web::results_api::Server as ResultApiServer;
 
@@ -124,10 +117,12 @@ enum PipelineCommand {
     /// Runs the full pipline locally.
     ///
     LocalRun {
-        /// Use redis, make sure the Redis URL is set in the configs
-        /// (makes only sense for debugging and testing when running locally)
-        #[arg(short, long, default_value = "false")]
-        use_redis: bool,
+        /// Storage used by the local pipeline
+        #[arg(short, long, value_enum, default_value = "memory")]
+        storage: StorageTarget,
+        /// Queue used by the local pipeline
+        #[arg(short, long, value_enum, default_value = "memory")]
+        queue: QueueTarget,
         /// Optional temp folder for intermediate files, default: `<system temp folder>/maccoys`
         #[arg(short, long)]
         tmp_dir: Option<PathBuf>,
@@ -211,6 +206,18 @@ enum PipelineCommand {
     Error {
         /// Path to the indexing configuration file.
         /// Contains `goodness_and_rescoring`-, `cleanup`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Http queuing server
+    QueueServer {
+        /// Path to safe state if server shutsdown
+        #[arg(short, long)]
+        state_file_path: Option<PathBuf>,
+        /// Interface where the service is spawned
+        interface: String,
+        /// Port where the service is spawned
+        port: u16,
+
         config_file_path: PathBuf,
     },
 }
@@ -361,7 +368,8 @@ async fn main() -> Result<()> {
         .add_directive("tokio_postgres=error".parse().unwrap())
         .add_directive("hyper=error".parse().unwrap())
         .add_directive("reqwest=error".parse().unwrap())
-        .add_directive("rustis=error".parse().unwrap());
+        .add_directive("rustis=error".parse().unwrap())
+        .add_directive("h2=error".parse().unwrap());
 
     // Tracing layers
     let mut tracing_indicatif_layer = None;
@@ -606,7 +614,8 @@ async fn main() -> Result<()> {
                 println!("{}", toml::to_string_pretty(&new_config)?);
             }
             PipelineCommand::LocalRun {
-                use_redis,
+                queue,
+                storage,
                 tmp_dir,
                 ptms_file,
                 result_dir,
@@ -639,39 +648,18 @@ async fn main() -> Result<()> {
 
                 let search_params = config.search_parameters.clone();
 
-                if !use_redis {
-                    info!("Running local pipeline");
-                    let pipeline = LocalPipeline::<
-                        LocalPipelineQueue<IndexingMessage>,
-                        LocalPipelineQueue<SearchSpaceGenerationMessage>,
-                        LocalPipelineQueue<IdentificationMessage>,
-                        LocalPipelineQueue<ScoringMessage>,
-                        LocalPipelineQueue<PublicationMessage>,
-                        LocalPipelineQueue<ErrorMessage>,
-                        LocalPipelineStorage,
-                    >::new(result_dir, tmp_dir, config)
-                    .await?;
-
-                    pipeline
-                        .run(search_params, ptms, mzml_file_paths, scrape_endpoint)
-                        .await?;
-                } else {
-                    info!("Running redis pipeline");
-                    let pipeline = LocalPipeline::<
-                        RedisPipelineQueue<IndexingMessage>,
-                        RedisPipelineQueue<SearchSpaceGenerationMessage>,
-                        RedisPipelineQueue<IdentificationMessage>,
-                        RedisPipelineQueue<ScoringMessage>,
-                        RedisPipelineQueue<PublicationMessage>,
-                        RedisPipelineQueue<ErrorMessage>,
-                        RedisPipelineStorage,
-                    >::new(result_dir, tmp_dir, config)
-                    .await?;
-
-                    pipeline
-                        .run(search_params, ptms, mzml_file_paths, scrape_endpoint)
-                        .await?;
-                }
+                build_and_run_local_pipeline(
+                    queue,
+                    storage,
+                    result_dir,
+                    tmp_dir,
+                    config,
+                    search_params,
+                    ptms,
+                    mzml_file_paths,
+                    scrape_endpoint,
+                )
+                .await?
             }
             PipelineCommand::RemoteRun {
                 ptms_file,
@@ -738,6 +726,18 @@ async fn main() -> Result<()> {
             }
             PipelineCommand::Error { config_file_path } => {
                 ErrorTask::run_standalone(config_file_path).await?
+            }
+            PipelineCommand::QueueServer {
+                interface,
+                port,
+                state_file_path,
+                config_file_path,
+            } => {
+                let config: RemoteEntypointConfiguration = toml::from_str(
+                    &fs::read_to_string(&config_file_path).context("Reading config file")?,
+                )
+                .context("Deserialize config")?;
+                QueueServer::run_standalone(interface, port, config, state_file_path).await?;
             }
         },
         Commands::Version {} => {
@@ -809,6 +809,12 @@ fn loki_tracing_label(commands: &Commands) -> &'static str {
             PipelineCommand::Error {
                 config_file_path: _,
             } => ErrorTask::loki_tracing_label_value(),
+            PipelineCommand::QueueServer {
+                interface: _,
+                port: _,
+                state_file_path: _,
+                config_file_path: _,
+            } => QueueServer::loki_tracing_label_value(),
             _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
         },
         _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,

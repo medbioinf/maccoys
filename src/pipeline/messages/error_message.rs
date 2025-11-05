@@ -8,7 +8,7 @@ use super::is_message::IsMessage;
 
 const ID_PREFIX: &str = "maccoys_error_message";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorMessage {
     /// Search uuid
     uuid: String,

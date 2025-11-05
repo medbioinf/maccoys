@@ -1,7 +1,5 @@
-// std import
 use std::{future::IntoFuture, str::FromStr, sync::Arc};
 
-// 3rd party imports
 use deadqueue::limited::Queue;
 use futures::Future;
 use macpepdb::tools::queue_monitor::MonitorableQueue;
@@ -11,12 +9,15 @@ use rustis::{
 };
 use tracing::debug;
 
-use crate::pipeline::errors::queue_error::RedisQueueError;
-
-//  local imports
 use super::{
     configuration::TaskConfiguration, errors::queue_error::QueueError,
     messages::is_message::IsMessage,
+};
+
+use crate::pipeline::{
+    errors::queue_error::{HttpQueueError, RedisQueueError},
+    messages::compressed_binary_message::CompressedBinaryMessage,
+    queue_server::{IsQueueRouteable, QueueController},
 };
 
 /// Trait defining the methods for a pipeline queue
@@ -56,6 +57,10 @@ where
     fn is_empty(&self) -> impl Future<Output = Result<bool, QueueError>> + Send {
         async { Ok(self.len().await? == 0) }
     }
+
+    /// Checks if the queue is empty
+    ///
+    fn is_full(&self) -> impl Future<Output = Result<bool, QueueError>> + Send;
 }
 
 /// Implementation of a local pipeline queue. useful to debug, testing, reviewing or
@@ -110,15 +115,20 @@ where
     async fn len(&self) -> Result<usize, QueueError> {
         Ok(self.queue.len())
     }
+
+    async fn is_full(&self) -> Result<bool, QueueError> {
+        Ok(self.queue.is_full())
+    }
 }
 
-/// Redis implementation of the pipeline queue for distributed systems
-/// Messages are stored as key value pairs in Redis
-/// while the queue is stored as a list. This way we do not need the hole message again for
-/// acknowledging the message. As some messages get deconstructed during the task, to safe some memory
-/// we need to store the message in redis.
-/// Be aware that the max queue size is limited by this implementation not Redis.
-/// So it is important that every client is using the same queue size.
+/// Queue implemented to use Redis as backend
+/// The messages are stored as string with their ID as key. The queue itself is a list
+/// containing the message IDs. When popping a message, the ID is moved to a backup list (WIP)
+/// It is important to note, that redis lists seem to have no maximum capacity. So the capacity
+/// is enforced by this implementation. and can slightly differ from the configured capacity.
+///
+/// This implementation proofed unstable with very large messages (20MB +) as Redis seems to
+/// to close connections to client when the transfer takes to long.
 ///
 pub struct RedisPipelineQueue<M>
 where
@@ -159,14 +169,14 @@ where
 {
     async fn new(config: &TaskConfiguration) -> Result<Self, QueueError> {
         // Check redis URL as it is optional in the config
-        if config.redis_url.is_none() {
+        if config.queue_url.is_none() {
             return Err(RedisQueueError::RedisUrlMissing(config.queue_name.clone()).into());
         }
 
-        debug!("Storages: {:?} / {}", &config.redis_url, &config.queue_name);
+        debug!("Storages: {:?} / {}", &config.queue_url, &config.queue_name);
 
         let mut redis_client_config =
-            match rustis::client::Config::from_str(config.redis_url.as_ref().unwrap()) {
+            match rustis::client::Config::from_str(config.queue_url.as_ref().unwrap()) {
                 Ok(config) => config,
                 Err(e) => {
                     return Err(RedisQueueError::ConfigError(config.queue_name.clone(), e).into())
@@ -304,6 +314,319 @@ where
         Ok(self.client.llen(&self.queue_name).await.map_err(|e| {
             RedisQueueError::RedisError(self.queue_name.clone(), "getting length", e)
         })?)
+    }
+
+    async fn is_full(&self) -> Result<bool, QueueError> {
+        let len = self.len().await?;
+        Ok(len >= self.capacity)
+    }
+}
+
+/// Queue implemented used [crate::pipeline::queue_server::QueueServer] as backend
+/// Messages are convert to compressed binary messages and transfered using HTTP.
+///
+pub struct HttpPipelineQueue<M>
+where
+    M: IsMessage + IsQueueRouteable,
+{
+    /// Base URL of the http queueing
+    base_url: String,
+
+    /// Redis client
+    client: reqwest::Client,
+
+    /// Name of the queue
+    queue_name: String,
+
+    _phantom_message: std::marker::PhantomData<M>,
+}
+
+impl<M> PipelineQueue<M> for HttpPipelineQueue<M>
+where
+    M: IsMessage + IsQueueRouteable,
+{
+    async fn new(config: &TaskConfiguration) -> Result<Self, QueueError> {
+        if config.queue_url.is_none() {
+            return Err(HttpQueueError::BaseUrlMissing(config.queue_name.clone()).into());
+        }
+
+        let base_url = format!(
+            "{}{}",
+            config.queue_url.as_ref().unwrap(),
+            QueueController::path()
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .user_agent(config.queue_name.clone())
+            // .default_headers(default_header)
+            .http2_prior_knowledge()
+            .build()
+            .map_err(|err| {
+                QueueError::from(HttpQueueError::BuildError(config.queue_name.clone(), err))
+            })?;
+
+        Ok(Self {
+            base_url,
+            client,
+            queue_name: config.queue_name.clone(),
+            _phantom_message: std::marker::PhantomData,
+        })
+    }
+
+    async fn get_capacity(&self) -> Result<usize, QueueError> {
+        let url = format!("{}{}", self.base_url, M::capacity_route());
+
+        let response = self.client.get(&url).send().await.map_err(|err| {
+            QueueError::from(HttpQueueError::RequestError(
+                self.queue_name.clone(),
+                "getting capacity",
+                err,
+            ))
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let reason = response.text().await.unwrap_or_default();
+            return Err(HttpQueueError::UnsuccessStatusCode(
+                self.queue_name.clone(),
+                status,
+                reason,
+                "getting capacity",
+            )
+            .into());
+        }
+
+        let capacity: usize = response.json().await.map_err(|err| {
+            QueueError::from(HttpQueueError::DeserializationError(
+                self.queue_name.clone(),
+                "deserializing capacity response",
+                err,
+            ))
+        })?;
+
+        Ok(capacity)
+    }
+
+    async fn pop(&self) -> Result<Option<(String, M)>, QueueError> {
+        let url = format!("{}{}", self.base_url, M::pop_route());
+
+        let response = self.client.get(&url).send().await.map_err(|err| {
+            QueueError::from(HttpQueueError::RequestError(
+                self.queue_name.clone(),
+                "getting message",
+                err,
+            ))
+        })?;
+
+        // not found is acceptable as the queue might not exists yet
+        match response.status() {
+            reqwest::StatusCode::OK => {}
+            reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND => {
+                return Ok(None);
+            }
+            _ => {
+                let status = response.status();
+                let reason = response.text().await.unwrap_or_default();
+                return Err(HttpQueueError::UnsuccessStatusCode(
+                    self.queue_name.clone(),
+                    status,
+                    reason,
+                    "popping message",
+                )
+                .into());
+            }
+        }
+
+        let message_bytes = response.bytes().await.map_err(|err| {
+            HttpQueueError::RequestError(self.queue_name.clone(), "accessing body for message", err)
+        })?;
+
+        let message: M = CompressedBinaryMessage::from_postcard(&message_bytes)
+            .map_err(|err| {
+                QueueError::from(HttpQueueError::MessageError(
+                    self.queue_name.clone(),
+                    "deserializing compressed message",
+                    err,
+                ))
+            })?
+            .try_into_message()
+            .map_err(|err| {
+                QueueError::from(HttpQueueError::MessageError(
+                    self.queue_name.clone(),
+                    "uncompressing message",
+                    err,
+                ))
+            })?;
+
+        Ok(Some((message.get_id(), message)))
+    }
+
+    async fn push(&self, message: M) -> Result<(), (QueueError, Box<M>)> {
+        let url = format!("{}{}", self.base_url, M::push_route());
+
+        let compressed_message = match CompressedBinaryMessage::try_from_message(&message) {
+            Ok(compressed_message) => compressed_message,
+            Err(err) => {
+                return Err((
+                    HttpQueueError::MessageError(
+                        self.queue_name.clone(),
+                        "compressing message",
+                        err,
+                    )
+                    .into(),
+                    Box::new(message),
+                ))
+            }
+        };
+
+        let serialized_compressed_message = match compressed_message.to_postcard() {
+            Ok(serialized_message) => serialized_message,
+            Err(err) => {
+                return Err((
+                    HttpQueueError::MessageError(
+                        self.queue_name.clone(),
+                        "serializing compressed message",
+                        err,
+                    )
+                    .into(),
+                    Box::new(message),
+                ))
+            }
+        };
+
+        let response = match self
+            .client
+            .post(&url)
+            .body(serialized_compressed_message)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return Err((
+                    HttpQueueError::RequestError(self.queue_name.clone(), "getting message", err)
+                        .into(),
+                    Box::new(message),
+                ))
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            match status {
+                reqwest::StatusCode::INSUFFICIENT_STORAGE => {
+                    return Err((QueueError::QueueFullError, Box::new(message)))
+                }
+                _ => {
+                    let reason: String = response.text().await.unwrap_or_default();
+                    return Err((
+                        HttpQueueError::UnsuccessStatusCode(
+                            self.queue_name.clone(),
+                            status,
+                            reason,
+                            "pushing message",
+                        )
+                        .into(),
+                        Box::new(message),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ack(&self, message_id: &str) -> Result<(), QueueError> {
+        let url = format!("{}{}", self.base_url, M::ack_route());
+
+        let response = self
+            .client
+            .post(&url)
+            .json(message_id)
+            .send()
+            .await
+            .map_err(|err| {
+                QueueError::from(HttpQueueError::RequestError(
+                    self.queue_name.clone(),
+                    "acknowledging message",
+                    err,
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let reason = response.text().await.unwrap_or_default();
+            return Err(HttpQueueError::UnsuccessStatusCode(
+                self.queue_name.clone(),
+                status,
+                reason,
+                "acknowledging message",
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    async fn len(&self) -> Result<usize, QueueError> {
+        let url = format!("{}{}", self.base_url, M::len_route());
+
+        let response = self.client.get(&url).send().await.map_err(|err| {
+            HttpQueueError::RequestError(self.queue_name.clone(), "acknowledging message", err)
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let reason = response.text().await.unwrap_or_default();
+            return Err(HttpQueueError::UnsuccessStatusCode(
+                self.queue_name.clone(),
+                status,
+                reason,
+                "getting length",
+            )
+            .into());
+        }
+
+        let len: usize = response.json().await.map_err(|err| {
+            QueueError::from(HttpQueueError::DeserializationError(
+                self.queue_name.clone(),
+                "deserializing length response",
+                err,
+            ))
+        })?;
+
+        Ok(len)
+    }
+
+    async fn is_full(&self) -> Result<bool, QueueError> {
+        let url = format!("{}{}", self.base_url, M::is_full_route());
+
+        let response = self.client.get(&url).send().await.map_err(|err| {
+            HttpQueueError::RequestError(self.queue_name.clone(), "checking if full", err)
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let reason = response.text().await.unwrap_or_default();
+            return Err(HttpQueueError::UnsuccessStatusCode(
+                self.queue_name.clone(),
+                status,
+                reason,
+                "checking if full",
+            )
+            .into());
+        }
+
+        let is_full: bool = response.json().await.map_err(|err| {
+            QueueError::from(HttpQueueError::DeserializationError(
+                self.queue_name.clone(),
+                "deserializing is_full response",
+                err,
+            ))
+        })?;
+
+        Ok(is_full)
     }
 }
 

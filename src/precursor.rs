@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Simple struct representing a precursor with m/z and charge
 ///
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Precursor {
     /// m/z
     mz: f64,

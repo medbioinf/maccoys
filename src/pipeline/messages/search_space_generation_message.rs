@@ -19,7 +19,7 @@ const ID_PREFIX: &str = "maccoys_search_space_generation_message";
 
 /// Search space generation message
 ///
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchSpaceGenerationMessage {
     /// Search uuid
     uuid: String,

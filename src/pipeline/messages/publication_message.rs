@@ -10,7 +10,7 @@ const ID_PREFIX: &str = "maccoys_publication_message";
 
 /// Publication message
 ///
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublicationMessage {
     /// Search uuid
     uuid: String,

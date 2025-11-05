@@ -7,7 +7,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use clap::ValueEnum;
 use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::future::join_all;
 use indicatif::ProgressStyle;
@@ -19,6 +20,10 @@ use uuid::Uuid;
 
 use crate::pipeline::{
     errors::queue_error::QueueError,
+    messages::is_message::IsMessage,
+    queue::{HttpPipelineQueue, LocalPipelineQueue, RedisPipelineQueue},
+    queue_server::{IsQueueRouteable, QueueServer, QueueServerState},
+    storage::{LocalPipelineStorage, RedisPipelineStorage},
     tasks::{
         error_task::ErrorTask, identification_task::IdentificationTask,
         indexing_task::IndexingTask, publication_task::PublicationTask, scoring_task::ScoringTask,
@@ -39,38 +44,75 @@ use super::{
     storage::PipelineStorage,
 };
 
+/// Target for local piplines storage
+///
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum StorageTarget {
+    Memory,
+    Redis,
+}
+
+/// Target for local piplines queue
+///
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum QueueTarget {
+    Memory,
+    Redis,
+    Http,
+}
+
+pub trait QueueFactory {
+    type Queue<M>: PipelineQueue<M>
+    where
+        M: IsMessage + IsQueueRouteable;
+}
+
+pub struct LocalQueue;
+impl QueueFactory for LocalQueue {
+    type Queue<M>
+        = LocalPipelineQueue<M>
+    where
+        M: IsMessage + IsQueueRouteable;
+}
+
+pub struct RedisQueue;
+impl QueueFactory for RedisQueue {
+    type Queue<M>
+        = RedisPipelineQueue<M>
+    where
+        M: IsMessage + IsQueueRouteable;
+}
+
+pub struct HttpQueue;
+impl QueueFactory for HttpQueue {
+    type Queue<M>
+        = HttpPipelineQueue<M>
+    where
+        M: IsMessage + IsQueueRouteable;
+}
+
 /// Local pipeline for debugging and testing
 /// Can run with local and remote storage and queues
 ///
 /// # Generics
-/// * `IQ` - Indexing Queue
-/// * `SQ` - Search Space Generation Queue
-/// * `CQ` - Identification Queue (formerly Comet Search Queue)
-/// * `GQ` - Scoring Queue (formerly Goodness and Rescoring Queue)
-/// * `PQ` - Publication Queue
-/// * `EQ` - Error Queue
+/// * `Q` - Queue factory
 /// * `S` - Storage
 ///
 ///
-pub struct LocalPipeline<IQ, SQ, CQ, GQ, PQ, EQ, S>
+pub struct LocalPipeline<Q, S>
 where
-    IQ: PipelineQueue<IndexingMessage> + 'static,
-    SQ: PipelineQueue<SearchSpaceGenerationMessage> + 'static,
-    CQ: PipelineQueue<IdentificationMessage> + 'static,
-    GQ: PipelineQueue<ScoringMessage> + 'static,
-    PQ: PipelineQueue<PublicationMessage> + 'static,
-    EQ: PipelineQueue<ErrorMessage> + 'static,
+    Q: QueueFactory + 'static,
     S: PipelineStorage + 'static,
 {
     result_dir: PathBuf,
     tmp_dir: PathBuf,
 
-    indexing_queue: Arc<IQ>,
-    _search_space_generation_queue: Arc<SQ>,
-    _identification_queue: Arc<CQ>,
-    _scoring_queue: Arc<GQ>,
-    _publication_queue: Arc<PQ>,
-    _error_queue: Arc<EQ>,
+    indexing_queue: Arc<<Q as QueueFactory>::Queue<IndexingMessage>>,
+    _search_space_generation_queue: Arc<<Q as QueueFactory>::Queue<SearchSpaceGenerationMessage>>,
+    _identification_queue: Arc<<Q as QueueFactory>::Queue<IdentificationMessage>>,
+    _scoring_queue: Arc<<Q as QueueFactory>::Queue<ScoringMessage>>,
+    _publication_queue: Arc<<Q as QueueFactory>::Queue<PublicationMessage>>,
+    _error_queue: Arc<<Q as QueueFactory>::Queue<ErrorMessage>>,
     storage: Arc<S>,
 
     index_stop_flag: Arc<AtomicBool>,
@@ -88,14 +130,9 @@ where
     error_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-impl<IQ, SQ, CQ, GQ, PQ, EQ, S> LocalPipeline<IQ, SQ, CQ, GQ, PQ, EQ, S>
+impl<Q, S> LocalPipeline<Q, S>
 where
-    IQ: PipelineQueue<IndexingMessage> + 'static,
-    SQ: PipelineQueue<SearchSpaceGenerationMessage> + 'static,
-    CQ: PipelineQueue<IdentificationMessage> + 'static,
-    GQ: PipelineQueue<ScoringMessage> + 'static,
-    PQ: PipelineQueue<PublicationMessage> + 'static,
-    EQ: PipelineQueue<ErrorMessage> + 'static,
+    Q: QueueFactory + 'static,
     S: PipelineStorage + 'static,
 {
     pub async fn new(
@@ -111,13 +148,25 @@ where
             .context("Could not create temporery directory")?;
 
         // Create the queues
-        let indexing_queue = Arc::new(IQ::new(&config.index).await?);
-        let search_space_generation_queue =
-            Arc::new(SQ::new(&config.search_space_generation).await?);
-        let identification_queue = Arc::new(CQ::new(&config.identification).await?);
-        let scoring_queue = Arc::new(GQ::new(&config.scoring).await?);
-        let publication_queue = Arc::new(PQ::new(&config.publication).await?);
-        let error_queue = Arc::new(EQ::new(&config.error).await?);
+        let indexing_queue =
+            Arc::new(<Q as QueueFactory>::Queue::<IndexingMessage>::new(&config.index).await?);
+        let search_space_generation_queue = Arc::new(
+            <Q as QueueFactory>::Queue::<SearchSpaceGenerationMessage>::new(
+                &config.search_space_generation,
+            )
+            .await?,
+        );
+        let identification_queue = Arc::new(
+            <Q as QueueFactory>::Queue::<IdentificationMessage>::new(&config.identification)
+                .await?,
+        );
+        let scoring_queue =
+            Arc::new(<Q as QueueFactory>::Queue::<ScoringMessage>::new(&config.scoring).await?);
+        let publication_queue = Arc::new(
+            <Q as QueueFactory>::Queue::<PublicationMessage>::new(&config.publication).await?,
+        );
+        let error_queue =
+            Arc::new(<Q as QueueFactory>::Queue::<ErrorMessage>::new(&config.error).await?);
 
         // Create the storage
         let storage = Arc::new(S::new(&config.storage).await?);
@@ -325,16 +374,16 @@ where
             IndexingMessage::new(uuid.clone(), mzml_file_names);
 
         loop {
-            indexing_message = match self.indexing_queue.push(indexing_message).await {
+            match self.indexing_queue.push(indexing_message).await {
                 Ok(_) => {
                     debug!("Sucessfully pushed indexing message");
                     break;
                 }
                 Err((err, errored_message)) => match err {
-                    QueueError::QueueFullError => *errored_message,
+                    QueueError::QueueFullError => indexing_message = *errored_message,
                     _ => {
-                        error!("{}", err);
-                        break;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        return Err(anyhow!("Error pushing indexing message: {}", err));
                     }
                 },
             };
@@ -377,14 +426,9 @@ where
     }
 }
 
-impl<IQ, SQ, CQ, GQ, PQ, EQ, S> Drop for LocalPipeline<IQ, SQ, CQ, GQ, PQ, EQ, S>
+impl<Q, S> Drop for LocalPipeline<Q, S>
 where
-    IQ: PipelineQueue<IndexingMessage> + 'static,
-    SQ: PipelineQueue<SearchSpaceGenerationMessage> + 'static,
-    CQ: PipelineQueue<IdentificationMessage> + 'static,
-    GQ: PipelineQueue<ScoringMessage> + 'static,
-    PQ: PipelineQueue<PublicationMessage> + 'static,
-    EQ: PipelineQueue<ErrorMessage> + 'static,
+    Q: QueueFactory + 'static,
     S: PipelineStorage + 'static,
 {
     fn drop(&mut self) {
@@ -429,4 +473,120 @@ where
             }
         }
     }
+}
+
+/// Build and run a local pipeline with the specified queue and storage targets
+///
+/// # Arguments
+/// * `queue` - Queue target
+/// * `storage` - Storage target
+/// * `result_dir` - Result directory where each search is stored
+/// * `tmp_dir` - Temporary directory for the pipeline
+/// * `config` - Configuration for the pipeline
+/// * `xcorr_config` - Configuration for Comet
+/// * `ptms` - Post translational modifications
+/// * `mzml_file_paths` - Paths to the mzML files to search
+///
+#[allow(clippy::too_many_arguments)]
+pub async fn build_and_run_local_pipeline(
+    queue: QueueTarget,
+    storage: StorageTarget,
+    result_dir: PathBuf,
+    tmp_dir: PathBuf,
+    config: PipelineConfiguration,
+    search_params: SearchParameters,
+    ptms: Vec<PostTranslationalModification>,
+    mzml_file_paths: Vec<PathBuf>,
+    metrics_scrape_url: Option<String>,
+) -> Result<()> {
+    let http_queue_server = match queue {
+        QueueTarget::Http => {
+            let queue_server_config = config.to_remote_entrypoint_configuration();
+            let queue_url = queue_server_config
+                .index
+                .queue_url
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "HTTP queue selected but no queue URL provided in configuration"
+                            .to_string(),
+                    )
+                })?;
+            let url = url::Url::parse(queue_url).context("Parsing queue URL")?;
+
+            let interface = url
+                .host_str()
+                .ok_or_else(|| anyhow!("No host found in queue URL"))?
+                .to_string();
+
+            let port: u16 = url
+                .port_or_known_default()
+                .ok_or_else(|| anyhow!("No port found in queue URL"))?;
+
+            let state = Arc::new(QueueServerState::from_config(&queue_server_config));
+
+            let (stop_signal_sender, stop_signal_receiver) = tokio::sync::oneshot::channel::<()>();
+
+            let stop_signal = async move {
+                stop_signal_receiver.await.ok();
+            };
+
+            let handle = tokio::spawn(async move {
+                QueueServer::run(interface, port, state, Some(Box::pin(stop_signal))).await
+            });
+
+            Some((handle, stop_signal_sender))
+        }
+        _ => None,
+    };
+
+    match (queue, storage) {
+        (QueueTarget::Memory, StorageTarget::Memory) => {
+            LocalPipeline::<LocalQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
+                .await?
+                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .await?
+        }
+        (QueueTarget::Memory, StorageTarget::Redis) => {
+            LocalPipeline::<LocalQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
+                .await?
+                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .await?
+        }
+        (QueueTarget::Redis, StorageTarget::Memory) => {
+            LocalPipeline::<RedisQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
+                .await?
+                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .await?
+        }
+        (QueueTarget::Redis, StorageTarget::Redis) => {
+            LocalPipeline::<RedisQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
+                .await?
+                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .await?
+        }
+        (QueueTarget::Http, StorageTarget::Memory) => {
+            LocalPipeline::<HttpQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
+                .await?
+                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .await?
+        }
+        (QueueTarget::Http, StorageTarget::Redis) => {
+            LocalPipeline::<HttpQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
+                .await?
+                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .await?
+        }
+    };
+
+    if let Some((handle, stop_signal_sender)) = http_queue_server {
+        stop_signal_sender
+            .send(())
+            .map_err(|_| anyhow!("Sending stop signal to HTTP queue server"))?;
+        handle
+            .await
+            .context("Waiting for HTTP queue server to stop")??;
+    }
+
+    Ok(())
 }

@@ -23,3 +23,6 @@ pub mod errors;
 
 /// Utility functions for the pipeline
 pub mod utils;
+
+/// Server for queueing message using HTTP
+pub mod queue_server;

@@ -18,7 +18,7 @@ use crate::pipeline::{
     configuration::StandaloneErrorConfiguration,
     errors::pipeline_error::PipelineError,
     messages::{error_message::ErrorMessage, is_message::IsMessage},
-    queue::{PipelineQueue, RedisPipelineQueue},
+    queue::{HttpPipelineQueue, PipelineQueue},
     utils::{
         create_file_path_on_ms_run_level, create_file_path_on_precursor_level,
         create_file_path_on_search_level, create_file_path_on_spectrum_level,
@@ -156,7 +156,7 @@ impl ErrorTask {
             toml::from_str(&fs::read_to_string(&config_file_path).context("Reading config file")?)
                 .context("Deserialize config")?;
 
-        let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
+        let error_queue = Arc::new(HttpPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
         let mut signals = Signals::new([SIGINT])?;
 

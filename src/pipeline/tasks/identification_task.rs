@@ -29,7 +29,7 @@ use crate::{
             is_message::IsMessage, publication_message::PublicationMessage,
             scoring_message::ScoringMessage,
         },
-        queue::{PipelineQueue, RedisPipelineQueue},
+        queue::{HttpPipelineQueue, PipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
         utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
     },
@@ -260,16 +260,16 @@ impl IdentificationTask {
             })?;
 
         let identification_queue = Arc::new(
-            RedisPipelineQueue::<IdentificationMessage>::new(&config.identification).await?,
+            HttpPipelineQueue::<IdentificationMessage>::new(&config.identification).await?,
         );
 
         let scoring_queue =
-            Arc::new(RedisPipelineQueue::<ScoringMessage>::new(&config.scoring).await?);
+            Arc::new(HttpPipelineQueue::<ScoringMessage>::new(&config.scoring).await?);
 
         let publication_queue =
-            Arc::new(RedisPipelineQueue::<PublicationMessage>::new(&config.publication).await?);
+            Arc::new(HttpPipelineQueue::<PublicationMessage>::new(&config.publication).await?);
 
-        let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
+        let error_queue = Arc::new(HttpPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
         let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 

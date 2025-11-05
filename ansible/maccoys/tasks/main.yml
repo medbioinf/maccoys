@@ -23,6 +23,13 @@
     regexp: '<STORAGE_SERVER>'
     replace: "{{ groups['storage'][0] }}"
 
+- name: Set queue server
+  when: action == "start"
+  ansible.builtin.replace:
+    path: "{{ config_file }}"
+    regexp: '<QUEUE_SERVER>'
+    replace: "{{ groups['queue'][0] }}"
+
 - name: Set target peptide URL
   when: action == "start"
   ansible.builtin.replace:

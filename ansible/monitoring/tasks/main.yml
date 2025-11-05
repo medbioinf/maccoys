@@ -110,6 +110,8 @@
       port: 9495
     - name: error
       port: 9496
+    - name: queue
+      port: 9497
 
 - name: Add hosts to prometheus config
   ansible.builtin.lineinfile:

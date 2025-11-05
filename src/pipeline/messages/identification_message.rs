@@ -18,7 +18,7 @@ const ID_PREFIX: &str = "maccoys_itentification_message";
 
 /// Indexing message
 ///
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IdentificationMessage {
     /// Search uuid
     uuid: String,

@@ -518,12 +518,12 @@ impl RedisPipelineStorage {
 
 impl PipelineStorage for RedisPipelineStorage {
     async fn new(config: &PipelineStorageConfiguration) -> Result<Self, StorageError> {
-        if config.redis_url.is_none() {
+        if config.url.is_none() {
             return Err(RedisStorageError::RedisUrlMissing.into());
         }
 
         let mut redis_client_config =
-            rustis::client::Config::from_str(config.redis_url.as_ref().unwrap())
+            rustis::client::Config::from_str(config.url.as_ref().unwrap())
                 .map_err(RedisStorageError::ConfigError)?;
         redis_client_config.retry_on_error = true;
         redis_client_config.reconnection = rustis::client::ReconnectionConfig::new_constant(0, 5);
@@ -781,7 +781,7 @@ mod tests {
 
         let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
             time_to_idle,
-            redis_url: Some("redis://127.0.0.1:6380".to_string()),
+            url: Some("redis://127.0.0.1:6380".to_string()),
         };
 
         let storage = RedisPipelineStorage::new(&config).await.unwrap();
@@ -842,7 +842,7 @@ mod tests {
 
         let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
             time_to_idle,
-            redis_url: Some("redis://127.0.0.1:6380".to_string()),
+            url: Some("redis://127.0.0.1:6380".to_string()),
         };
 
         let storage = RedisPipelineStorage::new(&config).await.unwrap();
@@ -859,7 +859,7 @@ mod tests {
 
         let storage = LocalPipelineStorage::new(&PipelineStorageConfiguration {
             time_to_idle,
-            redis_url: None,
+            url: None,
         })
         .await
         .unwrap();

@@ -1,0 +1,4 @@
+#SPDX-License-Identifier: MIT-0
+---
+# vars file for maccoys-http-queue-server
+ports: "{{ hostvars[inventory_hostname]['queue_ports'] | default([]) }}"

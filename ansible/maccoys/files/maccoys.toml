@@ -5,13 +5,13 @@ work_directory = "/searches"
 num_tasks = 1
 queue_name = "index"
 queue_capacity = 1000
-redis_url = "redis://<STORAGE_SERVER>:6379"
+queue_url = "http://<QUEUE_SERVER>:8123"
 
 [search_space_generation]
 num_tasks = 16
 queue_name = "search_space_generation"
 queue_capacity = 100
-redis_url = "redis://<STORAGE_SERVER>:6379"
+queue_url = "http://<QUEUE_SERVER>:8123"
 target_url = "<TARGET_PEPTIDE_URL>"
 # decoy_url = "http://
 # target_lookup_url = "http://
@@ -21,29 +21,29 @@ target_url = "<TARGET_PEPTIDE_URL>"
 num_tasks = 1
 queue_name = "identification"
 queue_capacity = 100
-redis_url = "redis://<STORAGE_SERVER>:6379"
+queue_url = "http://<QUEUE_SERVER>:8123"
 threads = 8
 
 [scoring]
 num_tasks = 1
 queue_name = "scoring"
 queue_capacity = 100
-redis_url = "redis://<STORAGE_SERVER>:6379"
+queue_url = "http://<QUEUE_SERVER>:8123"
 threads = 16
 
 [publication]
 num_tasks = 4
 queue_name = "publication"
 queue_capacity = 100
-redis_url = "redis://<STORAGE_SERVER>:6379"
+queue_url = "http://<QUEUE_SERVER>:8123"
 
 [error]
 num_tasks = 1
 queue_name = "error"
 queue_capacity = 100
-redis_url = "redis://<STORAGE_SERVER>:6379"
+queue_url = "http://<QUEUE_SERVER>:8123"
 
 
 [storage]
 time_to_idle = 900
-redis_url = "redis://<STORAGE_SERVER>:6379"
+url = "redis://<STORAGE_SERVER>:6379"

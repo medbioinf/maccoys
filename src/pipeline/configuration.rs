@@ -70,8 +70,8 @@ pub struct TaskConfiguration {
     pub queue_name: String,
     /// Queue capacity
     pub queue_capacity: usize,
-    /// Optional redis URL if the queue is not local
-    pub redis_url: Option<String>,
+    /// Optional URL for queues, none is in-memory (only for local runs), can be redis URL or http URL
+    pub queue_url: Option<String>,
 }
 
 /// Configuration for the search
@@ -166,7 +166,7 @@ pub struct PipelineConfiguration {
 pub struct PipelineStorageConfiguration {
     /// Seconds after the last access to a flag after which is automatically removed.
     pub time_to_idle: u64,
-    pub redis_url: Option<String>,
+    pub url: Option<String>,
 }
 
 impl PipelineConfiguration {
@@ -174,6 +174,20 @@ impl PipelineConfiguration {
     ///
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn to_remote_entrypoint_configuration(&self) -> RemoteEntypointConfiguration {
+        RemoteEntypointConfiguration {
+            index: self.index.clone(),
+            search_space_generation: self.search_space_generation.clone(),
+            identification: self.identification.clone(),
+            scoring: self.scoring.clone(),
+            publication: self.publication.clone(),
+            error: self.error.clone(),
+            storage: self.storage.clone(),
+            prometheus_base_url: "".to_string(),
+            work_directory: PathBuf::new(),
+        }
     }
 }
 
@@ -185,14 +199,14 @@ impl Default for PipelineConfiguration {
                 num_tasks: 1,
                 queue_name: INDEXING_QUEUE_KEY.to_string(),
                 queue_capacity: 100,
-                redis_url: None,
+                queue_url: None,
             },
             search_space_generation: SearchSpaceGenerationTaskConfiguration {
                 general: TaskConfiguration {
                     num_tasks: 64,
                     queue_name: SEARCH_SPACE_GENERATION_QUEUE_KEY.to_string(),
                     queue_capacity: 100,
-                    redis_url: None,
+                    queue_url: None,
                 },
                 target_url: "".to_string(),
                 decoy_url: None,
@@ -204,7 +218,7 @@ impl Default for PipelineConfiguration {
                     num_tasks: 4,
                     queue_name: IDENTIFICATION_QUEUE_KEY.to_string(),
                     queue_capacity: 100,
-                    redis_url: None,
+                    queue_url: None,
                 },
                 threads: 2,
             },
@@ -213,7 +227,7 @@ impl Default for PipelineConfiguration {
                     num_tasks: 2,
                     queue_name: SCORING_QUEUE_KEY.to_string(),
                     queue_capacity: 100,
-                    redis_url: None,
+                    queue_url: None,
                 },
                 threads: 1,
             },
@@ -221,17 +235,17 @@ impl Default for PipelineConfiguration {
                 num_tasks: 1,
                 queue_name: PUBLICATION_QUEUE_KEY.to_string(),
                 queue_capacity: 100,
-                redis_url: None,
+                queue_url: None,
             },
             error: TaskConfiguration {
                 num_tasks: 1,
                 queue_name: ERROR_QUEUE_KEY.to_string(),
                 queue_capacity: 100,
-                redis_url: None,
+                queue_url: None,
             },
             storage: PipelineStorageConfiguration {
                 time_to_idle: 86_400, // 24 hours
-                redis_url: None,
+                url: None,
             },
         }
     }
@@ -248,7 +262,7 @@ pub struct RemoteEntypointConfiguration {
     /// Identification task configuration
     pub identification: IdentificationTaskConfiguration,
     /// scoring task configuration
-    pub scoring: TaskConfiguration,
+    pub scoring: ScoringTaskConfiguration,
     /// Publication task configuration
     pub publication: TaskConfiguration,
     /// Error task configuration
@@ -300,7 +314,7 @@ pub struct StandaloneIdentificationConfiguration {
     /// Comet search task configuration
     pub identification: IdentificationTaskConfiguration,
     /// Goodness and rescoring task configuration
-    pub scoring: TaskConfiguration,
+    pub scoring: ScoringTaskConfiguration,
     /// Publication task configuration
     pub publication: TaskConfiguration,
     /// Error task configuration

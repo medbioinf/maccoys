@@ -19,7 +19,7 @@ use crate::{
     errors::axum::web_error::AnyhowWebError,
     io::axum::multipart::write_streamed_file,
     pipeline::{
-        queue::RedisPipelineQueue,
+        queue::HttpPipelineQueue,
         storage::{PipelineStorage, RedisPipelineStorage},
     },
     web::web_error::WebError,
@@ -45,12 +45,12 @@ static LOKI_TRACING_LABEL_VALUE: &str = "remote_pipeline_web_api";
 /// Shared state for the remote entrypoint service
 ///
 struct EntrypointServiceState {
-    index_queue: RedisPipelineQueue<IndexingMessage>,
-    search_space_generation_queue: RedisPipelineQueue<SearchSpaceGenerationMessage>,
-    identification_queue: RedisPipelineQueue<IdentificationMessage>,
-    scoring_queue: RedisPipelineQueue<ScoringMessage>,
-    publication_queue: RedisPipelineQueue<PublicationMessage>,
-    error_queue: RedisPipelineQueue<ErrorMessage>,
+    index_queue: HttpPipelineQueue<IndexingMessage>,
+    search_space_generation_queue: HttpPipelineQueue<SearchSpaceGenerationMessage>,
+    identification_queue: HttpPipelineQueue<IdentificationMessage>,
+    scoring_queue: HttpPipelineQueue<ScoringMessage>,
+    publication_queue: HttpPipelineQueue<PublicationMessage>,
+    error_queue: HttpPipelineQueue<ErrorMessage>,
     storage: RwLock<RedisPipelineStorage>,
     work_dir: PathBuf,
 }
@@ -162,13 +162,13 @@ impl RemotePipelineWebApi {
         port: u16,
         config: RemoteEntypointConfiguration,
     ) -> Result<()> {
-        let index_queue = RedisPipelineQueue::new(&config.index).await?;
+        let index_queue = HttpPipelineQueue::new(&config.index).await?;
         let search_space_generation_queue =
-            RedisPipelineQueue::new(&config.search_space_generation).await?;
-        let identification_queue = RedisPipelineQueue::new(&config.identification).await?;
-        let scoring_queue = RedisPipelineQueue::new(&config.scoring).await?;
-        let publication_queue = RedisPipelineQueue::new(&config.publication).await?;
-        let error_queue = RedisPipelineQueue::new(&config.error).await?;
+            HttpPipelineQueue::new(&config.search_space_generation).await?;
+        let identification_queue = HttpPipelineQueue::new(&config.identification).await?;
+        let scoring_queue = HttpPipelineQueue::new(&config.scoring).await?;
+        let publication_queue = HttpPipelineQueue::new(&config.publication).await?;
+        let error_queue = HttpPipelineQueue::new(&config.error).await?;
         let storage = RwLock::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let state: Arc<EntrypointServiceState> = Arc::new(EntrypointServiceState {

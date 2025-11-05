@@ -13,6 +13,14 @@
   tags:
    - storage
 
+- name: Queue
+  hosts: queue
+  become: true
+  roles:
+   - maccoys-http-queue-server
+  tags:
+   - queue
+
 - name: Monitored
   hosts: all
   become: true

@@ -24,7 +24,7 @@ use crate::{
             error_message::ErrorMessage, indexing_message::IndexingMessage, is_message::IsMessage,
             search_space_generation_message::SearchSpaceGenerationMessage,
         },
-        queue::{PipelineQueue, RedisPipelineQueue},
+        queue::{HttpPipelineQueue, PipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
         utils::{get_ms_run_index_path, get_ms_run_mzml_path},
     },
@@ -371,16 +371,14 @@ impl IndexingTask {
         })?;
 
         let indexing_queue =
-            Arc::new(RedisPipelineQueue::<IndexingMessage>::new(&config.index).await?);
+            Arc::new(HttpPipelineQueue::<IndexingMessage>::new(&config.index).await?);
 
         let search_space_generation_queue = Arc::new(
-            RedisPipelineQueue::<SearchSpaceGenerationMessage>::new(
-                &config.search_space_generation,
-            )
-            .await?,
+            HttpPipelineQueue::<SearchSpaceGenerationMessage>::new(&config.search_space_generation)
+                .await?,
         );
 
-        let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
+        let error_queue = Arc::new(HttpPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
         let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 

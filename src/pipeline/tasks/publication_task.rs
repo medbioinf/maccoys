@@ -18,7 +18,7 @@ use crate::pipeline::{
     messages::{
         error_message::ErrorMessage, is_message::IsMessage, publication_message::PublicationMessage,
     },
-    queue::{PipelineQueue, RedisPipelineQueue},
+    queue::{HttpPipelineQueue, PipelineQueue},
     storage::{PipelineStorage, RedisPipelineStorage},
 };
 
@@ -169,9 +169,9 @@ impl PublicationTask {
         })?;
 
         let publication_queue =
-            Arc::new(RedisPipelineQueue::<PublicationMessage>::new(&config.publication).await?);
+            Arc::new(HttpPipelineQueue::<PublicationMessage>::new(&config.publication).await?);
 
-        let error_queue = Arc::new(RedisPipelineQueue::<ErrorMessage>::new(&config.error).await?);
+        let error_queue = Arc::new(HttpPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
         let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 
