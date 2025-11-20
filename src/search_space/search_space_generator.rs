@@ -370,7 +370,18 @@ impl SearchSpaceGenerator {
                     .send()
                     .await?;
                 if !response.status().is_success() {
-                    bail!("Failed to fetch peptides: {}", response.text().await?);
+                    let status_code = response.status();
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|ct| ct.to_str().ok())
+                        .unwrap_or("unknown content type")
+                        .to_string();
+                    let response_text = response
+                        .text()
+                        .await
+                        .unwrap_or("text is not decodable".to_string());
+                    bail!("Failed to fetch peptides:\nstatus code: {status_code}\ncontent type: {content_type}\nresponse text: {response_text}");
                 }
                 let mut peptide_stream = response.bytes_stream();
                 let mut buffer = Vec::with_capacity(1024);
