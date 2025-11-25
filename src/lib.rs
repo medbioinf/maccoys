@@ -21,5 +21,7 @@ pub mod pipeline;
 pub mod precursor;
 /// Module for generating MaCcoyS search spaces
 pub mod search_space;
+/// Utility funtions and extensions based on external crates.
+pub mod utils;
 /// Web API endpoints for adding decoys to a MaCPepDB database used only for decoys.
 pub mod web;

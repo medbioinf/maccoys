@@ -54,6 +54,8 @@ pub enum HttpQueueServerError {
     SignalHandlerError(std::io::Error),
     #[error("[HttpQueueServer] {0}")]
     MessageError(#[from] MessageError),
+    #[error("[HttpQueueServer] Rescheduler could not be joined")]
+    ReschedulerJoinError,
 }
 
 impl IntoResponse for HttpQueueServerError {

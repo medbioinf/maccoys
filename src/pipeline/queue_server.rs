@@ -1,6 +1,8 @@
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,11 +13,12 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use dashmap::DashMap;
-use deadqueue::limited::Queue;
 use http::status::StatusCode;
+use parking_lot::RwLock;
 use paste::paste;
 use serde::{Deserialize, Serialize};
+use tokio::time::{sleep_until, Instant};
+use tracing::error;
 
 use crate::pipeline::configuration::RemoteEntypointConfiguration;
 use crate::pipeline::messages::error_message::ErrorMessage;
@@ -33,6 +36,13 @@ use crate::pipeline::{
 
 static LOKI_TRACING_LABEL_VALUE: &str = "http_queue_server";
 
+/// Type alias for the RwLock holding the messages queue and work_in_progress map
+///
+type RWLockedMessages<M> = RwLock<(
+    VecDeque<CompressedBinaryMessage<M>>,
+    HashMap<String, (usize, CompressedBinaryMessage<M>)>,
+)>;
+
 /// A redundant queue implementation that holds messages to be processed
 /// and messages being processed with timestamp of when processing started
 /// Operations are lockfree where possible
@@ -41,20 +51,22 @@ pub struct RedundantQueue<M>
 where
     M: IsMessage,
 {
-    /// Queue holding messages (Postcard formatted CompressedBinaryMessage) to be processed
-    work: Queue<CompressedBinaryMessage<M>>,
-    /// Queue holding messages being processed with timestamp of when processing started
-    work_in_progress: DashMap<String, (usize, CompressedBinaryMessage<M>)>,
+    capacity: usize,
+    /// After this duration a message in work_in_progress is considered timed out and eligible for rescheduling
+    timeout: Duration,
+    messages: RWLockedMessages<M>,
 }
 
 impl<M> RedundantQueue<M>
 where
     M: IsMessage + Clone,
 {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, timeout: Duration) -> Self {
+        let messages = RwLock::new((VecDeque::with_capacity(capacity), HashMap::new()));
         Self {
-            work: Queue::new(capacity),
-            work_in_progress: DashMap::new(),
+            capacity,
+            timeout,
+            messages,
         }
     }
 
@@ -66,30 +78,36 @@ where
     pub fn try_push(
         &self,
         message: CompressedBinaryMessage<M>,
-    ) -> Result<(), HttpQueueServerError> {
-        self.work
-            .try_push(message)
-            .map_err(|_| HttpQueueServerError::QueueFullError)
+    ) -> Result<(), (Box<CompressedBinaryMessage<M>>, HttpQueueServerError)> {
+        if self.len() >= self.capacity {
+            return Err((Box::new(message), HttpQueueServerError::QueueFullError));
+        }
+
+        let (work, _) = &mut *self.messages.write();
+
+        work.push_back(message);
+
+        Ok(())
     }
 
     /// Tries to pop a message from the queue
     /// If a message is popped, it is added to the work_in_progress map with the current timestamp
     ///
     pub fn try_pop(&self) -> Result<CompressedBinaryMessage<M>, HttpQueueServerError> {
-        let message = self
-            .work
-            .try_pop()
+        let (work, work_in_progress) = &mut *self.messages.write();
+        let message = work
+            .pop_front()
             .ok_or(HttpQueueServerError::QueueEmptyError)?;
 
-        self.work_in_progress.insert(
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0));
+
+        let timeout = unix_now + self.timeout;
+
+        work_in_progress.insert(
             message.id().to_string(),
-            (
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::from_secs(0))
-                    .as_secs() as usize,
-                message.clone(),
-            ),
+            (timeout.as_secs() as usize, message.clone()),
         );
 
         Ok(message)
@@ -101,7 +119,9 @@ where
     /// * `message_id` - ID of the message to acknowledge
     ///
     pub fn acknowledge(&self, message_id: &str) -> Result<(), HttpQueueServerError> {
-        self.work_in_progress
+        let (_, work_in_progress) = &mut *self.messages.write();
+
+        work_in_progress
             .remove(message_id)
             .ok_or(HttpQueueServerError::KeyNotFoundError(
                 message_id.to_string(),
@@ -111,19 +131,49 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.work.len()
+        let (work, work_in_progress) = &*self.messages.read();
+        work.len() + work_in_progress.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.work.is_empty()
+        let (work, work_in_progress) = &*self.messages.read();
+        work.is_empty() && work_in_progress.is_empty()
     }
 
     pub fn is_full(&self) -> bool {
-        self.work.is_full()
+        self.len() >= self.capacity
     }
 
     pub fn capacity(&self) -> usize {
-        self.work.capacity()
+        self.capacity
+    }
+
+    pub fn reschedule(&self) -> Result<(), HttpQueueServerError> {
+        let (work, work_in_progress) = &mut *self.messages.write();
+
+        let now: usize = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() as usize;
+
+        let messages_to_reschedule = work_in_progress
+            .iter()
+            .filter_map(|(message_id, (timeout, _))| {
+                if now >= *timeout {
+                    Some(message_id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for message_id in messages_to_reschedule.into_iter() {
+            if let Some((_, message)) = work_in_progress.remove(&message_id) {
+                work.push_back(message);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -131,15 +181,11 @@ impl<M> From<SerializableRedundantQueue<M>> for RedundantQueue<M>
 where
     M: IsMessage,
 {
-    fn from(mut queue: SerializableRedundantQueue<M>) -> Self {
-        let work = Queue::new(queue.capacity);
-        for message in queue.work.drain(..) {
-            let _ = work.try_push(message);
-        }
-
+    fn from(queue: SerializableRedundantQueue<M>) -> Self {
         Self {
-            work,
-            work_in_progress: queue.work_in_progress,
+            capacity: queue.capacity,
+            timeout: queue.timeout,
+            messages: RwLock::new((queue.work, queue.work_in_progress)),
         }
     }
 }
@@ -153,8 +199,10 @@ where
     M: IsMessage,
 {
     capacity: usize,
-    work: Vec<CompressedBinaryMessage<M>>,
-    work_in_progress: DashMap<String, (usize, CompressedBinaryMessage<M>)>,
+    #[serde(with = "crate::utils::serde::duration_as_secs")]
+    timeout: Duration,
+    work: VecDeque<CompressedBinaryMessage<M>>,
+    work_in_progress: HashMap<String, (usize, CompressedBinaryMessage<M>)>,
 }
 
 impl<M> From<RedundantQueue<M>> for SerializableRedundantQueue<M>
@@ -162,15 +210,13 @@ where
     M: IsMessage,
 {
     fn from(queue: RedundantQueue<M>) -> Self {
-        let mut work = Vec::with_capacity(queue.work.len());
-        while let Some(message) = queue.work.try_pop() {
-            work.push(message);
-        }
+        let (work, work_in_progress) = queue.messages.into_inner();
 
         Self {
-            capacity: queue.work.capacity(),
             work,
-            work_in_progress: queue.work_in_progress,
+            work_in_progress,
+            capacity: queue.capacity,
+            timeout: queue.timeout,
         }
     }
 }
@@ -234,10 +280,11 @@ macro_rules! queue_namespace {
             ///
             impl QueueCollection {
                 pub fn new(
-                     $([< $data_type:snake _queue_capacity >]: usize ),+
+                     $([< $data_type:snake _queue_capacity >]: usize ),+,
+                     timeout: Duration,
                 ) -> Self {
                     Self {
-                        $([< $data_type:snake _queue >]: RedundantQueue::<$data_type>::new([< $data_type:snake _queue_capacity >]) ),+
+                        $([< $data_type:snake _queue >]: RedundantQueue::<$data_type>::new([< $data_type:snake _queue_capacity >], timeout) ),+
                     }
                 }
 
@@ -253,7 +300,17 @@ macro_rules! queue_namespace {
                         config.scoring.queue_capacity,
                         config.publication.queue_capacity,
                         config.error.queue_capacity,
+                        config.queueing.message_timeout,
                     )
+                }
+
+                pub fn reschedule_all(&self) -> Result<(), HttpQueueServerError> {
+                    [
+                        $(
+                            self.[< $data_type:snake _queue >].reschedule(),
+                        )+
+                    ].into_iter().collect::<Result<Vec<()>, HttpQueueServerError>>()?;
+                    Ok(())
                 }
             }
 
@@ -273,7 +330,7 @@ macro_rules! queue_namespace {
             }
 
             impl SerializableQueueCollection {
-                pub fn from_file(path: &PathBuf) -> Result<Self, HttpQueueServerError> {
+                pub fn from_file(path: &PathBuf) -> Result<Self, HttpQueueServerError<>> {
                     let serialized = std::fs::read(path).map_err(|_| HttpQueueServerError::CacheFileReadError)?;
                     let queue_collection: Self = postcard::from_bytes(&serialized).map_err(|_| HttpQueueServerError::StateDeserializationError)?;
                     Ok(queue_collection)
@@ -366,10 +423,15 @@ macro_rules! queue_namespace {
                     }
                 )+
 
+                async fn healthcheck(State(_state): State<Arc<QueueServerState>>) -> (StatusCode, &'static str) {
+                    (StatusCode::OK, "Queue Server is healthy")
+                }
+
                 /// Returns the router for queue operations
                 ///
                 pub fn router() -> Router<Arc<QueueServerState>> {
                     Router::new()
+                    .route("/healthcheck", get(Self::healthcheck))
                     $(
                         .route($data_type::push_route(), post(Self::[< push_ $data_type:snake >]))
                         .route($data_type::pop_route(), get(Self::[< pop_ $data_type:snake >]))
@@ -463,6 +525,23 @@ impl QueueServer {
         }
     }
 
+    async fn rescheduling_task(
+        state: Arc<QueueServerState>,
+        check_interval: Duration,
+        stop_signal: Arc<AtomicBool>,
+    ) {
+        while !stop_signal.load(std::sync::atomic::Ordering::Relaxed) {
+            let next_reschedule = Instant::now() + check_interval;
+            match state.queue_collection().reschedule_all() {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("[QueueServer / Rescheduling] Could not reschedule: {:?}", e);
+                }
+            }
+            sleep_until(next_reschedule).await;
+        }
+    }
+
     /// Starts the HTTP Queue Server
     ///
     /// # Arguments
@@ -475,12 +554,20 @@ impl QueueServer {
         interface: String,
         port: u16,
         state: Arc<QueueServerState>,
+        reschedule_check_interval: Duration,
         shutdown_signal: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     ) -> Result<(), HttpQueueServerError> {
         let shutdown_signal = match shutdown_signal {
             Some(signal) => signal,
             None => Box::pin(Self::default_shutdown_signal()),
         };
+
+        let rescheduler_stop_signal = Arc::new(AtomicBool::new(false));
+        let rescheduler = tokio::spawn(Self::rescheduling_task(
+            state.clone(),
+            reschedule_check_interval,
+            rescheduler_stop_signal.clone(),
+        ));
 
         // Build our application with route
         let app = Router::new()
@@ -497,6 +584,12 @@ impl QueueServer {
             .with_graceful_shutdown(shutdown_signal)
             .await
             .map_err(HttpQueueServerError::ServerStartError)?;
+
+        rescheduler_stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        rescheduler
+            .await
+            .map_err(|_| HttpQueueServerError::ReschedulerJoinError)?;
 
         Ok(())
     }
@@ -536,7 +629,14 @@ impl QueueServer {
 
         let state = Arc::new(state);
 
-        Self::run(interface, port, state.clone(), None).await?;
+        Self::run(
+            interface,
+            port,
+            state.clone(),
+            config.queueing.reschedule_check_interval,
+            None,
+        )
+        .await?;
 
         if let Some(state_path) = state_path {
             let collection: SerializableQueueCollection = Arc::try_unwrap(state)
@@ -547,5 +647,127 @@ impl QueueServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::panic;
+    use std::net::TcpListener;
+
+    use tracing::warn;
+    use tracing_test::traced_test;
+
+    use crate::pipeline::{
+        configuration::PipelineConfiguration,
+        queue::{HttpPipelineQueue, PipelineQueue},
+    };
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn test_queue_push_pop_ack_reschedule() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        drop(listener);
+
+        let config = std::fs::read_to_string("test_files/maccoys.http-queue.toml").unwrap();
+        let config = toml::from_str::<PipelineConfiguration>(&config)
+            .unwrap()
+            .to_remote_entrypoint_configuration();
+
+        let state: Arc<QueueServerState> = Arc::new(QueueServerState::from_config(&config));
+        let (stop_signal_sender, stop_signal_receiver) = tokio::sync::oneshot::channel::<()>();
+        let stop_signal = async move {
+            stop_signal_receiver.await.ok();
+        };
+
+        let handle = tokio::spawn(async move {
+            match QueueServer::run(
+                "127.0.0.1".to_string(),
+                port,
+                state,
+                config.queueing.reschedule_check_interval,
+                Some(Box::pin(stop_signal)),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => error!("{}", e),
+            }
+        });
+
+        let mut healthcheck_status_code = None;
+        for _ in 0..11 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match reqwest::get(format!(
+                "http://127.0.0.1:{port}{}/healthcheck",
+                QueueController::path()
+            ))
+            .await
+            {
+                Ok(response) => {
+                    healthcheck_status_code = Some(response.status());
+                    break;
+                }
+                Err(_) => {
+                    warn!("waiting for queue server to get online");
+                    continue;
+                }
+            }
+        }
+
+        if let Some(status_code) = healthcheck_status_code {
+            assert_eq!(status_code, StatusCode::OK);
+        } else {
+            panic!("Queue server did not start in time");
+        }
+
+        let mut indexing_task_config = config.index.clone();
+        indexing_task_config.queue_url = Some(format!("http://127.0.0.1:{}", port));
+        let queue = HttpPipelineQueue::<IndexingMessage>::new(&indexing_task_config)
+            .await
+            .unwrap();
+
+        let message1 = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+        let message2 = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+
+        queue.push(message1.clone()).await.unwrap();
+        queue.push(message2.clone()).await.unwrap();
+
+        // Check if length is 2
+        assert_eq!(queue.len().await.unwrap(), 2);
+
+        // Popping message 1 and acknowledging it
+        if let Some((_, popped_message1)) = queue.pop().await.unwrap() {
+            assert_eq!(popped_message1.get_id(), message1.get_id());
+            queue.ack(&popped_message1.get_id()).await.unwrap();
+        }
+
+        // Check if length is 1 now
+        assert_eq!(queue.len().await.unwrap(), 1);
+
+        // Popping message 2 without acknowledging
+        assert!(queue.pop().await.unwrap().is_some());
+
+        // Wait for rescheduling
+        tokio::time::sleep(
+            (config.queueing.reschedule_check_interval + config.queueing.message_timeout) * 2,
+        )
+        .await;
+
+        // Popping message 2 and acknowledging it
+        if let Some((_, popped_message2)) = queue.pop().await.unwrap() {
+            assert_eq!(popped_message2.get_id(), message2.get_id());
+            queue.ack(&popped_message2.get_id()).await.unwrap();
+        }
+
+        // Queue should be empty now
+        assert_eq!(queue.len().await.unwrap(), 0);
+
+        stop_signal_sender.send(()).unwrap();
+        handle.await.unwrap()
     }
 }

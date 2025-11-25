@@ -1,4 +1,4 @@
-use std::{ops::Deref, path::PathBuf};
+use std::{ops::Deref, path::PathBuf, time::Duration};
 
 use xcorrrs::configuration::Configuration as XcorrConfiguration;
 
@@ -140,6 +140,27 @@ impl Deref for ScoringTaskConfiguration {
     }
 }
 
+/// Comet configuration
+///
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct QueuingConfiguration {
+    /// Message timeout, after which a message is considered failed and requeued
+    #[serde(with = "crate::utils::serde::duration_as_secs")]
+    pub message_timeout: Duration,
+    /// Interval after
+    #[serde(with = "crate::utils::serde::duration_as_secs")]
+    pub reschedule_check_interval: Duration,
+}
+
+impl Default for QueuingConfiguration {
+    fn default() -> Self {
+        Self {
+            message_timeout: Duration::from_secs(900),
+            reschedule_check_interval: Duration::from_secs(60),
+        }
+    }
+}
+
 /// Configuration for the pipeline
 ///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -160,6 +181,8 @@ pub struct PipelineConfiguration {
     pub error: TaskConfiguration,
     /// Storage configuration
     pub storage: PipelineStorageConfiguration,
+    /// Message timeout, after which a message is considered failed and requeued
+    pub queueing: QueuingConfiguration,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -187,6 +210,7 @@ impl PipelineConfiguration {
             storage: self.storage.clone(),
             prometheus_base_url: "".to_string(),
             work_directory: PathBuf::new(),
+            queueing: self.queueing.clone(),
         }
     }
 }
@@ -247,6 +271,7 @@ impl Default for PipelineConfiguration {
                 time_to_idle: 86_400, // 24 hours
                 url: None,
             },
+            queueing: QueuingConfiguration::default(),
         }
     }
 }
@@ -273,6 +298,8 @@ pub struct RemoteEntypointConfiguration {
     pub prometheus_base_url: String,
     /// Work directory
     pub work_directory: PathBuf,
+    /// Message timeout, after which a message is considered failed and requeued
+    pub queueing: QueuingConfiguration,
 }
 
 /// Configuration for standalone indexing

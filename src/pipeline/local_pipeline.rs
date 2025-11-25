@@ -532,7 +532,14 @@ pub async fn build_and_run_local_pipeline(
             };
 
             let handle = tokio::spawn(async move {
-                QueueServer::run(interface, port, state, Some(Box::pin(stop_signal))).await
+                QueueServer::run(
+                    interface,
+                    port,
+                    state,
+                    Duration::from_secs(5),
+                    Some(Box::pin(stop_signal)),
+                )
+                .await
             });
 
             Some((handle, stop_signal_sender))

@@ -9,7 +9,7 @@ use crate::pipeline::{errors::message_error::MessageError, messages::is_message:
 /// Message contains the actual message serialized as postcard and gzip compressed
 /// for efficient storing and transmission
 ///  
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompressedBinaryMessage<T>
 where
     T: IsMessage,

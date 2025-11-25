@@ -1,0 +1,75 @@
+prometheus_base_url = "http://localhost:9090"
+work_directory = "/mnt/results/tests/results"
+message_timeout = 10
+
+[search_parameters]
+max_charge = 6
+lower_mass_tolerance_ppm = 10
+upper_mass_tolerance_ppm = 10
+max_variable_modifications = 3
+decoys_per_peptide = 0
+score_threshold = 0.1
+keep_fasta_files = true
+
+[search_parameters.xcorr]
+bin_size = 0.02
+bin_offset = 0.0
+use_flanking_peaks = true
+minimum_intensity = 0.0
+max_fragment_charge = 3
+ions = [
+    "B",
+    "Y",
+]
+use_neutral_loss_ions = false
+
+[index]
+num_tasks = 1
+queue_name = "index"
+queue_capacity = 10
+queue_url = "http://127.0.0.1:0"
+
+[search_space_generation]
+num_tasks = 1
+queue_name = "search_space_generation"
+queue_capacity = 10
+queue_url = "http://127.0.0.1:0"
+target_url = "httpa://macpepdb.cubimed.rub.de"
+# decoy_url = "http://
+# target_lookup_url = "http://
+# decoy_cache_url = "http://
+
+[identification]
+num_tasks = 6
+queue_name = "identification"
+queue_capacity = 10
+queue_url = "http://127.0.0.1:0"
+threads = 16
+
+[scoring]
+num_tasks = 1
+queue_name = "scoring"
+queue_capacity = 10
+queue_url = "http://127.0.0.1:0"
+threads = 1
+
+[publication]
+num_tasks = 1
+queue_name = "publication"
+queue_capacity = 10
+queue_url = "http://127.0.0.1:0"
+
+[error]
+num_tasks = 1
+queue_name = "error"
+queue_capacity = 10
+queue_url = "http://127.0.0.1:0"
+
+
+[storage]
+time_to_idle = 300
+url = "redis://localhost:6380"
+
+[queueing]
+message_timeout = 5.0
+reschedule_check_interval = 6.0
