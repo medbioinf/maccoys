@@ -688,7 +688,7 @@ impl QueueServer {
 #[cfg(test)]
 mod tests {
     use core::panic;
-    use std::net::TcpListener;
+    use std::{env::temp_dir, net::TcpListener};
 
     use tracing::warn;
     use tracing_test::traced_test;
@@ -804,5 +804,63 @@ mod tests {
 
         stop_signal_sender.send(()).unwrap();
         handle.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_queue_collection_serialization_deserialization() {
+        let state_path = temp_dir().join("maccoys.tests.queue_server.queue.bin");
+
+        let config = std::fs::read_to_string("test_files/maccoys.http-queue.toml").unwrap();
+        let config = toml::from_str::<PipelineConfiguration>(&config)
+            .unwrap()
+            .to_remote_entrypoint_configuration();
+
+        let queue_collection = QueueCollection::from_config(&config);
+
+        let message1 = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+        let message2 = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+
+        queue_collection
+            .indexing_message_queue
+            .try_push(CompressedBinaryMessage::try_from_message(&message1).unwrap())
+            .unwrap();
+        queue_collection
+            .indexing_message_queue
+            .try_push(CompressedBinaryMessage::try_from_message(&message2).unwrap())
+            .unwrap();
+
+        let serializable_queue_collection: SerializableQueueCollection = queue_collection.into();
+
+        serializable_queue_collection.to_file(&state_path).unwrap();
+
+        drop(serializable_queue_collection);
+
+        let loaded_serializable_queue_collection =
+            SerializableQueueCollection::from_file(&state_path).unwrap();
+        let loaded_queue_collection: QueueCollection = loaded_serializable_queue_collection.into();
+
+        assert_eq!(loaded_queue_collection.indexing_message_queue.len(), 2);
+
+        let popped_message1 = loaded_queue_collection
+            .indexing_message_queue
+            .try_pop()
+            .unwrap();
+        assert_eq!(popped_message1.id(), message1.get_id());
+        loaded_queue_collection
+            .indexing_message_queue
+            .acknowledge(&popped_message1.id())
+            .unwrap();
+
+        let popped_message2 = loaded_queue_collection
+            .indexing_message_queue
+            .try_pop()
+            .unwrap();
+        assert_eq!(popped_message2.id(), message2.get_id());
+        loaded_queue_collection
+            .indexing_message_queue
+            .acknowledge(&popped_message2.id())
+            .unwrap();
+
+        std::fs::remove_file(&state_path).unwrap();
     }
 }
