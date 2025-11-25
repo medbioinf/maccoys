@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(popped_message1.id(), message1.get_id());
         loaded_queue_collection
             .indexing_message_queue
-            .acknowledge(&popped_message1.id())
+            .acknowledge(popped_message1.id())
             .unwrap();
 
         let popped_message2 = loaded_queue_collection
@@ -858,7 +858,7 @@ mod tests {
         assert_eq!(popped_message2.id(), message2.get_id());
         loaded_queue_collection
             .indexing_message_queue
-            .acknowledge(&popped_message2.id())
+            .acknowledge(popped_message2.id())
             .unwrap();
 
         std::fs::remove_file(&state_path).unwrap();
