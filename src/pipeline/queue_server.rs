@@ -36,11 +36,45 @@ use crate::pipeline::{
 
 static LOKI_TRACING_LABEL_VALUE: &str = "http_queue_server";
 
+/// Compressed message plus a absolute timeout for rescheduling
+///
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(bound = "M: IsMessage")]
+pub struct WorkInProgressMessage<M>
+where
+    M: IsMessage,
+{
+    #[serde(with = "crate::utils::serde::duration_as_secs")]
+    pub timeout: Duration,
+    pub message: CompressedBinaryMessage<M>,
+}
+
+impl<M> WorkInProgressMessage<M>
+where
+    M: IsMessage,
+{
+    pub fn new(timeout: Duration, message: CompressedBinaryMessage<M>) -> Self {
+        Self { timeout, message }
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn message(&self) -> &CompressedBinaryMessage<M> {
+        &self.message
+    }
+
+    pub fn into_inner_message(self) -> CompressedBinaryMessage<M> {
+        self.message
+    }
+}
+
 /// Type alias for the RwLock holding the messages queue and work_in_progress map
 ///
 type RWLockedMessages<M> = RwLock<(
     VecDeque<CompressedBinaryMessage<M>>,
-    HashMap<String, (usize, CompressedBinaryMessage<M>)>,
+    HashMap<String, WorkInProgressMessage<M>>,
 )>;
 
 /// A redundant queue implementation that holds messages to be processed
@@ -107,7 +141,7 @@ where
 
         work_in_progress.insert(
             message.id().to_string(),
-            (timeout.as_secs() as usize, message.clone()),
+            WorkInProgressMessage::new(timeout, message.clone()),
         );
 
         Ok(message)
@@ -158,8 +192,8 @@ where
 
         let messages_to_reschedule = work_in_progress
             .iter()
-            .filter_map(|(message_id, (timeout, _))| {
-                if now >= *timeout {
+            .filter_map(|(message_id, wip_message)| {
+                if now >= wip_message.timeout().as_secs() as usize {
                     Some(message_id.to_string())
                 } else {
                     None
@@ -168,8 +202,8 @@ where
             .collect::<Vec<_>>();
 
         for message_id in messages_to_reschedule.into_iter() {
-            if let Some((_, message)) = work_in_progress.remove(&message_id) {
-                work.push_back(message);
+            if let Some(wip_message) = work_in_progress.remove(&message_id) {
+                work.push_back(wip_message.into_inner_message());
             }
         }
 
@@ -191,6 +225,7 @@ where
 }
 
 /// Serializable version of RedundantQueue for saving/loading state.
+/// Serves as a workaround as RwLock does not implement Clone.
 ///
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "M: IsMessage")]
@@ -202,7 +237,7 @@ where
     #[serde(with = "crate::utils::serde::duration_as_secs")]
     timeout: Duration,
     work: VecDeque<CompressedBinaryMessage<M>>,
-    work_in_progress: HashMap<String, (usize, CompressedBinaryMessage<M>)>,
+    work_in_progress: HashMap<String, WorkInProgressMessage<M>>,
 }
 
 impl<M> From<RedundantQueue<M>> for SerializableRedundantQueue<M>
