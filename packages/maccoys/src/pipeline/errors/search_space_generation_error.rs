@@ -26,4 +26,8 @@ pub enum SearchSpaceGenerationError {
     MutexLockError(String),
     #[error("Could not get {0} from arc.")]
     ArcIntoError(String),
+    #[error("Sending request to search peptides failed:\n\t{0}")]
+    PeptideSearchRequestSendError(reqwest::Error),
+    #[error("Error in peptide search response:\n\tStatus: {0}; Content-Type: {1}; Body: {2}")]
+    PeptideSearchRequestResponseError(reqwest::StatusCode, String, String),
 }

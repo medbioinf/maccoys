@@ -1,32 +1,16 @@
-[package]
-name = "maccoys"
-version = "0.1.0"
-authors = ["Dirk Winkelhardt <dirk.winkelhardt@rub.de>"]
-edition = "2021"
-description = "Mass spectrometry search engine using MaCPepDB as search space."
-repository = "https://github.com/medbioinf/maccoys"
-homepage = "https://github.com/medbioinf/maccoys"
-documentation = "https://github.com/medbioinf/maccoys"
-license-file = "../LICENSE"
-readme = "README.md"
+[workspace]
+resolver = "3"
+members = [
+    "packages/maccoys",
+]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[lib]
-name = "maccoys"
-path = "src/lib.rs"
-
-[[bin]]
-name = "maccoys"
-path = "src/bin.rs"
-
-[dependencies]
-anyhow = { version = "1.0.75", features = ["backtrace"] }
+[workspace.dependencies]
+anyhow = { version = "1.0.75" }
 async-stream = "0.3.5"
-axum = { version = "0.7.4", features = ["multipart", "original-uri", "http2"] }
-clap = { version = "4.4.6", features = ["derive"] }
+axum = { version = "0.7.4" }
+clap = { version = "4.4.6" }
 csv = "1.3.0"
-deadqueue = { version = "0.2.4", features = ["limited"] }
+deadqueue = { version = "0.2.4" }
 dihardts_omicstools = "~3.1.0"
 fancy-regex = "0.11.0"
 flate2 = "1.1.5"
@@ -39,56 +23,38 @@ local-outlier-probabilities = { git = "https://github.com/medbioinf/loop-rs", br
 maccoys-exchange-entities = { git = "https://github.com/medbioinf/maccoys-exchange-entities", rev = "405e0f1692a32b05ac1ada684975afd503e1feb3" }
 macpepdb = "1.1.0"
 metrics = "0.24.1"
-metrics-exporter-prometheus = { version = "0.16.2", features = [
-    "http-listener",
-] }
+metrics-exporter-prometheus = { version = "0.16.2" }
 mini-moka = "0.10.3"
 murmur3 = "0.5.2"
-ndarray = { version = "0.16.1", features = ["serde"] }
+ndarray = { version = "0.16.1" }
 parking_lot = "0.12.5"
 paste = "1.0.15"
-polars = { version = "0.46.0", features = [
-    "abs",
-    "csv",
-    "cum_agg",
-    "json",
-    "lazy",
-    "ndarray",
-    "parquet",
-    "strings",
-    "serde",
-] }
-postcard = { version = "1.1.3", features = ["alloc"] }
+polars = { version = "0.46.0" }
+postcard = { version = "1.1.3" }
 rand = "0.8.5"
 rayon = "1.11.0"
-reqwest = { version = "0.12.8", features = [
-
-    "blocking",
-    "json",
-    "stream",
-    "multipart",
-    "http2"
-] }
-rustis = { version = "0.13.3", features = ["tokio-runtime"] }
+reqwest = { version = "0.12.8" }
+rustis = { version = "0.13.3" }
 scylla = "0.8.1"
 serde = "1.0.219"
 serde_json = "1.0.143"
+serial_test = "3.2.0"
 signal-hook = "0.3.17"
 thiserror = "2.0.12"
-tokio = { version = "1.44.2", features = ["rt-multi-thread"] }
+tokio = { version = "1.44.2" }
 tokio-util = "0.7.11"
 toml = "0.8.14"
-tower-http = { version = "0.5.0", features = ["cors", "trace"] }
+tower-http = { version = "0.5.0" }
 tracing = "0.1.39"
 tracing-appender = "0.2.3"
 tracing-indicatif = "0.3.5"
 tracing-loki = "0.2.6"
 tracing-subscriber = "0.3.17"
+tracing-test = "0.2.5"
 url = "2.5.7"
 urlencoding = "2.1.3"
 uuid = "1.9.0"
 xcorrrs = "1.2.0"
 
-[dev-dependencies]
-serial_test = "3.2.0"
-tracing-test = "0.2.5"
+# workspace
+maccoys = { path = "packages/maccoys", version = "0.1.0" }

@@ -2,7 +2,6 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +16,8 @@ use http::status::StatusCode;
 use parking_lot::RwLock;
 use paste::paste;
 use serde::{Deserialize, Serialize};
+use tokio::select;
+use tokio::sync::watch::Receiver as WatchReceiver;
 use tokio::time::{sleep_until, Instant};
 use tracing::error;
 
@@ -563,17 +564,25 @@ impl QueueServer {
     async fn rescheduling_task(
         state: Arc<QueueServerState>,
         check_interval: Duration,
-        stop_signal: Arc<AtomicBool>,
+        mut stop_signal: WatchReceiver<bool>,
     ) {
-        while !stop_signal.load(std::sync::atomic::Ordering::Relaxed) {
-            let next_reschedule = Instant::now() + check_interval;
+        let mut next_reschedule = Instant::now() + check_interval;
+        loop {
+            select! {
+                _ = stop_signal.changed() => {
+                    if *stop_signal.borrow() {
+                        break;
+                    }
+                },
+                _ = sleep_until(next_reschedule) => {}
+            }
+            next_reschedule = Instant::now() + check_interval;
             match state.queue_collection().reschedule_all() {
                 Ok(_) => {}
                 Err(e) => {
                     error!("[QueueServer / Rescheduling] Could not reschedule: {:?}", e);
                 }
             }
-            sleep_until(next_reschedule).await;
         }
     }
 
@@ -597,11 +606,12 @@ impl QueueServer {
             None => Box::pin(Self::default_shutdown_signal()),
         };
 
-        let rescheduler_stop_signal = Arc::new(AtomicBool::new(false));
+        let (rescheduler_stop_signal, rescheduler_stop_receiver) =
+            tokio::sync::watch::channel(false);
         let rescheduler = tokio::spawn(Self::rescheduling_task(
             state.clone(),
             reschedule_check_interval,
-            rescheduler_stop_signal.clone(),
+            rescheduler_stop_receiver,
         ));
 
         // Build our application with route
@@ -620,7 +630,12 @@ impl QueueServer {
             .await
             .map_err(HttpQueueServerError::ServerStartError)?;
 
-        rescheduler_stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+        match rescheduler_stop_signal.send(true) {
+            Ok(_) => {}
+            Err(_) => {
+                error!("Could not send stop signal to rescheduler task");
+            }
+        }
 
         rescheduler
             .await
@@ -708,7 +723,16 @@ mod tests {
 
         drop(listener);
 
-        let config = std::fs::read_to_string("test_files/maccoys.http-queue.toml").unwrap();
+        let config_file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("test_files")
+            .join("maccoys.http-queue.toml");
+
+
+        let config = std::fs::read_to_string(config_file_path).unwrap();
         let config = toml::from_str::<PipelineConfiguration>(&config)
             .unwrap()
             .to_remote_entrypoint_configuration();
@@ -810,7 +834,16 @@ mod tests {
     async fn test_queue_collection_serialization_deserialization() {
         let state_path = temp_dir().join("maccoys.tests.queue_server.queue.bin");
 
-        let config = std::fs::read_to_string("test_files/maccoys.http-queue.toml").unwrap();
+        let config_file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("test_files")
+            .join("maccoys.http-queue.toml");
+
+
+        let config = std::fs::read_to_string(config_file_path).unwrap();
         let config = toml::from_str::<PipelineConfiguration>(&config)
             .unwrap()
             .to_remote_entrypoint_configuration();

@@ -1,13 +1,12 @@
 use std::cmp::min;
-// std imports
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
-use dihardts_omicstools::proteomics::peptide::Terminus;
+use dihardts_omicstools::proteomics::peptide::{self, Terminus};
 use dihardts_omicstools::proteomics::post_translational_modifications::{
     Position as PtmPosition, PostTranslationalModification,
 };
@@ -337,10 +336,16 @@ impl SearchSpaceGenerator {
                     &ptm_collecton,
                     true,
                 )
-                .await?;
+                .await
+                .map_err(|err| anyhow!("Failed to initiate query search: {err}"))?;
+
                 pin_mut!(target_stream);
                 while let Some(peptide) = target_stream.next().await {
-                    for sequence in peptide?.get_additional_sequences() {
+                    let peptide = peptide.map_err(|err| {
+                        anyhow!("Failed to get next peptide from peptide search stream: {err}")
+                    })?;
+
+                    for sequence in peptide.get_additional_sequences() {
                         if is_target {
                             search_space.add_target(sequence.to_string()).await?;
                         } else {
@@ -357,7 +362,6 @@ impl SearchSpaceGenerator {
             MaCPepDBClient::Http(ref client) => {
                 let response = client
                     .post(http_url.as_str())
-                    .header("Connection", "close")
                     .header("Accept", "text/proforma")
                     .json(&json!({
                         "mass": mass_to_float(mass),
@@ -368,7 +372,9 @@ impl SearchSpaceGenerator {
                         "modifications": ptms
                     }))
                     .send()
-                    .await?;
+                    .await
+                    .map_err(|err| anyhow!("Failed to send peptide search request: {err}"))?;
+
                 if !response.status().is_success() {
                     let status_code = response.status();
                     let content_type = response
@@ -381,12 +387,16 @@ impl SearchSpaceGenerator {
                         .text()
                         .await
                         .unwrap_or("text is not decodable".to_string());
-                    bail!("Failed to fetch peptides:\nstatus code: {status_code}\ncontent type: {content_type}\nresponse text: {response_text}");
+                    bail!("Request to peptide search failed:\n\tstatus code: {status_code}\n\tcontent type: {content_type}\n\tresponse text: {response_text}");
                 }
                 let mut peptide_stream = response.bytes_stream();
                 let mut buffer = Vec::with_capacity(1024);
                 while let Some(chunk) = peptide_stream.next().await {
-                    chunk?.iter().for_each(|byte| buffer.push(*byte));
+                    let chunk = chunk.map_err(|err| {
+                        anyhow!("Failed to get next chunk from peptide search stream: {err}")
+                    })?;
+
+                    chunk.iter().for_each(|byte| buffer.push(*byte));
                     if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
                         let sequence = std::str::from_utf8(&buffer[..newline_pos])?.to_string();
 

@@ -7,7 +7,7 @@ use rustis::{
     client::BatchPreparedCommand,
     commands::{GenericCommands, LMoveWhere, ListCommands, StringCommands},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{
     configuration::TaskConfiguration, errors::queue_error::QueueError,
@@ -556,6 +556,16 @@ where
 
         if !response.status().is_success() {
             let status = response.status();
+
+            // 410
+            if status == reqwest::StatusCode::GONE {
+                warn!(
+                    "Tried to acknowledge message '{}' which does not exist in queue '{}'",
+                    message_id, self.queue_name
+                );
+                return Ok(());
+            }
+
             let reason = response.text().await.unwrap_or_default();
             return Err(HttpQueueError::UnsuccessStatusCode(
                 self.queue_name.clone(),

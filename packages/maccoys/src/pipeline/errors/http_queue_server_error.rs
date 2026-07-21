@@ -63,7 +63,7 @@ impl IntoResponse for HttpQueueServerError {
         let status_code = match &self {
             HttpQueueServerError::QueueFullError => StatusCode::INSUFFICIENT_STORAGE,
             HttpQueueServerError::QueueEmptyError => StatusCode::NO_CONTENT,
-            HttpQueueServerError::KeyNotFoundError(_) => StatusCode::NOT_FOUND,
+            HttpQueueServerError::KeyNotFoundError(_) => StatusCode::GONE,
             HttpQueueServerError::MissingCapacityHeader => StatusCode::BAD_REQUEST,
             HttpQueueServerError::InvaidCapacityHeader => StatusCode::BAD_REQUEST,
             HttpQueueServerError::UnknownQueueError => StatusCode::NOT_FOUND,

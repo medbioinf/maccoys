@@ -345,7 +345,13 @@ mod tests {
 
     #[test]
     fn test_calculate_features() {
-        let psm_file_path = PathBuf::from("test_files/well_separated_psms.tsv");
+        let psm_file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("test_files")
+            .join("well_separated_psms.tsv");
 
         let mut psms = CsvReadOptions::default()
             .with_has_header(true)
