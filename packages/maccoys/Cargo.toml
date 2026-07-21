@@ -2,7 +2,7 @@
 name = "maccoys"
 version = "0.1.0"
 authors = ["Dirk Winkelhardt <dirk.winkelhardt@rub.de>"]
--edition = "2021"
+edition = "2021"
 description = "Mass spectrometry search engine using MaCPepDB as search space."
 repository = "https://github.com/medbioinf/maccoys"
 homepage = "https://github.com/medbioinf/maccoys"

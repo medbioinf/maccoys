@@ -1,0 +1,27 @@
+[package]
+name = "maccoys-frontend"
+version = "0.1.0"
+authors = [
+    "Dirk Winkelhardt <dirk.winkelhardt@rub.de>",
+    "Julian Uszkoreit <julian.uszkoreit@rub.de>",
+]
+edition = "2021"
+description = "Web based frontend for submitting MaCcoyS searches and browsing results"
+repository = "https://github.com/medbioinf/maccoys"
+homepage = "https://github.com/medbioinf/maccoys"
+documentation = "https://github.com/medbioinf/maccoys"
+license-file = "../LICENSE"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dioxus = { workspace = true, features = ["web", "router",] }
+dioxus-free-icons = { workspace = true, features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
+dioxus-logger = { workspace = true }
+maccoys-exchange-entities = { workspace = true }
+polars = { workspace = true, features = ["serde", "json"] } # Features are very limited to make it run in WASM
+reqwest = {workspace = true, features=["json"]}
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+urlencoding = { workspace = true }

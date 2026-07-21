@@ -19,5 +19,9 @@ logs/
 !Cargo.toml
 !rust-toolchain.toml
 
+# Dioxus
+/packages/frontend/dist
+/packages/frontend/public/index.css*
+
 # OS
 .DS_Store
