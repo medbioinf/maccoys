@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use dioxus_free_icons::icons::fa_regular_icons::FaCircleCheck;
 use dioxus_free_icons::icons::fa_solid_icons::{FaCircleInfo, FaCircleXmark};
 use dioxus_free_icons::Icon;
-use maccoys_exchange_entities::results_api::Spectrum;
+use maccoys_exchange_entities::results_api::Spectrum as SpecturmEntity;
 use maccoys_exchange_entities::tools::polars::RowIter;
 use serde_json::json;
 
@@ -28,10 +28,16 @@ pub fn Spectrum(search_uuid: String, ms_run_name: String, spectrum_id: String) -
             "{}/api/searches/{}/{}/{}",
             maccoys_base_url, search_uuid_clone, ms_run_name_clone, spectrum_id_clone
         );
-        async move { reqwest::get(url).await.unwrap().json::<Spectrum>().await }
+        async move {
+            reqwest::get(url)
+                .await
+                .unwrap()
+                .json::<SpecturmEntity>()
+                .await
+        }
     });
 
-    let spectrum_plot = eval(
+    let spectrum_plot = document::eval(
         r#"
             let plot_data = await dioxus.recv();
 
@@ -55,7 +61,7 @@ pub fn Spectrum(search_uuid: String, ms_run_name: String, spectrum_id: String) -
         "#,
     );
 
-    let score_plot = eval(
+    let score_plot = document::eval(
         r#"
             let plot_data = await dioxus.recv();
 
@@ -191,7 +197,7 @@ pub fn Spectrum(search_uuid: String, ms_run_name: String, spectrum_id: String) -
                                             style: "grid-column: {goodness.shape().1 + 1} / span 1; grid-row: 1 / span 1",
                                             ""
                                         }
-                                        for (row_idx, row) in RowIter::new(&goodness).enumerate() {
+                                        for (row_idx, row) in RowIter::new(goodness).enumerate() {
                                             for (col_idx, col) in row.iter().enumerate() {
                                                 div {
                                                     class: "dataframe-cell",

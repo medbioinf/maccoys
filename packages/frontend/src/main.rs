@@ -5,6 +5,8 @@
 mod app;
 /// Components used by the web app
 mod components;
+/// App configuration
+mod configuration;
 /// Entities used by the web app
 mod entities;
 /// Layouts for different pages
@@ -13,8 +15,8 @@ mod layouts;
 mod pages;
 /// Routes used by the web app
 mod routes;
-/// App configuration
-mod configuration;
+/// Matomo tracking
+mod tracking;
 
 // 3rd party imports
 use dioxus::prelude::*;

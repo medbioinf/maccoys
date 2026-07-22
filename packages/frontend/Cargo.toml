@@ -12,16 +12,39 @@ homepage = "https://github.com/medbioinf/maccoys"
 documentation = "https://github.com/medbioinf/maccoys"
 license-file = "../LICENSE"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-dioxus = { workspace = true, features = ["web", "router",] }
+chrono = { workspace = true }
+dioxus = { workspace = true, features = ["router", "logger"] }
 dioxus-free-icons = { workspace = true, features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 dioxus-logger = { workspace = true }
 maccoys-exchange-entities = { workspace = true }
+plotly = { workspace = true }
 polars = { workspace = true, features = ["serde", "json"] } # Features are very limited to make it run in WASM
 reqwest = {workspace = true, features=["json"]}
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 urlencoding = { workspace = true }
+uuid = { workspace = true, features = ["js", "v4"] }
+web-sys = { workspace = true, features = ["Navigator"] }
+xxhash-rust = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+toml = { workspace = true }
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"

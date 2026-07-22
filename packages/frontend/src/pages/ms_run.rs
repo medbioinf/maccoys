@@ -1,6 +1,6 @@
 // 3rd party imports
 use dioxus::prelude::*;
-use maccoys_exchange_entities::results_api::MsRun;
+use maccoys_exchange_entities::results_api::MsRun as MsRunEntity;
 
 // internal imports
 use crate::{configuration::Configuration, routes::Routes};
@@ -18,7 +18,7 @@ pub fn MsRun(search_uuid: String, ms_run_name: String) -> Element {
             "{}/api/searches/{}/{}",
             maccoys_base_url, search_uuid_clone, ms_run_clone
         );
-        async move { reqwest::get(url).await.unwrap().json::<MsRun>().await }
+        async move { reqwest::get(url).await.unwrap().json::<MsRunEntity>().await }
     });
 
     rsx! {
