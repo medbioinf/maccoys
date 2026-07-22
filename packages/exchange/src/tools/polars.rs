@@ -30,6 +30,10 @@ impl<'a> Row<'a> {
     pub fn len(&self) -> usize {
         self.col_values.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.col_values.is_empty()
+    }
 }
 
 impl<'a> std::ops::Index<&str> for Row<'a> {
@@ -60,7 +64,7 @@ impl<'a> RowIter<'a> {
         );
         let col_iterators = dataframe
             .get_columns()
-            .into_iter()
+            .iter()
             .map(|col| col.as_materialized_series().iter())
             .collect::<Vec<SeriesIter<'_>>>();
         Self {
@@ -76,10 +80,7 @@ impl<'a> Iterator for RowIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut values = Vec::with_capacity(self.col_iterators.len());
         for iter in self.col_iterators.iter_mut() {
-            match iter.next() {
-                Some(value) => values.push(value),
-                None => return None,
-            }
+            values.push(iter.next()?);
         }
         Some(Row::new(self.col_index.clone(), values))
     }
