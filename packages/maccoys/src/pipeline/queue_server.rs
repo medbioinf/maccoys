@@ -731,7 +731,6 @@ mod tests {
             .join("test_files")
             .join("maccoys.http-queue.toml");
 
-
         let config = std::fs::read_to_string(config_file_path).unwrap();
         let config = toml::from_str::<PipelineConfiguration>(&config)
             .unwrap()
@@ -841,7 +840,6 @@ mod tests {
             .unwrap()
             .join("test_files")
             .join("maccoys.http-queue.toml");
-
 
         let config = std::fs::read_to_string(config_file_path).unwrap();
         let config = toml::from_str::<PipelineConfiguration>(&config)

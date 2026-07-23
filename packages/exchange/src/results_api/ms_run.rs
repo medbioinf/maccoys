@@ -34,5 +34,4 @@ impl MsRun {
     pub fn get_spectra_ids(&self) -> &Vec<String> {
         &self.spectra_ids
     }
-
 }
