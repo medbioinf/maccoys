@@ -1,7 +1,14 @@
 // 3rd party imports
 use crate::search_space::macpepdb_client::MaCPepDBClient;
 use anyhow::{anyhow, Result};
-use macpepdb::database::scylla::peptide_table::PeptideTable;
+use futures::StreamExt;
+use macpepdb::{
+    peptide::Peptide,
+    peptide_search::PeptideSearchType,
+    peptide_table::PeptideTable,
+    sequence::{IsSimpleSequence, PeptideSequence},
+};
+use tokio_postgres::types::ToSql;
 
 /// Path for MaCPepDB web API, with `:sequence:` as placeholder for the sequence
 const MACPEPDB_WEB_API_PATH: &str = "/api/peptides/:sequence:/exists";
@@ -30,7 +37,7 @@ impl TargetLookup {
             url.to_string()
         };
 
-        let client = MaCPepDBClient::from_url(&url).await?;
+        let client = MaCPepDBClient::from_url(&url, PeptideSearchType::MultiTask).await?;
 
         Ok(Self { url, client })
     }
@@ -42,8 +49,39 @@ impl TargetLookup {
     ///
     pub async fn is_target(&self, sequence: &str) -> Result<bool> {
         match &self.client {
-            MaCPepDBClient::Db(client, configuration) => {
-                Ok(PeptideTable::exists_by_sequence(client, sequence, configuration).await?)
+            MaCPepDBClient::Db(client, configuration, _) => {
+                let sequence = PeptideSequence::try_from(sequence)
+                    .map_err(|e| anyhow!("Invalid sequence: {}", e))?;
+                let mass =
+                    Peptide::peptide_mass_from_amino_acid_bits(sequence.amino_acid_bit_codes());
+                let partitions = configuration
+                    .mass_partitioning()
+                    .partition_by_mass(mass)
+                    .map(|(_, mass)| mass)
+                    .collect::<Vec<_>>();
+
+                let params: Vec<Box<dyn ToSql + Sync + Send>> = vec![
+                    Box::new(partitions) as Box<dyn ToSql + Sync + Send>,
+                    Box::new(mass) as Box<dyn ToSql + Sync + Send>,
+                    Box::new(sequence) as Box<dyn ToSql + Sync + Send>,
+                ];
+
+                // TODO: Implement exist query on peptide table
+                let peptide = PeptideTable::new(client.clone())
+                    .select(
+                        "WHERE partitions = ANY($1) AND mass = $2 AND sequence = $3 LIMIT 1",
+                        params,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("Unable to query peptides: {}", e))?
+                    .next()
+                    .await;
+
+                match peptide {
+                    Some(Ok(_)) => Ok(true),
+                    Some(Err(e)) => Err(anyhow!("Error querying peptides: {}", e)),
+                    None => Ok(false),
+                }
             }
             MaCPepDBClient::Http(client) => {
                 let response = client

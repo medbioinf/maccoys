@@ -9,13 +9,11 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::future::join_all;
-use indicatif::ProgressStyle;
-use macpepdb::tools::metrics_monitor::{MetricsMonitor, MonitorableMetric, MonitorableMetricType};
+use macpepdb::post_translational_modification::PostTranslationalModification;
+use macpepdb_tui::{MetricConfig, TuiHandle};
 use tokio::{fs::create_dir_all, time::sleep};
-use tracing::{debug, error, info, info_span};
-use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::pipeline::{
@@ -300,52 +298,68 @@ where
     pub async fn run(
         &self,
         search_params: SearchParameters,
-        ptms: Vec<PostTranslationalModification>,
+        ptms: Vec<Arc<PostTranslationalModification>>,
         mzml_file_paths: Vec<PathBuf>,
-        metrics_scrape_url: Option<String>,
+        tui: &Option<TuiHandle>,
     ) -> Result<()> {
         let uuid = Uuid::new_v4().to_string();
         info!("UUID: {}", uuid);
 
         self.storage
-            .init_search(&uuid, search_params.clone(), &ptms)
+            .init_search(&uuid, search_params.clone(), ptms.as_slice())
             .await?;
 
-        let mut metrics_monitor: Option<MetricsMonitor> = None;
-        if let Some(metrics_scrape_url) = metrics_scrape_url {
-            let corrected_uuid = uuid.clone().replace('-', "_"); // scrape endpoint replaces dashes with underscores
-            let monitorable_metrics = vec![
-                MonitorableMetric::new(
-                    IndexingTask::get_counter_name(&corrected_uuid).to_string(),
-                    MonitorableMetricType::Rate,
-                ),
-                MonitorableMetric::new(
-                    SearchSpaceGenerationTask::get_counter_name(&corrected_uuid).to_string(),
-                    MonitorableMetricType::Rate,
-                ),
-                MonitorableMetric::new(
-                    IdentificationTask::get_counter_name(&corrected_uuid).to_string(),
-                    MonitorableMetricType::Rate,
-                ),
-                MonitorableMetric::new(
-                    ScoringTask::get_counter_name(&corrected_uuid).to_string(),
-                    MonitorableMetricType::Rate,
-                ),
-                MonitorableMetric::new(
-                    PublicationTask::get_counter_name(&corrected_uuid).to_string(),
-                    MonitorableMetricType::Rate,
-                ),
-                MonitorableMetric::new(
-                    ErrorTask::get_counter_name(&corrected_uuid).to_string(),
-                    MonitorableMetricType::Rate,
-                ),
-            ];
+        let corrected_uuid = uuid.clone().replace('-', "_");
+        if let Some(tui) = tui {
+            tui.add_metric(MetricConfig::rate(
+                IndexingTask::get_counter_name(&corrected_uuid),
+                "Indexing rate",
+            ));
+            tui.add_metric(MetricConfig::rate(
+                SearchSpaceGenerationTask::get_counter_name(&corrected_uuid),
+                "Search spaces generation rate",
+            ));
+            tui.add_metric(MetricConfig::rate(
+                IdentificationTask::get_counter_name(&corrected_uuid),
+                "Identification rate",
+            ));
+            tui.add_metric(MetricConfig::rate(
+                ScoringTask::get_counter_name(&corrected_uuid),
+                "Scoring rate",
+            ));
+            tui.add_metric(MetricConfig::rate(
+                PublicationTask::get_counter_name(&corrected_uuid),
+                "Publication rate",
+            ));
+            tui.add_metric(MetricConfig::rate(
+                ErrorTask::get_counter_name(&corrected_uuid),
+                "Error rate",
+            ));
 
-            metrics_monitor = Some(MetricsMonitor::new(
-                "maccoys.local_pipeline",
-                monitorable_metrics,
-                metrics_scrape_url,
-            )?);
+            tui.add_metric(MetricConfig::counter(
+                IndexingTask::get_counter_name(&corrected_uuid),
+                "Indexed runs",
+            ));
+            tui.add_metric(MetricConfig::counter(
+                SearchSpaceGenerationTask::get_counter_name(&corrected_uuid),
+                "Search spaces generated",
+            ));
+            tui.add_metric(MetricConfig::counter(
+                IdentificationTask::get_counter_name(&corrected_uuid),
+                "Identified spectra",
+            ));
+            tui.add_metric(MetricConfig::counter(
+                ScoringTask::get_counter_name(&corrected_uuid),
+                "Scored PSM distributions",
+            ));
+            tui.add_metric(MetricConfig::counter(
+                PublicationTask::get_counter_name(&corrected_uuid),
+                "Publicated results",
+            ));
+            tui.add_metric(MetricConfig::counter(
+                ErrorTask::get_counter_name(&corrected_uuid),
+                "Errors",
+            ));
         }
 
         // Sanitize file names and copy mzML files to the work directory
@@ -394,32 +408,28 @@ where
         // Wait a couple of seconds for the indexing to start
         sleep(Duration::from_millis(5000)).await;
 
-        let progress_span = info_span!("progress");
-        progress_span.pb_set_message("Finished spectra");
-        progress_span.pb_set_style(
-            &ProgressStyle::with_template("        {msg} {wide_bar} {pos}/{len} {per_sec} ")
-                .unwrap(),
-        );
-
+        let mut is_fully_enqueued_notified = false;
         loop {
             if self.storage.is_search_finished(&uuid).await? {
                 info!("Search finished");
                 break;
             }
             sleep(Duration::from_millis(1000)).await;
-            let _ = progress_span.enter();
-            progress_span.pb_set_length(self.storage.get_total_spectrum_count(&uuid).await?);
-            progress_span.pb_set_position(self.storage.get_finished_spectrum_count(&uuid).await?);
-            if self.storage.is_search_fully_enqueued(&uuid).await? {
-                progress_span.pb_set_message("Finished spectra");
-            } else {
-                progress_span.pb_set_message("Finished spectra (enqueuing still in progress)");
+            if self.storage.is_search_fully_enqueued(&uuid).await? && !is_fully_enqueued_notified {
+                is_fully_enqueued_notified = true;
+                info!("Spectra fully enqueued");
             }
         }
-        drop(progress_span);
 
-        if let Some(mut metrics_monitor) = metrics_monitor {
-            metrics_monitor.stop().await?;
+        if let Some(tui) = tui {
+            tui.remove_metric(IndexingTask::get_counter_name(&corrected_uuid).as_str());
+            tui.remove_metric(
+                SearchSpaceGenerationTask::get_counter_name(&corrected_uuid).as_str(),
+            );
+            tui.remove_metric(IdentificationTask::get_counter_name(&corrected_uuid).as_str());
+            tui.remove_metric(ScoringTask::get_counter_name(&corrected_uuid).as_str());
+            tui.remove_metric(PublicationTask::get_counter_name(&corrected_uuid).as_str());
+            tui.remove_metric(ErrorTask::get_counter_name(&corrected_uuid).as_str());
         }
 
         Ok(())
@@ -495,9 +505,9 @@ pub async fn build_and_run_local_pipeline(
     tmp_dir: PathBuf,
     config: PipelineConfiguration,
     search_params: SearchParameters,
-    ptms: Vec<PostTranslationalModification>,
+    ptms: Vec<Arc<PostTranslationalModification>>,
     mzml_file_paths: Vec<PathBuf>,
-    metrics_scrape_url: Option<String>,
+    tui: &Option<TuiHandle>,
 ) -> Result<()> {
     let http_queue_server = match queue {
         QueueTarget::Http => {
@@ -551,37 +561,37 @@ pub async fn build_and_run_local_pipeline(
         (QueueTarget::Memory, StorageTarget::Memory) => {
             LocalPipeline::<LocalQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
-                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
         (QueueTarget::Memory, StorageTarget::Redis) => {
             LocalPipeline::<LocalQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
-                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
         (QueueTarget::Redis, StorageTarget::Memory) => {
             LocalPipeline::<RedisQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
-                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
         (QueueTarget::Redis, StorageTarget::Redis) => {
             LocalPipeline::<RedisQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
-                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
         (QueueTarget::Http, StorageTarget::Memory) => {
             LocalPipeline::<HttpQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
-                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
         (QueueTarget::Http, StorageTarget::Redis) => {
             LocalPipeline::<HttpQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
-                .run(search_params, ptms, mzml_file_paths, metrics_scrape_url)
+                .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
     };

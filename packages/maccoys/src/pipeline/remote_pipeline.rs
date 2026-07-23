@@ -7,19 +7,14 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Result};
-use indicatif::ProgressStyle;
 use tokio::{spawn, task::JoinHandle, time::sleep_until};
-use tracing::{error, info, info_span};
-use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing::{error, info};
 
 use crate::pipeline::remote_pipeline_web_api::ProgressRepsonse;
 
 /// Interval to refresh the monitored metrics
 ///
 const REFRESH_INTERVAL: u64 = 1000;
-
-/// Progress bar style
-const PROGRESS_STYLE: &str = "\t{msg} {wide_bar} {pos}/{len} {per_sec} ";
 
 pub struct RemotePipeline {}
 
@@ -141,9 +136,7 @@ impl RemotePipelineProgressMonitor {
     }
 
     async fn view(stop_flag: Arc<AtomicBool>, monitor_endpoint_url: String) -> Result<()> {
-        let progress_span = info_span!("progress");
-        progress_span.pb_set_message("Finished spectra");
-        progress_span.pb_set_style(&ProgressStyle::with_template(PROGRESS_STYLE).unwrap());
+        let mut is_fully_enqueued_notified = false;
 
         while !stop_flag.load(Ordering::Relaxed) {
             let next_refresh =
@@ -175,13 +168,9 @@ impl RemotePipelineProgressMonitor {
                 }
             };
 
-            let _ = progress_span.enter();
-            progress_span.pb_set_length(progress.total_spectrum_count());
-            progress_span.pb_set_position(progress.finished_spectrum_count());
-            if progress.is_search_fully_enqueued() {
-                progress_span.pb_set_message("Finished spectra");
-            } else {
-                progress_span.pb_set_message("Finished spectra (enqueuing still in progress)");
+            if progress.is_search_fully_enqueued() && !is_fully_enqueued_notified {
+                is_fully_enqueued_notified = true;
+                info!("Spectra fully enqueued");
             }
 
             sleep_until(next_refresh).await;

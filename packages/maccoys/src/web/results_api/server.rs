@@ -1,13 +1,10 @@
-// std modules
-use std::{path::PathBuf, sync::Arc};
+use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin, sync::Arc};
 
-// external modules
 use anyhow::Result;
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use http::Method;
 use tower_http::cors::{Any, CorsLayer};
 
-// internal modules
 use crate::web::results_api::ResultController;
 
 /// Loki tracing label value for the results api server
@@ -21,11 +18,14 @@ impl Server {
     /// and monitor the progress of the searches.
     ///
     /// # Arguments
-    /// * `interface` - Interface to bind the service to
-    /// * `port` - Port to bind the service to
+    /// * `socket` - The socket address to bind the server to
     /// * `result_dir` - Directory to store the results
     ///
-    pub async fn start(interface: String, port: u16, result_dir: PathBuf) -> Result<()> {
+    pub async fn start(
+        socket: SocketAddr,
+        result_dir: PathBuf,
+        shutdown_signal: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    ) -> Result<()> {
         let result_dir = Arc::new(result_dir);
 
         // Add CORS layer
@@ -49,9 +49,16 @@ impl Server {
             .layer(cors)
             .with_state(result_dir);
 
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", interface, port)).await?;
-        tracing::info!("ready for connections, listening on {}", interface);
-        axum::serve(listener, app).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(socket).await?;
+        tracing::info!(
+            "Ready for connections, listening on {}:{}",
+            socket.ip(),
+            socket.port()
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await
+            .unwrap();
 
         Ok(())
     }

@@ -4,7 +4,6 @@ use axum::{
 };
 use http::StatusCode;
 use thiserror::Error;
-use tracing::error;
 
 use crate::pipeline::errors::message_error::MessageError;
 

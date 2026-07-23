@@ -3,12 +3,12 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        RwLock,
+        Arc, RwLock,
     },
 };
 
-use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use futures::Future;
+use macpepdb::post_translational_modification::PostTranslationalModification;
 use mini_moka::sync::Cache;
 use rustis::commands::{GenericCommands, StringCommands};
 
@@ -62,14 +62,14 @@ pub trait PipelineStorage: Send + Sync + Sized {
     fn get_ptms(
         &self,
         uuid: &str,
-    ) -> impl Future<Output = Result<Option<Vec<PostTranslationalModification>>, StorageError>> + Send;
+    ) -> impl Future<Output = Result<Option<Vec<Arc<PostTranslationalModification>>>, StorageError>> + Send;
 
     /// Set the PTM reader
     ///
     fn set_ptms(
         &self,
         uuid: &str,
-        ptms: &[PostTranslationalModification],
+        ptms: &[Arc<PostTranslationalModification>],
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Remove PTMs
@@ -113,7 +113,7 @@ pub trait PipelineStorage: Send + Sync + Sized {
         &self,
         uuid: &str,
         search_parameters: SearchParameters,
-        ptms: &[PostTranslationalModification],
+        ptms: &[Arc<PostTranslationalModification>],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async {
             // Set configs
@@ -280,7 +280,7 @@ pub struct LocalPipelineStorage {
     search_parameters: RwLock<HashMap<String, SearchParameters>>,
 
     /// Post translational modifications
-    ptms_collections: RwLock<HashMap<String, Vec<PostTranslationalModification>>>,
+    ptms_collections: RwLock<HashMap<String, Vec<Arc<PostTranslationalModification>>>>,
 
     /// Counts
     counters: RwLock<HashMap<String, AtomicU64>>,
@@ -337,7 +337,7 @@ impl PipelineStorage for LocalPipelineStorage {
     async fn get_ptms(
         &self,
         uuid: &str,
-    ) -> Result<Option<Vec<PostTranslationalModification>>, StorageError> {
+    ) -> Result<Option<Vec<Arc<PostTranslationalModification>>>, StorageError> {
         Ok(self
             .ptms_collections
             .read()
@@ -349,7 +349,7 @@ impl PipelineStorage for LocalPipelineStorage {
     async fn set_ptms(
         &self,
         uuid: &str,
-        ptms: &[PostTranslationalModification],
+        ptms: &[Arc<PostTranslationalModification>],
     ) -> Result<(), StorageError> {
         let mut ptms_guard = self
             .ptms_collections
@@ -586,7 +586,7 @@ impl PipelineStorage for RedisPipelineStorage {
     async fn get_ptms(
         &self,
         uuid: &str,
-    ) -> Result<Option<Vec<PostTranslationalModification>>, StorageError> {
+    ) -> Result<Option<Vec<Arc<PostTranslationalModification>>>, StorageError> {
         let ptms_json: String = self
             .client
             .get(Self::get_ptms_key(uuid))
@@ -597,8 +597,8 @@ impl PipelineStorage for RedisPipelineStorage {
             return Ok(None);
         }
 
-        let ptms: Vec<PostTranslationalModification> =
-            serde_json::from_str(&ptms_json).map_err(|err| {
+        let ptms: Vec<Arc<PostTranslationalModification>> = serde_json::from_str(&ptms_json)
+            .map_err(|err| {
                 RedisStorageError::DeserializationError("getting PTMs".to_string(), err)
             })?;
 
@@ -608,7 +608,7 @@ impl PipelineStorage for RedisPipelineStorage {
     async fn set_ptms(
         &self,
         uuid: &str,
-        ptms: &[PostTranslationalModification],
+        ptms: &[Arc<PostTranslationalModification>],
     ) -> Result<(), StorageError> {
         let ptms_json = serde_json::to_string(ptms).map_err(|err| {
             RedisStorageError::SerializationError("setting ptms".to_string(), err)

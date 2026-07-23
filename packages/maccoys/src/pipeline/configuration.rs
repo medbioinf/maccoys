@@ -1,5 +1,6 @@
-use std::{ops::Deref, path::PathBuf, time::Duration};
+use std::{num::NonZeroUsize, ops::Deref, path::PathBuf, time::Duration};
 
+use macpepdb::peptide_search::PeptideSearchType;
 use xcorrrs::configuration::Configuration as XcorrConfiguration;
 
 pub const INDEXING_QUEUE_KEY: &str = "index";
@@ -23,7 +24,7 @@ pub struct SearchParameters {
     pub upper_mass_tolerance_ppm: i64,
 
     /// Maximum number of variable modifications
-    pub max_variable_modifications: i8,
+    pub max_variable_modifications: usize,
 
     /// Number of decoys per peptide
     pub decoys_per_peptide: usize,
@@ -80,6 +81,12 @@ pub struct TaskConfiguration {
 pub struct SearchSpaceGenerationTaskConfiguration {
     #[serde(flatten)]
     pub general: TaskConfiguration,
+
+    /// Search type
+    pub search_type: PeptideSearchType,
+
+    /// Concurrent search, only applied on MultiTask search type
+    pub concurrent_searches: NonZeroUsize,
 
     /// URL to the target database
     pub target_url: String,
@@ -233,6 +240,8 @@ impl Default for PipelineConfiguration {
                     queue_url: None,
                 },
                 target_url: "".to_string(),
+                search_type: PeptideSearchType::MultiTask,
+                concurrent_searches: NonZeroUsize::new(16).unwrap(),
                 decoy_url: None,
                 target_lookup_url: None,
                 decoy_cache_url: None,

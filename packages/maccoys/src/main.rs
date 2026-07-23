@@ -1,14 +1,17 @@
+use std::collections::HashMap;
 // std imports
+use std::env;
 use std::fs::{self, read_to_string, write as write_file, File};
 use std::io::BufReader;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::{env, process};
+use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use dihardts_omicstools::proteomics::io::mzml::{index::Index, reader::Reader as MzmlReader};
-use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use glob::glob;
 use maccoys::pipeline::configuration::{PipelineConfiguration, RemoteEntypointConfiguration};
 use maccoys::pipeline::local_pipeline::{build_and_run_local_pipeline, QueueTarget, StorageTarget};
@@ -23,82 +26,26 @@ use maccoys::pipeline::tasks::scoring_task::ScoringTask;
 use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
 use maccoys::pipeline::tasks::task::Task;
 use maccoys::search_space::search_space_generator::{FastaSearchSpace, SearchSpaceGenerator};
-use macpepdb::functions::post_translational_modification::PTMCollection;
-use macpepdb::io::post_translational_modification_csv::reader::Reader as PtmReader;
-use macpepdb::mass::convert::to_int as mass_to_int;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use macpepdb::mass::to_int as mass_to_int;
+use macpepdb::monitoring::{MetricTarget, Monitoring, TracingLogRotation, TracingTarget};
+use macpepdb::peptide_search::PeptideSearchType;
+use macpepdb::post_translational_modification::PostTranslationalModification;
+use macpepdb_tui::Tui;
 use reqwest::Url;
 use tokio::fs::OpenOptions;
-use tokio::net::TcpListener;
-use tracing::{debug, info, Level};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing::{debug, info};
 
 // internal imports
-use maccoys::database::database_build::DatabaseBuild;
 use maccoys::functions::post_process;
-use maccoys::web::decoy_api::Server as DecoyApiServer;
 use maccoys::web::results_api::Server as ResultApiServer;
 
-static DEFAULT_LOKI_TRACING_LABEL_KEY: &str = "maccoys";
 static DEFAULT_LOKI_TRACING_LABEL_VALUE: &str = "general";
-
-/// Target for tracing
-///
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum TracingTarget {
-    Loki,
-    File,
-    Terminal,
-    All,
-}
-
-/// Target for metrics
-///
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum MetricTarget {
-    Terminal,
-    Prometheus,
-    All,
-}
-
-/// Log rotation values for CLI
-///
-#[derive(clap::ValueEnum, Clone, Debug)]
-enum TracingLogRotation {
-    Minutely,
-    Hourly,
-    Daily,
-    Never,
-}
-
-impl From<TracingLogRotation> for Rotation {
-    fn from(rotation: TracingLogRotation) -> Self {
-        match rotation {
-            TracingLogRotation::Minutely => Rotation::MINUTELY,
-            TracingLogRotation::Hourly => Rotation::HOURLY,
-            TracingLogRotation::Daily => Rotation::DAILY,
-            TracingLogRotation::Never => Rotation::NEVER,
-        }
-    }
-}
 
 #[derive(Debug, Subcommand)]
 enum WebCommand {
-    /// API for caching generated decoys
-    DecoyApi {
-        /// Interface where the service is spawned
-        interface: String,
-        /// Port where the service is spawned
-        port: u16,
-        /// Database URL for a MaCPepDB-like database for just for decoys
-        database_url: String,
-    },
     /// API for accessing the search results
     ResultApi {
-        interface: String,
-        port: u16,
+        socket: SocketAddr,
         result_dir: PathBuf,
     },
 }
@@ -232,22 +179,35 @@ struct PipelineCLI {
 enum Commands {
     /// Starts one of the various web APIs
     Web(WebCLI),
-    /// Build a MaCPepDB database for decoy caching.
-    ///
-    DatabaseBuild {
-        /// Database URL of the format scylla://host1,host2,host3/keyspace
-        database_url: String,
-        /// Path or http(s)-URL to a MaCPepDB configuration JSON file. If a URL is given, the file will be downloaded and parsed.
-        /// If you have no working MaCPepDB do download one, you can use the default from the MaCcoyS repo.
-        configuration_resource: String,
-    },
     /// Build search space for the given mass, mass tolerance and PTMs.
     ///
     SearchSpaceBuild {
+        // Optional and default arguments
+        /// Number of concurrent searches for MultiTask search type
+        #[arg(long, default_value_t = NonZeroUsize::new(16).unwrap())]
+        concurrent_searches: NonZeroUsize,
+        /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        #[arg(short = 'c')]
+        decoy_cache_url: Option<String>,
+        /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        #[arg(short)]
+        decoy_url: Option<String>,
+        /// Type of search to perform, multi-task search can be faster but also more memory intensive.
+        /// Only recognized if `target-url` is postgresql connection.
+        #[arg(long, default_value_t = PeptideSearchType::MultiTask)]
+        search_type: PeptideSearchType,
+        /// Optional URL for checking generated decoy against targets.
+        /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
+        /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
+        /// If not given, decoys will not be checked against the target database and considered as "correct".
+        #[arg(short)]
+        target_lookup_url: Option<String>,
+
+        // mendatory arguments
         /// Path to search space FASTA file.
         fasta_file_path: String,
         /// Path to PTM file
-        ptm_file_path: String,
+        ptm_file_path: PathBuf,
         /// Mass
         mass: f64,
         /// Lower mass tolerance in PPM
@@ -255,23 +215,11 @@ enum Commands {
         /// Upper mass tolerance in PPM
         upper_mass_tolerance_ppm: i64,
         /// Maximal number of variable modifications
-        max_variable_modifications: i8,
+        max_variable_modifications: usize,
         /// Amount of decoys to generate
         decoys_per_peptide: usize,
-        /// URL for fetching targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
+        /// URL for fetching targets, can be URL for the database (`postgresq://(<user>(:<password>))@<host>(:<port>)/<database>`) or base url for MaCPepDB web API.
         target_url: String,
-        /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
-        #[arg(short)]
-        decoy_url: Option<String>,
-        /// Optional URL for checking generated decoy against targets.
-        /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
-        /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
-        /// If not given, decoys will not be checked against the target database and considered as "correct".
-        #[arg(short)]
-        target_lookup_url: Option<String>,
-        /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
-        #[arg(short = 'c')]
-        decoy_cache_url: Option<String>,
     },
     /// Index a spectrum file for fast access. Only mzML is supported yet.
     ///
@@ -306,199 +254,120 @@ enum Commands {
     Config {},
     /// MaCcoyS search pipeline
     Pipeline(PipelineCLI),
-    /// Prints the version
-    Version {},
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "maccoys")]
 struct Cli {
-    /// Verbosity level
-    /// 0 - Error
-    /// 1 - Warn
-    /// 2 - Info
-    /// 3 - Debug
-    /// > 3 - Trace
+    /// Flag to start tokio console API
+    #[arg(long, default_value_t = false)]
+    console: bool,
+    /// Socket for tokio console API
+    #[arg(long)]
+    console_socket: Option<SocketAddr>,
+    /// Database URL, format `postgresql://[<user>[:<url-safe-password>]@]<host[:<port>]>[,<host[:<port>]>...]/<dbname>[?pool_size=N&...]`
+    #[arg(short, long, default_value_t = String::from("postgresql://postgres@127.0.0.1:5432/postgres"))]
+    database_url: String,
+    /// Path to optional log file
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+    #[arg(long, default_value_t = TracingLogRotation::Daily)]
+    log_rotation: TracingLogRotation,
+    /// Endpoint for Loki API to send logs to
+    #[arg(long)]
+    loki: Option<Url>,
+    /// Label to  distinguish logs from this app instance in Loki
+    #[arg(long, default_value_t = String::from(env!("CARGO_CRATE_NAME")))]
+    loki_label: String,
+    /// Socket for prometheus collection endpoint
+    #[arg(long)]
+    prometheus: Option<SocketAddr>,
+    /// Flag to show tracing on the stdout, no tui, no metrics
+    #[arg(long, default_value_t = false, conflicts_with = "tui")]
+    terminal: bool,
+    /// If set
+    #[arg(long)]
+    metrics_to_logs: Option<u64>,
+    /// Flag to show a terminal UI for tracing and metics
+    #[arg(long, default_value_t = false, conflicts_with = "terminal")]
+    tui: bool,
+    /// Increases log level each time it is used. 10 and above will activating level tracing for all crates included.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
-    /// How to log tracing. Can be used multiple times
-    #[arg(short, long, value_enum, action = clap::ArgAction::Append)]
-    tracing_target: Vec<TracingTarget>,
-    /// Tracing log file. Only used if `file` is set in `tracing_target`.
-    #[arg(short, long, default_value = "./logs/macpepdb.log")]
-    file: PathBuf,
-    /// Tracing log rotation. Only used if `file` is set in `tracing_target`.
-    #[arg(short, long, value_enum, default_value = "never")]
-    rotation: TracingLogRotation,
-    /// Max log files. Only used if `file` is set in `tracing_target`.
-    #[arg(short, long, value_enum, default_value = "1")]
-    number_of_log_files: usize,
-    /// Remote address of Loki endpoint for logging.
-    /// Only used if `loki` is set in `tracing_target`.
-    #[arg(short, long, default_value = "127.0.0.1:3100")]
-    loki: String,
-    /// How to log metrics. Can be used multiple times
-    #[arg(short, long, value_enum, action = clap::ArgAction::Append)]
-    metric_target: Vec<MetricTarget>,
-    /// Local address to serve the Prometheus metrics endpoint.
-    /// Port zero will automatically use a free port.
-    /// Only used if `prometheus` is set in `metric_target`.
-    #[arg(short, long, default_value = "127.0.0.1:9494")]
-    prometheus: String,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Cli::parse();
-
-    //// Set up tracing
-    let verbosity = match args.verbose {
-        0 => Level::ERROR,
-        1 => Level::WARN,
-        2 => Level::INFO,
-        3 => Level::DEBUG,
-        _ => Level::TRACE,
-    };
-
-    let filter = EnvFilter::from_default_env()
-        .add_directive(verbosity.into())
-        .add_directive("scylla=error".parse().unwrap())
-        .add_directive("tokio_postgres=error".parse().unwrap())
-        .add_directive("hyper=error".parse().unwrap())
-        .add_directive("reqwest=error".parse().unwrap())
-        .add_directive("rustis=error".parse().unwrap())
-        .add_directive("h2=error".parse().unwrap());
-
-    // Tracing layers
-    let mut tracing_indicatif_layer = None;
-    let mut tracing_terminal_layer = None;
-    let mut tracing_loki_layer = None;
-    let mut tracing_file_layer = None;
-
-    // Tracing guards/tasks
-    let mut _tracing_loki_task = None;
-    let mut _tracing_log_writer_guard = None;
-
-    if args.tracing_target.contains(&TracingTarget::Terminal)
-        || args.metric_target.contains(&MetricTarget::Terminal)
-        || args.tracing_target.contains(&TracingTarget::All)
-        || args.metric_target.contains(&MetricTarget::All)
-    {
-        let layer = IndicatifLayer::new()
-            .with_span_child_prefix_symbol("\t")
-            .with_span_child_prefix_indent("")
-            .with_max_progress_bars(20, None);
-        tracing_indicatif_layer = Some(layer);
-    }
-
-    if args.tracing_target.contains(&TracingTarget::Terminal)
-        || args.tracing_target.contains(&TracingTarget::All)
-    {
-        let parent_layer = tracing_indicatif_layer.as_ref().unwrap();
-        tracing_terminal_layer =
-            Some(tracing_subscriber::fmt::layer().with_writer(parent_layer.get_stderr_writer()));
-    }
-
-    if args.tracing_target.contains(&TracingTarget::File)
-        || args.tracing_target.contains(&TracingTarget::All)
-    {
-        let file_appender = RollingFileAppender::builder()
-            .max_log_files(args.number_of_log_files)
-            .rotation(args.rotation.into())
-            .filename_prefix(args.file.file_stem().unwrap().to_string_lossy())
-            .filename_suffix(
-                args.file
-                    .extension()
-                    .map_or("log", |ext| ext.to_str().unwrap()),
-            )
-            .build(args.file.parent().unwrap())?;
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        tracing_file_layer = Some(tracing_subscriber::fmt::layer().with_writer(non_blocking));
-        _tracing_log_writer_guard = Some(guard);
-    }
-
-    if args.tracing_target.contains(&TracingTarget::Loki)
-        || args.tracing_target.contains(&TracingTarget::All)
-    {
-        let (layer, task) = tracing_loki::builder()
-            .label(
-                DEFAULT_LOKI_TRACING_LABEL_KEY,
-                loki_tracing_label(&args.command),
-            )?
-            .extra_field("pid", format!("{}", process::id()))?
-            .build_url(Url::parse(&format!("http://{}", args.loki)).unwrap())?;
-        tracing_loki_layer = Some(layer);
-        _tracing_loki_task = Some(tokio::spawn(task));
-    }
-
-    tracing_subscriber::registry()
-        .with(tracing_terminal_layer)
-        .with(tracing_indicatif_layer)
-        .with(tracing_file_layer)
-        .with(tracing_loki_layer)
-        .with(filter)
-        .init();
-
-    //// Setup (prometheus) metrics
-
-    let mut prometheus_scrape_address = None;
-
-    if args.metric_target.contains(&MetricTarget::Prometheus)
-        || args.metric_target.contains(&MetricTarget::Terminal)
-        || args.metric_target.contains(&MetricTarget::All)
-    {
-        let prometheus_metrics_builder = PrometheusBuilder::new();
-
-        // Create TCP listener for Prometheus metrics to check if port is available.
-        // When Port 0 is given, the OS will choose a free port.
-        let prometheus_scrape_socket_tmp = TcpListener::bind(&args.prometheus)
-            .await
-            .context("Creating TCP listener for Prometheus scrape endpoint")?;
-        // Copy socket address to be able to use it for the endpoint
-        let prometheus_scrape_socket = prometheus_scrape_socket_tmp.local_addr()?;
-        prometheus_scrape_address = Some(format!(
-            "{}:{}",
-            prometheus_scrape_socket.ip(),
-            prometheus_scrape_socket.port()
-        ));
-        // Drop listener to make port available for the web server
-        drop(prometheus_scrape_socket_tmp);
-
-        prometheus_metrics_builder
-            .with_http_listener(prometheus_scrape_socket)
-            .install()?;
-    }
+    let cli = Cli::parse();
 
     info!("Welcome to MaCoyS - The `S` is silent!");
 
-    match args.command {
+    let mut tracing_targets: Vec<TracingTarget> = Vec::new();
+    let mut metric_targets: Vec<MetricTarget> = Vec::new();
+
+    let tui = cli.tui.then(|| {
+        let tui = Tui::builder().title(env!("CARGO_CRATE_NAME")).build();
+        tracing_targets.push(TracingTarget::Tui(tui.layer()));
+        metric_targets.push(MetricTarget::Tui(tui.recorder()));
+        tui.run_raw()
+    });
+
+    if cli.terminal {
+        tracing_targets.push(TracingTarget::Terminal);
+    }
+
+    #[cfg(feature = "tokio-console")]
+    if cli.console {
+        tracing_targets.push(TracingTarget::Console(cli.console_socket));
+    }
+
+    if let Some(log_file_path) = cli.log_file {
+        tracing_targets.push(TracingTarget::File(
+            log_file_path.clone(),
+            cli.log_rotation.into(),
+        ));
+    }
+
+    if let Some(loki_url) = cli.loki {
+        let loki_label = loki_tracing_label(&cli.command, cli.loki_label.clone());
+        tracing_targets.push(TracingTarget::Loki(loki_url, loki_label));
+    }
+
+    if let Some(prometheus_socket) = cli.prometheus {
+        metric_targets.push(MetricTarget::Prometheus(
+            prometheus_socket,
+            Box::pin(shutdown_signal()),
+        ));
+    }
+
+    if let Some(metrics_to_logs_period) = cli.metrics_to_logs {
+        metric_targets.push(MetricTarget::Tracing(metrics_to_logs_period));
+    }
+
+    let _monitoring = Monitoring::new(
+        cli.verbose,
+        tracing_targets.into_iter(),
+        metric_targets.into_iter(),
+        HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    match cli.command {
         Commands::Web(web_command) => match web_command.command {
-            WebCommand::DecoyApi {
-                interface,
-                port,
-                database_url,
-            } => {
-                DecoyApiServer::start(&database_url, interface, port).await?;
-            }
-            WebCommand::ResultApi {
-                interface,
-                port,
-                result_dir,
-            } => {
-                ResultApiServer::start(interface, port, result_dir).await?;
+            WebCommand::ResultApi { socket, result_dir } => {
+                ResultApiServer::start(socket, result_dir, Box::pin(shutdown_signal())).await?;
             }
         },
-        Commands::DatabaseBuild {
-            database_url,
-            configuration_resource,
-        } => {
-            let build = DatabaseBuild::new(&database_url);
-            build.build(&configuration_resource).await?;
-            info!("Database build finished");
-        }
         Commands::SearchSpaceBuild {
+            concurrent_searches,
+            decoy_cache_url,
+            decoy_url,
+            search_type,
+            target_lookup_url,
             fasta_file_path,
             ptm_file_path,
             mass,
@@ -507,11 +376,16 @@ async fn main() -> Result<()> {
             max_variable_modifications,
             decoys_per_peptide,
             target_url,
-            decoy_url,
-            target_lookup_url,
-            decoy_cache_url,
         } => {
-            let ptms = PtmReader::read(Path::new(&ptm_file_path))?;
+            let ptms = csv::ReaderBuilder::new()
+                .delimiter(b'\t')
+                .has_headers(true)
+                .from_path(ptm_file_path)
+                .unwrap()
+                .deserialize()
+                .map(|result| result.map(Arc::new))
+                .collect::<Result<Vec<Arc<PostTranslationalModification>>, csv::Error>>()
+                .unwrap();
 
             let fasta_file = OpenOptions::new()
                 .read(true)
@@ -527,6 +401,7 @@ async fn main() -> Result<()> {
 
             let search_space_generator = SearchSpaceGenerator::new(
                 &target_url,
+                search_type,
                 decoy_url,
                 target_lookup_url,
                 decoy_cache_url,
@@ -540,8 +415,9 @@ async fn main() -> Result<()> {
                     lower_mass_tolerance_ppm,
                     upper_mass_tolerance_ppm,
                     max_variable_modifications,
-                    &ptms,
+                    ptms.as_slice(),
                     decoys_per_peptide,
+                    concurrent_searches,
                 )
                 .await?;
         }
@@ -633,18 +509,22 @@ async fn main() -> Result<()> {
                     toml::from_str(&read_to_string(&config).context("Reading config file")?)
                         .context("Deserialize config")?;
 
-                let mut ptms: Vec<PostTranslationalModification> = Vec::new();
-                if let Some(ptms_file) = &ptms_file {
-                    ptms =
-                        PtmReader::read(Path::new(ptms_file)).context("Fail to read PSM file")?;
-                    // validate PTMs
-                    let _ = PTMCollection::new(&ptms).map_err(|err| anyhow!(err))?;
-                }
+                let ptms = ptms_file
+                    .map(|path| {
+                        csv::ReaderBuilder::new()
+                            .delimiter(b'\t')
+                            .has_headers(true)
+                            .from_path(path)
+                            .unwrap()
+                            .deserialize()
+                            .map(|result| result.map(Arc::new))
+                            .collect::<Result<Vec<Arc<PostTranslationalModification>>, csv::Error>>(
+                            )
+                            .unwrap()
+                    })
+                    .unwrap_or_default();
 
                 let mzml_file_paths = convert_str_paths_and_resolve_globs(mzml_file_paths)?;
-                let scrape_endpoint = prometheus_scrape_address
-                    .as_ref()
-                    .map(|address| format!("http://{}/metrics", address));
 
                 let search_params = config.search_parameters.clone();
 
@@ -657,7 +537,7 @@ async fn main() -> Result<()> {
                     search_params,
                     ptms,
                     mzml_file_paths,
-                    scrape_endpoint,
+                    &tui,
                 )
                 .await?
             }
@@ -740,11 +620,6 @@ async fn main() -> Result<()> {
                 QueueServer::run_standalone(interface, port, config, state_file_path).await?;
             }
         },
-        Commands::Version {} => {
-            println!("-- MaCcoyS - Mass Centric Decoy Search  --");
-            println!("Version: {}", env!("CARGO_PKG_VERSION"));
-            println!("Repository: {}", env!("CARGO_PKG_REPOSITORY"));
-        }
     };
     Ok(())
 }
@@ -774,15 +649,13 @@ fn convert_str_paths_and_resolve_globs(paths: Vec<String>) -> Result<Vec<PathBuf
         .collect())
 }
 
-fn loki_tracing_label(commands: &Commands) -> &'static str {
-    match commands {
+fn loki_tracing_label(commands: &Commands, loki_label: String) -> String {
+    let command_label = match commands {
         Commands::Web(web_command) => match &web_command.command {
             WebCommand::ResultApi {
-                interface: _,
-                port: _,
+                socket: _,
                 result_dir: _,
             } => ResultApiServer::loki_tracing_label_value(),
-            _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
         },
         Commands::Pipeline(pipeline_command) => match &pipeline_command.command {
             PipelineCommand::RemoteEntrypoint {
@@ -818,5 +691,29 @@ fn loki_tracing_label(commands: &Commands) -> &'static str {
             _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
         },
         _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
+    };
+
+    format!("{}:{}", loki_label, command_label)
+}
+
+/// Axum shutdown signal handler for ctrl-c and terminate signals
+///
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
 }

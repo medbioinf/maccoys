@@ -1,8 +1,7 @@
-use std::{future::IntoFuture, str::FromStr, sync::Arc};
+use std::{future::IntoFuture, str::FromStr};
 
 use deadqueue::limited::Queue;
 use futures::Future;
-use macpepdb::tools::queue_monitor::MonitorableQueue;
 use rustis::{
     client::BatchPreparedCommand,
     commands::{GenericCommands, LMoveWhere, ListCommands, StringCommands},
@@ -637,40 +636,5 @@ where
         })?;
 
         Ok(is_full)
-    }
-}
-
-/// New Arc type to implement the MonitorableQueue trait from `macpepdb`
-///
-pub struct PipelineQueueArc<M, Q>
-where
-    M: IsMessage + 'static,
-    Q: PipelineQueue<M> + 'static,
-{
-    /// Queue
-    queue: Arc<Q>,
-    _phantom_message: std::marker::PhantomData<M>,
-}
-
-impl<M, Q> MonitorableQueue for PipelineQueueArc<M, Q>
-where
-    M: IsMessage + 'static,
-    Q: PipelineQueue<M> + 'static,
-{
-    async fn len(&self) -> usize {
-        self.queue.len().await.unwrap_or(0)
-    }
-}
-
-impl<M, Q> From<Arc<Q>> for PipelineQueueArc<M, Q>
-where
-    M: IsMessage + 'static,
-    Q: PipelineQueue<M> + 'static,
-{
-    fn from(queue: Arc<Q>) -> Self {
-        Self {
-            queue,
-            _phantom_message: std::marker::PhantomData,
-        }
     }
 }

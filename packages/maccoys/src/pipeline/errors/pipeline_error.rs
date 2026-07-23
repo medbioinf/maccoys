@@ -1,4 +1,4 @@
-use macpepdb::functions::post_translational_modification::PTMCollectionValidationError;
+use macpepdb::post_translational_modification::Error as PtmError;
 use thiserror::Error;
 
 use super::{
@@ -46,5 +46,5 @@ pub enum PipelineError {
     #[error("Unable to write to log file")]
     WriteLogError(std::io::Error),
     #[error("Invalid combination of PTMs: {0}")]
-    InvalidPTMCombinationError(#[from] PTMCollectionValidationError),
+    InvalidPTMCombinationError(#[from] PtmError),
 }

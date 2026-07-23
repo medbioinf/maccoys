@@ -10,21 +10,12 @@ documentation = "https://github.com/medbioinf/maccoys"
 license-file = "../LICENSE"
 readme = "README.md"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[lib]
-name = "maccoys"
-path = "src/lib.rs"
-
-[[bin]]
-name = "maccoys"
-path = "src/bin.rs"
-
 [dependencies]
 anyhow = { workspace = true, features = ["backtrace"] }
 async-stream = { workspace = true }
 axum = { workspace = true, features = ["multipart", "original-uri", "http2"] }
 clap = { workspace = true, features = ["derive"] }
+console-subscriber = { workspace = true, optional = true, features = ["env-filter", "grpc-web"] }
 csv = { workspace = true }
 deadqueue = { workspace = true, features = ["limited"] }
 dihardts_omicstools = "~3.1.0"
@@ -38,6 +29,10 @@ lazy_static = { workspace = true }
 local-outlier-probabilities = { workspace = true }
 maccoys-exchange-entities = { workspace = true }
 macpepdb = { workspace = true }
+macpepdb_metrics_peek = { workspace = true }
+macpepdb_tui = { workspace = true }
+macpepdb_web_common = { workspace = true }
+memchr = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, features = [
     "http-listener",
@@ -57,6 +52,7 @@ polars = { workspace = true, features = [
     "parquet",
     "strings",
     "serde",
+    "dtype-u8"
 ] }
 postcard = { workspace = true, features = ["alloc"] }
 rand = { workspace = true }
@@ -76,6 +72,7 @@ serde_json = { workspace = true }
 signal-hook = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-postgres = { workspace = true, features = ["array-impls"] }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true, features = ["cors", "trace"] }
@@ -92,3 +89,7 @@ xcorrrs = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 tracing-test = { workspace = true }
+
+
+[features]
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]

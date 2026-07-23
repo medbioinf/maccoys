@@ -1,23 +1,29 @@
 use std::cmp::min;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::Result;
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
-use dihardts_omicstools::proteomics::peptide::{self, Terminus};
+use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::{
-    Position as PtmPosition, PostTranslationalModification,
+    ModificationType as PtmType, Position as PtmPosition,
 };
 use fancy_regex::Regex;
 use futures::{pin_mut, StreamExt};
-use macpepdb::functions::post_translational_modification::PTMCollection;
-use macpepdb::{
-    database::scylla::peptide_table::PeptideTable,
-    mass::convert::{to_float as mass_to_float, to_int as mass_to_int},
+use http::StatusCode;
+use macpepdb::mass::{to_float as mass_to_float, to_int as mass_to_int};
+use macpepdb::peptide_search::{MultiTaskSearch, PeptideSearchType, Search, UnionAllSearch};
+use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
+use macpepdb::sequence::PeptideSequence;
+use macpepdb_web_common::requests::peptide::{SearchRequestBody, SearchRequestMass};
+use macpepdb_web_common::requests::ptm::{
+    PostTranslationalModificationRequest, PtmPosition as RequestPtmPosition,
+    PtmType as RequestPtmType,
 };
-use serde_json::json;
+use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::error;
 
@@ -32,6 +38,30 @@ use crate::constants::{
 use crate::search_space::decoy_cache::DecoyCache;
 use crate::search_space::macpepdb_client::MaCPepDBClient;
 use crate::search_space::target_lookup::TargetLookup;
+
+static HTTP_BUFFER_SIZE: usize = 1024 * 1024 * 10; // 10 MiB
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("MaCPepDB returned error in stream: {0}")]
+    ApiStream(String),
+    #[error("Error getting next peptide from HTTP stream: {0}")]
+    NextFromHttpStream(Box<reqwest::Error>),
+    #[error("Peptide search error in search space generator: {0}")]
+    PeptideSearch(Box<macpepdb::peptide_search::Error>),
+    #[error("Post-translational modification error in search space generator: {0}")]
+    PostTranslationalModification(Box<macpepdb::post_translational_modification::Error>),
+    #[error("Error adding peptide to search space: {0}")]
+    SearchSpaceAddition(String),
+    #[error("Unable to send search request: {0}")]
+    SearchRequest(Box<reqwest::Error>),
+    #[error("Seqeunce error in search space generator: {0}")]
+    Sequence(Box<macpepdb::sequence::Error>),
+    #[error(
+        "Unsuccessful search request, status code: {0}, content type: {1}, response text: {2}"
+    )]
+    UnsuccessfullSearchRequest(StatusCode, String, String),
+}
 
 /// Path to the peptide search endpoint of MaCPepDB
 ///
@@ -184,7 +214,7 @@ impl IsSearchSpace for FastaSearchSpace {
             )
             .await?;
         self.target_ctr += 1;
-        if self.target_ctr % 1000 == 0 {
+        if self.target_ctr.is_multiple_of(1000) {
             self.fasta.flush().await?;
         }
         Ok(())
@@ -203,7 +233,7 @@ impl IsSearchSpace for FastaSearchSpace {
             )
             .await?;
         self.decoy_ctr += 1;
-        if self.decoy_ctr % 1000 == 0 {
+        if self.decoy_ctr.is_multiple_of(1000) {
             self.fasta.flush().await?;
         }
         Ok(())
@@ -239,13 +269,14 @@ pub struct SearchSpaceGenerator {
 impl SearchSpaceGenerator {
     pub async fn new(
         target_url: &str,
+        search_type: PeptideSearchType,
         decoy_url: Option<String>,
         target_lookup_url: Option<String>,
         decoy_cache_url: Option<String>,
     ) -> Result<Self> {
-        let target_client = MaCPepDBClient::from_url(target_url).await?;
+        let target_client = MaCPepDBClient::from_url(target_url, search_type).await?;
         let decoy_client = match decoy_url.as_ref() {
-            Some(url) => Some(MaCPepDBClient::from_url(url).await?),
+            Some(url) => Some(MaCPepDBClient::from_url(url, search_type).await?),
             None => None,
         };
 
@@ -285,18 +316,17 @@ impl SearchSpaceGenerator {
         mass: i64,
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
-        max_variable_modifications: i16,
-        taxonomy_ids: Option<Vec<i64>>,
+        max_variable_modifications: usize,
+        taxonomy_ids: Option<Vec<i32>>,
         proteome_id: Option<String>,
         is_reviewed: Option<bool>,
-        ptms: &[PostTranslationalModification],
+        ptms: &[Arc<PostTranslationalModification>],
+        concurrent_searches: NonZeroUsize,
         limit: Option<usize>,
-    ) -> Result<()>
+    ) -> Result<(), Error>
     where
         T: IsSearchSpace,
     {
-        let proteome_ids = proteome_id.map(|proteome_id| vec![proteome_id]);
-
         // Determine the client
         let client = if is_target {
             &self.target_client
@@ -321,35 +351,63 @@ impl SearchSpaceGenerator {
         };
 
         match client {
-            MaCPepDBClient::Db(ref client, configuration) => {
-                let ptm_collecton = PTMCollection::new(ptms)?;
-                let target_stream = PeptideTable::search(
-                    client.clone(),
-                    Arc::new(configuration.clone()),
-                    mass,
-                    lower_mass_tolerance_ppm,
-                    upper_mass_tolerance_ppm,
-                    max_variable_modifications as usize,
-                    taxonomy_ids,
-                    proteome_ids,
-                    is_reviewed,
-                    &ptm_collecton,
-                    true,
-                )
-                .await
-                .map_err(|err| anyhow!("Failed to initiate query search: {err}"))?;
+            MaCPepDBClient::Db(ref client, configuration, search_type) => {
+                let ptm_collection = PTMCollection::new(ptms.iter().cloned())
+                    .map(Arc::new)
+                    .map_err(|err| Error::PostTranslationalModification(Box::new(err)))?;
+                let target_stream = match search_type {
+                    PeptideSearchType::UnionAll => UnionAllSearch::search(
+                        client.clone(),
+                        configuration.clone(),
+                        mass,
+                        lower_mass_tolerance_ppm,
+                        upper_mass_tolerance_ppm,
+                        max_variable_modifications,
+                        true,
+                        taxonomy_ids,
+                        proteome_id.map(|proteome_id| vec![proteome_id]),
+                        is_reviewed,
+                        ptm_collection,
+                        true,
+                        concurrent_searches,
+                    )
+                    .await
+                    .map_err(|err| Error::PeptideSearch(Box::new(err)))?,
+                    PeptideSearchType::MultiTask => MultiTaskSearch::search(
+                        client.clone(),
+                        configuration.clone(),
+                        mass,
+                        lower_mass_tolerance_ppm,
+                        upper_mass_tolerance_ppm,
+                        max_variable_modifications,
+                        true,
+                        taxonomy_ids,
+                        proteome_id.map(|proteome_id| vec![proteome_id]),
+                        is_reviewed,
+                        ptm_collection.clone(),
+                        true,
+                        concurrent_searches,
+                    )
+                    .await
+                    .map_err(|err| Error::PeptideSearch(Box::new(err)))?,
+                };
 
                 pin_mut!(target_stream);
                 while let Some(peptide) = target_stream.next().await {
-                    let peptide = peptide.map_err(|err| {
-                        anyhow!("Failed to get next peptide from peptide search stream: {err}")
-                    })?;
+                    let peptidoforms =
+                        peptide.map_err(|err| Error::PeptideSearch(Box::new(err)))?;
 
-                    for sequence in peptide.get_additional_sequences() {
+                    for peptidoform in peptidoforms {
                         if is_target {
-                            search_space.add_target(sequence.to_string()).await?;
+                            search_space
+                                .add_target(peptidoform.sequence().to_string())
+                                .await
+                                .map_err(|err| Error::SearchSpaceAddition(err.to_string()))?;
                         } else {
-                            search_space.add_decoys(sequence.to_string()).await?;
+                            search_space
+                                .add_decoys(peptidoform.sequence().to_string())
+                                .await
+                                .map_err(|err| Error::SearchSpaceAddition(err.to_string()))?;
                         }
                     }
                     if let Some(limit) = limit {
@@ -360,20 +418,45 @@ impl SearchSpaceGenerator {
                 }
             }
             MaCPepDBClient::Http(ref client) => {
+                let modifications = ptms
+                    .iter()
+                    .map(|ptm| PostTranslationalModificationRequest {
+                        name: ptm.name().to_string(),
+                        amino_acid: ptm.amino_acid().code(),
+                        mass_delta: mass_to_float(ptm.mass_delta()),
+                        mod_type: match ptm.mod_type() {
+                            PtmType::Static => RequestPtmType::Static,
+                            PtmType::Variable => RequestPtmType::Variable,
+                        },
+                        position: match ptm.position() {
+                            PtmPosition::Anywhere => RequestPtmPosition::Anywhere,
+                            PtmPosition::Terminus(Terminus::N) => RequestPtmPosition::NTerminus,
+                            PtmPosition::Terminus(Terminus::C) => RequestPtmPosition::CTerminus,
+                            PtmPosition::Bond(Terminus::N) => RequestPtmPosition::NBond,
+                            PtmPosition::Bond(Terminus::C) => RequestPtmPosition::CBond,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+
+                let request_body = SearchRequestBody {
+                    modifications,
+                    lower_mass_tolerance_ppm,
+                    upper_mass_tolerance_ppm,
+                    max_variable_modifications,
+                    proteome_id,
+                    is_reviewed,
+                    mass: SearchRequestMass::Dalton(mass_to_float(mass)),
+                    taxonomy_id: taxonomy_ids.and_then(|ids| ids.first().cloned()),
+                    resolve_modifications: Some(true),
+                };
+
                 let response = client
                     .post(http_url.as_str())
-                    .header("Accept", "text/proforma")
-                    .json(&json!({
-                        "mass": mass_to_float(mass),
-                        "lower_mass_tolerance_ppm": lower_mass_tolerance_ppm,
-                        "upper_mass_tolerance_ppm": upper_mass_tolerance_ppm,
-                        "max_variable_modifications": max_variable_modifications,
-                        "resolve_modifications": true,
-                        "modifications": ptms
-                    }))
+                    .header("Accept", "text/plain")
+                    .json(&request_body)
                     .send()
                     .await
-                    .map_err(|err| anyhow!("Failed to send peptide search request: {err}"))?;
+                    .map_err(|err| Error::SearchRequest(Box::new(err)))?;
 
                 if !response.status().is_success() {
                     let status_code = response.status();
@@ -387,89 +470,78 @@ impl SearchSpaceGenerator {
                         .text()
                         .await
                         .unwrap_or("text is not decodable".to_string());
-                    bail!("Request to peptide search failed:\n\tstatus code: {status_code}\n\tcontent type: {content_type}\n\tresponse text: {response_text}");
+                    return Err(Error::UnsuccessfullSearchRequest(
+                        status_code,
+                        content_type,
+                        response_text,
+                    ));
                 }
-                let mut peptide_stream = response.bytes_stream();
-                let mut buffer = Vec::with_capacity(1024);
-                while let Some(chunk) = peptide_stream.next().await {
-                    let chunk = chunk.map_err(|err| {
-                        anyhow!("Failed to get next chunk from peptide search stream: {err}")
-                    })?;
+                let peptide_stream = response.bytes_stream().peekable();
+                pin_mut!(peptide_stream);
+                let mut buffer = Vec::with_capacity(HTTP_BUFFER_SIZE); // 10 MiB
+                while let Some(chunk) = peptide_stream.as_mut().next().await {
+                    let chunk = chunk.map_err(|err| Error::NextFromHttpStream(Box::new(err)))?;
+                    buffer.extend_from_slice(&chunk);
 
-                    chunk.iter().for_each(|byte| buffer.push(*byte));
-                    if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
-                        let sequence = std::str::from_utf8(&buffer[..newline_pos])?.to_string();
-
-                        if is_target {
-                            search_space.add_target(sequence).await?;
-                        } else {
-                            search_space.add_decoys(sequence).await?;
-                        }
-
-                        if let Some(limit) = limit {
-                            if search_space.target_count() >= limit {
-                                break;
-                            }
-                        }
-                        // remove the written sequence from the buffer
-                        buffer = buffer[newline_pos + 1..].to_vec();
-                    }
-                }
-                // write the rest of the buffer if needed
-                if let Some(limit) = limit {
-                    if search_space.target_count() < limit {
-                        let sequence = std::str::from_utf8(&buffer)?.trim().to_string();
-                        if !sequence.is_empty() {
-                            if is_target {
-                                search_space.add_target(sequence).await?;
-                            } else {
-                                search_space.add_decoys(sequence).await?;
-                            }
+                    if let Some(Ok(next)) = peptide_stream.as_mut().peek().await {
+                        if buffer.len() + next.len() > HTTP_BUFFER_SIZE {
+                            Self::http_buffer_to_search_space(
+                                search_space,
+                                &mut buffer,
+                                is_target,
+                                limit,
+                            )
+                            .await?;
                         }
                     }
-                    // Write peptides to FASTA
-                    Self::next_peptide_in_http_buffer_to_fasta(
-                        search_space,
-                        &mut buffer,
-                        Some(limit),
-                    )
-                    .await
-                    .context("Writing peptide buffer to FASTA")?;
                 }
-                // Write remaining buffer
-                Self::next_peptide_in_http_buffer_to_fasta(search_space, &mut buffer, limit)
-                    .await?;
+                if !buffer.is_empty() {
+                    Self::http_buffer_to_search_space(search_space, &mut buffer, is_target, limit)
+                        .await?;
+                }
             }
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn next_peptide_in_http_buffer_to_fasta<T>(
-        fasta: &mut T,
+    async fn http_buffer_to_search_space<T>(
+        search_space: &mut T,
         buffer: &mut Vec<u8>,
+        is_target: bool,
         limit: Option<usize>,
-    ) -> Result<()>
+    ) -> Result<(), Error>
     where
         T: IsSearchSpace,
     {
-        loop {
-            // Break if limit is reached
+        let mut last_newline_pos = 0;
+        for newline_pos in memchr::memchr_iter(b'\n', buffer) {
+            let sequence =
+                String::from_utf8_lossy(&buffer[last_newline_pos..newline_pos]).to_string();
+
+            if sequence.starts_with("!!!") {
+                return Err(Error::ApiStream(sequence));
+            }
+
+            if is_target {
+                search_space
+                    .add_target(sequence)
+                    .await
+                    .map_err(|err| Error::SearchSpaceAddition(err.to_string()))?;
+            } else {
+                search_space
+                    .add_decoys(sequence)
+                    .await
+                    .map_err(|err| Error::SearchSpaceAddition(err.to_string()))?;
+            }
+            last_newline_pos = newline_pos + 1;
             if let Some(limit) = limit {
-                if fasta.target_count() >= limit {
+                if search_space.target_count() >= limit {
                     break;
                 }
             }
-            if let Some(newline_pos) = buffer.iter().position(|byte| *byte == b'\n') {
-                fasta
-                    .add_target(std::str::from_utf8(&buffer[..newline_pos])?.to_string())
-                    .await?;
-                *buffer = buffer[newline_pos + 1..].to_vec();
-            } else {
-                // Break if no newline is found
-                break;
-            }
         }
+        drop(buffer.drain(..last_newline_pos));
+
         Ok(())
     }
 
@@ -481,8 +553,8 @@ impl SearchSpaceGenerator {
         mass: i64,
         lower_mass_tolerance_ppm: i64,
         upper_mass_tolerance_ppm: i64,
-        max_variable_modifications: i8,
-        ptms: &[PostTranslationalModification],
+        max_variable_modifications: usize,
+        ptms: &[Arc<PostTranslationalModification>],
     ) -> Result<()>
     where
         T: IsSearchSpace,
@@ -500,7 +572,7 @@ impl SearchSpaceGenerator {
         let statically_modified_amino_acids = ptms
             .iter()
             .filter(|ptm| ptm.is_static())
-            .map(|ptm| *ptm.get_amino_acid().get_code())
+            .map(|ptm| ptm.amino_acid().code())
             .collect::<HashSet<char>>();
 
         let mut decoy_part_ctr: usize = 0;
@@ -529,11 +601,11 @@ impl SearchSpaceGenerator {
                 .map(|ptm| {
                     let part = DecoyPart::new(
                         decoy_part_ctr,
-                        *ptm.get_amino_acid().get_code(),
-                        mass_to_int(*ptm.get_amino_acid().get_mono_mass()), // need to convert it here as we use the amino acid representation from omicstools, not from MaCPepDB
-                        Some(ptm.get_mod_type().clone()),
-                        ptm.get_position().clone(),
-                        mass_to_int(*ptm.get_mass_delta()),
+                        ptm.amino_acid().code(),
+                        ptm.amino_acid().mono_mass(),
+                        Some(ptm.mod_type().clone()),
+                        ptm.position().clone(),
+                        ptm.mass_delta(),
                     );
                     decoy_part_ctr += 1;
                     part
@@ -542,13 +614,13 @@ impl SearchSpaceGenerator {
 
         let static_n_terminus_modification =
             match ptms.iter().find(|ptm| ptm.is_n_bond() && ptm.is_static()) {
-                Some(ptm) => mass_to_int(*ptm.get_mass_delta()),
+                Some(ptm) => ptm.mass_delta(),
                 None => 0,
             };
 
         let static_c_terminus_modification =
             match ptms.iter().find(|ptm| ptm.is_c_bond() && ptm.is_static()) {
-                Some(ptm) => mass_to_int(*ptm.get_mass_delta()),
+                Some(ptm) => ptm.mass_delta(),
                 None => 0,
             };
 
@@ -598,7 +670,9 @@ impl SearchSpaceGenerator {
                 }
             }
             if let Some(ref decoy_cache) = decoy_cache {
-                decoy_cache.cache(vec![(sequence.clone(), 0)]).await?;
+                let seqeunce = PeptideSequence::try_from(sequence.as_str())
+                    .map_err(|err| Error::Sequence(Box::new(err)))?;
+                decoy_cache.cache(vec![(seqeunce, 0)]).await?;
             }
             fasta.add_decoys(sequence).await?;
             if fasta.decoy_count() == needed_decoys {
@@ -615,9 +689,10 @@ impl SearchSpaceGenerator {
         mass: i64,
         lower_mass_tolerance: i64,
         upper_mass_tolerance: i64,
-        max_variable_modifications: i8,
-        ptms: &[PostTranslationalModification],
+        max_variable_modifications: usize,
+        ptms: &[Arc<PostTranslationalModification>],
         decoys_per_peptide: usize,
+        concurrent_searches: NonZeroUsize,
     ) -> Result<()>
     where
         T: IsSearchSpace,
@@ -630,11 +705,12 @@ impl SearchSpaceGenerator {
                     mass,
                     lower_mass_tolerance,
                     upper_mass_tolerance,
-                    max_variable_modifications as i16,
+                    max_variable_modifications,
                     None,
                     None,
                     None,
                     ptms,
+                    concurrent_searches,
                     None,
                 )
                 .await;
@@ -662,11 +738,12 @@ impl SearchSpaceGenerator {
                         mass,
                         lower_mass_tolerance,
                         upper_mass_tolerance,
-                        max_variable_modifications as i16,
+                        max_variable_modifications,
                         None, // Not applicable for decoys
                         None, // Not applicable for decoys
                         None, // Not applicable for decoys
                         ptms,
+                        concurrent_searches,
                         Some(needed_decoys),
                     )
                     .await;

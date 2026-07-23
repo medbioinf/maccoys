@@ -208,12 +208,12 @@ impl TryInto<DataFrame> for PeptideSpectrumMatchCollection {
 
     fn try_into(self) -> Result<DataFrame, Self::Error> {
         let mut precusor_mz: Vec<f64> = Vec::with_capacity(self.len());
-        let mut precusor_charge: Vec<i16> = Vec::with_capacity(self.len());
+        let mut precusor_charge: Vec<u8> = Vec::with_capacity(self.len());
         let mut precursor_da: Vec<f64> = Vec::with_capacity(self.len());
         for precursor in self.precursor_col.into_iter() {
             precursor_da.push(precursor.to_dalton());
             precusor_mz.push(precursor.mz());
-            precusor_charge.push(precursor.charge() as i16);
+            precusor_charge.push(precursor.charge());
         }
 
         let scan_id_series = Column::new("scan_id".into(), self.scan_id_col);

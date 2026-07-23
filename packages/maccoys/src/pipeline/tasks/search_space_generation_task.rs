@@ -7,8 +7,9 @@ use std::{
     },
 };
 
-use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
-use macpepdb::mass::convert::to_int as mass_to_int;
+use macpepdb::{
+    mass::to_int as mass_to_int, post_translational_modification::PostTranslationalModification,
+};
 use metrics::counter;
 use tracing::{error, info};
 
@@ -77,7 +78,7 @@ impl SearchSpaceGenerationTask {
     {
         let mut last_search_uuid = String::new();
         let mut current_search_params = SearchParameters::new();
-        let mut current_ptms: Vec<PostTranslationalModification> = Vec::new();
+        let mut current_ptms: Vec<Arc<PostTranslationalModification>> = Vec::new();
         let mut metrics_counter_name = COUNTER_PREFIX.to_string();
 
         'message_loop: loop {
@@ -159,6 +160,7 @@ impl SearchSpaceGenerationTask {
 
                 let search_space_generator = match SearchSpaceGenerator::new(
                     &config.target_url,
+                    config.search_type,
                     config.decoy_url.clone(),
                     config.target_lookup_url.clone(),
                     config.decoy_cache_url.clone(),
@@ -184,8 +186,9 @@ impl SearchSpaceGenerationTask {
                         current_search_params.lower_mass_tolerance_ppm,
                         current_search_params.upper_mass_tolerance_ppm,
                         current_search_params.max_variable_modifications,
-                        &current_ptms,
+                        current_ptms.as_slice(),
                         current_search_params.decoys_per_peptide,
+                        config.concurrent_searches,
                     )
                     .await
                 {

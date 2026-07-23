@@ -7,9 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use dihardts_omicstools::proteomics::post_translational_modifications::PostTranslationalModification;
 use http::StatusCode;
-use macpepdb::functions::post_translational_modification::PTMCollection;
+use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
 use serde_json::Value as JsonValue;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
@@ -226,7 +225,7 @@ impl RemotePipelineWebApi {
         // Manifest files
         let uuid = Uuid::new_v4().to_string();
         let mut search_params: Option<SearchParameters> = None;
-        let mut ptms: Vec<PostTranslationalModification> = Vec::new();
+        let mut ptms: Vec<Arc<PostTranslationalModification>> = Vec::new();
         let mut mzml_file_names: Vec<String> = Vec::new();
 
         while let Ok(Some(field)) = payload.next_field().await {
@@ -278,18 +277,15 @@ impl RemotePipelineWebApi {
 
                 ptms = reader
                     .into_deserialize::<PostTranslationalModification>()
-                    .map(|ptm_result| match ptm_result {
-                        Ok(ptm) => Ok(ptm),
-                        Err(e) => Err(anyhow::Error::new(e)),
-                    })
-                    .collect::<Result<Vec<PostTranslationalModification>>>()?;
+                    .map(|ptm_result| ptm_result.map(Arc::new).map_err(anyhow::Error::new))
+                    .collect::<Result<Vec<Arc<PostTranslationalModification>>>>()?;
             }
         }
 
         if !ptms.is_empty() {
             // validate PTMs
-            let _ =
-                PTMCollection::new(&ptms).map_err(|e| anyhow!("Error validating PTMs: {:?}", e))?;
+            let _ = PTMCollection::new(ptms.clone())
+                .map_err(|e| anyhow!("Error validating PTMs: {:?}", e))?;
         } else {
             warn!("Not PTMs submitted, which is unusual")
         }
@@ -297,10 +293,10 @@ impl RemotePipelineWebApi {
         for ptm in ptms.iter() {
             debug!(
                 "PTM: {}, {}, {:?}, {:?}",
-                ptm.get_amino_acid().get_code(),
-                ptm.get_mass_delta(),
-                ptm.get_position(),
-                ptm.get_mod_type()
+                ptm.amino_acid().code(),
+                ptm.mass_delta(),
+                ptm.position(),
+                ptm.mod_type()
             );
         }
 

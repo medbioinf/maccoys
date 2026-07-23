@@ -9,7 +9,7 @@ use dihardts_omicstools::proteomics::post_translational_modifications::Modificat
 use dihardts_omicstools::proteomics::post_translational_modifications::Position as ModificationPosition;
 use fancy_regex::Regex;
 use futures::Stream;
-use macpepdb::chemistry::molecule::WATER_MONO_MASS;
+use macpepdb::molecules::WATER_MONO_MASS;
 use rand::{thread_rng, Rng};
 
 // internal imports
@@ -118,7 +118,7 @@ impl DecoyGenerator {
         lower_mass_tolerance_ppm: i64,
         min_decoy_length: usize,
         max_decoy_length: usize,
-        max_number_of_variable_modifications: i8,
+        max_number_of_variable_modifications: usize,
         max_number_of_missed_cleavages: i8,
         timeout: f64,
         annotate_modifications: bool,
@@ -131,7 +131,7 @@ impl DecoyGenerator {
         let max_number_of_missed_cleavages_u = max_number_of_missed_cleavages as usize;
         let mut rng = thread_rng();
         while start.elapsed().as_secs_f64() < timeout {
-            let mut mass = *WATER_MONO_MASS
+            let mut mass = WATER_MONO_MASS
                 + self.static_n_terminus_modification
                 + self.static_c_terminus_modification;
             let mut sequence: Vec<&DecoyPart> = Vec::new();
@@ -296,7 +296,7 @@ impl DecoyGenerator {
         upper_mass_tolerance_ppm: i64,
         min_decoy_length: usize,
         max_decoy_length: usize,
-        max_number_of_variable_modifications: i8,
+        max_number_of_variable_modifications: usize,
         max_number_of_missed_cleavages: i8,
         timeout: f64,
         annotate_modifications: bool,
@@ -348,7 +348,7 @@ impl DecoyGenerator {
         upper_mass_tolerance_ppm: i64,
         min_decoy_length: usize,
         max_decoy_length: usize,
-        max_number_of_variable_modifications: i8,
+        max_number_of_variable_modifications: usize,
         max_number_of_missed_cleavages: i8,
         timeout: f64,
         annotate_modifications: bool,
