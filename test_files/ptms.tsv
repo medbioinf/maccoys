@@ -1,0 +1,3 @@
+name	amino_acid	mass_delta	mod_type	position
+Carbamidomethylation	C	57.021464	Static	Anywhere
+Oxidation	M	15.994915	Variable	Anywhere
