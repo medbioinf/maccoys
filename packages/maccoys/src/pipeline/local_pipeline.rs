@@ -309,55 +309,54 @@ where
             .init_search(&uuid, search_params.clone(), ptms.as_slice())
             .await?;
 
-        let corrected_uuid = uuid.clone().replace('-', "_");
         if let Some(tui) = tui {
             tui.add_metric(MetricConfig::rate(
-                IndexingTask::get_counter_name(&corrected_uuid),
+                IndexingTask::get_counter_name(&uuid),
                 "Indexing rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                SearchSpaceGenerationTask::get_counter_name(&corrected_uuid),
+                SearchSpaceGenerationTask::get_counter_name(&uuid),
                 "Search spaces generation rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                IdentificationTask::get_counter_name(&corrected_uuid),
+                IdentificationTask::get_counter_name(&uuid),
                 "Identification rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                ScoringTask::get_counter_name(&corrected_uuid),
+                ScoringTask::get_counter_name(&uuid),
                 "Scoring rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                PublicationTask::get_counter_name(&corrected_uuid),
+                PublicationTask::get_counter_name(&uuid),
                 "Publication rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                ErrorTask::get_counter_name(&corrected_uuid),
+                ErrorTask::get_counter_name(&uuid),
                 "Error rate",
             ));
 
             tui.add_metric(MetricConfig::counter(
-                IndexingTask::get_counter_name(&corrected_uuid),
+                IndexingTask::get_counter_name(&uuid),
                 "Indexed runs",
             ));
             tui.add_metric(MetricConfig::counter(
-                SearchSpaceGenerationTask::get_counter_name(&corrected_uuid),
+                SearchSpaceGenerationTask::get_counter_name(&uuid),
                 "Search spaces generated",
             ));
             tui.add_metric(MetricConfig::counter(
-                IdentificationTask::get_counter_name(&corrected_uuid),
+                IdentificationTask::get_counter_name(&uuid),
                 "Identified spectra",
             ));
             tui.add_metric(MetricConfig::counter(
-                ScoringTask::get_counter_name(&corrected_uuid),
+                ScoringTask::get_counter_name(&uuid),
                 "Scored PSM distributions",
             ));
             tui.add_metric(MetricConfig::counter(
-                PublicationTask::get_counter_name(&corrected_uuid),
+                PublicationTask::get_counter_name(&uuid),
                 "Publicated results",
             ));
             tui.add_metric(MetricConfig::counter(
-                ErrorTask::get_counter_name(&corrected_uuid),
+                ErrorTask::get_counter_name(&uuid),
                 "Errors",
             ));
         }
@@ -422,14 +421,12 @@ where
         }
 
         if let Some(tui) = tui {
-            tui.remove_metric(IndexingTask::get_counter_name(&corrected_uuid).as_str());
-            tui.remove_metric(
-                SearchSpaceGenerationTask::get_counter_name(&corrected_uuid).as_str(),
-            );
-            tui.remove_metric(IdentificationTask::get_counter_name(&corrected_uuid).as_str());
-            tui.remove_metric(ScoringTask::get_counter_name(&corrected_uuid).as_str());
-            tui.remove_metric(PublicationTask::get_counter_name(&corrected_uuid).as_str());
-            tui.remove_metric(ErrorTask::get_counter_name(&corrected_uuid).as_str());
+            tui.remove_metric(IndexingTask::get_counter_name(&uuid).as_str());
+            tui.remove_metric(SearchSpaceGenerationTask::get_counter_name(&uuid).as_str());
+            tui.remove_metric(IdentificationTask::get_counter_name(&uuid).as_str());
+            tui.remove_metric(ScoringTask::get_counter_name(&uuid).as_str());
+            tui.remove_metric(PublicationTask::get_counter_name(&uuid).as_str());
+            tui.remove_metric(ErrorTask::get_counter_name(&uuid).as_str());
         }
 
         Ok(())
