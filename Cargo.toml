@@ -75,3 +75,7 @@ xxhash-rust = "0.8.15"
 maccoys = { path = "packages/maccoys" }
 maccoys-frontend = { path = "packages/frontend" }
 maccoys-exchange-entities = { path = "packages/exchange" }
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
