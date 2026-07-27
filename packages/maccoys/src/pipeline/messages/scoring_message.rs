@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    peptide_spectrum_match::PeptideSpectrumMatch, pipeline::errors::pipeline_error::PipelineError,
+    peptide_spectrum_match::{PeptideSpectrumMatch, PeptideSpectrumMatchCollection},
+    pipeline::errors::pipeline_error::PipelineError,
     precursor::Precursor,
 };
 
@@ -28,7 +29,7 @@ pub struct ScoringMessage {
     /// Precursor (m/z, charge) used for generating the search space
     precursor: Precursor,
     /// PSMs
-    psms: DataFrame,
+    psms: PeptideSpectrumMatchCollection,
 }
 
 impl ScoringMessage {
@@ -39,7 +40,7 @@ impl ScoringMessage {
         ms_run_name: String,
         spectrum_id: String,
         precursor: Precursor,
-        psms: DataFrame,
+        psms: PeptideSpectrumMatchCollection,
     ) -> Self {
         Self {
             uuid,
@@ -75,13 +76,13 @@ impl ScoringMessage {
 
     /// Get the PSMs
     ///
-    pub fn psms(&self) -> &DataFrame {
+    pub fn psms(&self) -> &PeptideSpectrumMatchCollection {
         &self.psms
     }
 
     /// get PSMs mutable
     ///
-    pub fn psms_mut(&mut self) -> &mut DataFrame {
+    pub fn psms_mut(&mut self) -> &mut PeptideSpectrumMatchCollection {
         &mut self.psms
     }
 
@@ -101,7 +102,7 @@ impl ScoringMessage {
 
         ParquetWriter::new(&mut content)
             .with_compression(ParquetCompression::Zstd(None))
-            .finish(&mut self.psms)
+            .finish(self.psms.values_mut())
             .unwrap();
 
         Ok(PublicationMessage::new(

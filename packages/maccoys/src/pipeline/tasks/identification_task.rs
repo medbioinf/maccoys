@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     fs,
     path::PathBuf,
     sync::{
@@ -17,7 +16,9 @@ use xcorrrs::{
 };
 
 use crate::{
-    peptide_spectrum_match::{PeptideSpectrumMatch, PeptideSpectrumMatchCollection},
+    peptide_spectrum_match::{
+        PeptideSpectrumMatchCollection, PeptideSpectrumMatchCollectionBuilder,
+    },
     pipeline::{
         configuration::{
             IdentificationTaskConfiguration, SearchParameters,
@@ -165,7 +166,7 @@ impl IdentificationTask {
                 message.precursor(),
                 peptides,
                 config.threads,
-                None,
+                Some(current_search_params.score_threshold),
             ) {
                 Ok(psms) => psms,
                 Err(e) => {
@@ -329,8 +330,12 @@ pub fn run_xcorr_search(
 ) -> Result<PeptideSpectrumMatchCollection, IdentificationError> {
     let score_threshold = score_threshold.unwrap_or(f64::NEG_INFINITY);
 
-    let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollection>> = Arc::new(Mutex::new(
-        PeptideSpectrumMatchCollection::with_capacity(peptides.len()),
+    let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollectionBuilder>> = Arc::new(Mutex::new(
+        PeptideSpectrumMatchCollectionBuilder::with_capacity(
+            scan_id.to_string(),
+            precursor.clone(),
+            peptides.len(),
+        ),
     ));
 
     let xcorrer = FastXcorr::new(config, experimental_spectrum, precursor.charge() as usize)
@@ -349,14 +354,8 @@ pub fn run_xcorr_search(
             .for_each(|peptide| match xcorrer.xcorr_peptide(&peptide) {
                 Ok(scoring_result) => {
                     if scoring_result.score >= score_threshold {
-                        let psm = PeptideSpectrumMatch::new(
-                            Cow::Owned(scan_id.to_string()),
-                            Cow::Owned(peptide),
-                            Cow::Owned(precursor.clone()),
-                            scoring_result,
-                        );
                         let mut guard = psm_collection.lock().unwrap();
-                        guard.push(psm);
+                        guard.push(peptide, scoring_result);
                     }
                 }
                 Err(e) => {
@@ -381,7 +380,7 @@ pub fn run_xcorr_search(
         .map_err(|_| IdentificationError::MutexLockError("Errors".to_string()))?;
 
     if errors.is_empty() {
-        Ok(psm_collect)
+        Ok(psm_collect.try_into()?)
     } else {
         error!("Errors occurred during XCorr search:");
         for e in errors.iter() {

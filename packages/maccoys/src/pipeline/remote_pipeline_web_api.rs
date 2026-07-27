@@ -265,15 +265,15 @@ impl RemotePipelineWebApi {
 
             // Optional PTMs
             if field_name == "ptms" {
-                let ptm_csv = match field.bytes().await {
+                let ptm_tsv = match field.bytes().await {
                     Ok(csv) => Cursor::new(csv),
                     Err(err) => return Err(anyhow!("Error reading PTMs field: {:?}", err).into()),
                 };
 
                 let reader = csv::ReaderBuilder::new()
                     .has_headers(true)
-                    .delimiter(b',')
-                    .from_reader(ptm_csv);
+                    .delimiter(b'\t')
+                    .from_reader(ptm_tsv);
 
                 ptms = reader
                     .into_deserialize::<PostTranslationalModification>()

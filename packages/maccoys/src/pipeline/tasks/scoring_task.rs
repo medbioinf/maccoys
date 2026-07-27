@@ -13,17 +13,20 @@ use polars::prelude::*;
 use signal_hook::{consts::SIGINT, iterator::Signals};
 use tracing::{debug, error, info, warn};
 
-use crate::pipeline::{
-    configuration::StandaloneScoringConfiguration,
-    errors::{pipeline_error::PipelineError, scoring_error::ScoringError},
-    messages::{
-        error_message::ErrorMessage,
-        is_message::IsMessage,
-        publication_message::PublicationMessage,
-        scoring_message::{IntoPublicationMessageError, ScoringMessage},
+use crate::{
+    peptide_spectrum_match::PeptideSpectrumMatchCollection,
+    pipeline::{
+        configuration::StandaloneScoringConfiguration,
+        errors::{pipeline_error::PipelineError, scoring_error::ScoringError},
+        messages::{
+            error_message::ErrorMessage,
+            is_message::IsMessage,
+            publication_message::PublicationMessage,
+            scoring_message::{IntoPublicationMessageError, ScoringMessage},
+        },
+        queue::{HttpPipelineQueue, PipelineQueue},
+        utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
     },
-    queue::{HttpPipelineQueue, PipelineQueue},
-    utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
 };
 
 use super::task::Task;
@@ -70,7 +73,7 @@ impl ScoringTask {
         publish_queue: Arc<P>,
         error_queue: Arc<E>,
         stop_flag: Arc<AtomicBool>,
-        threads: usize,
+        _threads: usize,
     ) where
         S: PipelineQueue<ScoringMessage> + Send + Sync + 'static,
         P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
@@ -102,7 +105,7 @@ impl ScoringTask {
                 message.uuid(),
                 message.ms_run_name(),
                 message.spectrum_id(),
-                message.psms().height()
+                message.psms().len()
             );
 
             let metrics_counter_name = Self::get_counter_name(message.uuid());
@@ -143,35 +146,8 @@ impl ScoringTask {
                 }
             }
 
-            let feature_df = match message.psms().select(FEATURES) {
-                Ok(feature_df) => feature_df,
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(ScoringError::PolarsError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
-
-            let feature_array = match feature_df.to_ndarray::<Float64Type>(IndexOrder::C) {
-                Ok(feature_array) => feature_array,
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(ScoringError::PolarsError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
-
-            let loop_score = match local_outlier_probabilities(
-                &feature_array,
-                N_NEIGHBORS,
-                3,
-                None,
-                Some(threads),
-            ) {
+            let loop_score = match local_outlier_probabilities(message.psms(), N_NEIGHBORS, 3, None)
+            {
                 Ok(loop_score) => loop_score,
                 Err(err) => {
                     let error_message =
@@ -188,7 +164,8 @@ impl ScoringTask {
 
             match message
                 .psms_mut()
-                .with_column(Series::new(LOOP_COL_NAME.into(), loop_score))
+                .values_mut()
+                .with_column(Column::new(LOOP_COL_NAME.into(), loop_score))
             {
                 Ok(_) => {}
                 Err(e) => {
@@ -208,7 +185,7 @@ impl ScoringTask {
                 message.uuid(),
                 message.ms_run_name(),
                 message.spectrum_id(),
-                message.psms().height()
+                message.psms().len()
             );
 
             let metrics_path = create_metrics_file_path_on_precursor_level(
@@ -320,19 +297,21 @@ impl Task for ScoringTask {
 /// # Arguments
 /// * `psms` - The PSMs to calculate the features for
 ///
-fn calc_features(psms: &mut DataFrame) -> Result<(), ScoringError> {
-    let ions_matches = psms.column("ions_matched")?.cast(&DataType::Float64)?;
-    let ions_total = psms.column("ions_total")?.cast(&DataType::Float64)?;
+fn calc_features(psms: &mut PeptideSpectrumMatchCollection) -> Result<(), ScoringError> {
+    let experimental_mass = psms.experimental_mass();
+    let values = psms.values_mut();
+    let ions_matches = values.column("ions_matched")?.cast(&DataType::Float64)?;
+    let ions_total = values.column("ions_total")?.cast(&DataType::Float64)?;
     let ions_matched_ratio =
         (ions_matches / ions_total)?.with_name(IONS_MATCHED_RATIO_COL_NAME.into());
 
-    let experimental_mass = psms.column("experimental_mass")?;
-    let theoretical_mass = psms.column("theoretical_mass")?;
-    let mass_error = abs((experimental_mass - theoretical_mass)?.as_materialized_series())?
-        .with_name(MASS_ERROR_COL_NAME.into());
+    let theoretical_mass = values.column("theoretical_mass")?;
+    let mass_error = abs((theoretical_mass - experimental_mass).as_materialized_series())?
+        .with_name(MASS_ERROR_COL_NAME.into())
+        .into_column();
 
-    psms.with_column(ions_matched_ratio)?;
-    psms.with_column(mass_error)?;
+    values.with_column(ions_matched_ratio)?;
+    values.with_column(mass_error)?;
 
     Ok(())
 }
@@ -340,8 +319,10 @@ fn calc_features(psms: &mut DataFrame) -> Result<(), ScoringError> {
 #[cfg(test)]
 mod tests {
 
+    use macpepdb::mass::PROTON_MASS_DA;
+
     use super::*;
-    use crate::constants::COMET_SEPARATOR;
+    use crate::{constants::COMET_SEPARATOR, precursor::Precursor};
 
     #[test]
     fn test_calculate_features() {
@@ -353,7 +334,7 @@ mod tests {
             .join("test_files")
             .join("well_separated_psms.tsv");
 
-        let mut psms = CsvReadOptions::default()
+        let psms = CsvReadOptions::default()
             .with_has_header(true)
             .with_parse_options(
                 CsvParseOptions::default().with_separator(COMET_SEPARATOR.as_bytes()[0]),
@@ -363,12 +344,24 @@ mod tests {
             .finish()
             .unwrap();
 
+        let scan_id = psms["scan"].u32().unwrap().first().unwrap().to_string();
+        let experimental_mass = psms["exp_neutral_mass"].f64().unwrap().first().unwrap();
+        let charge = psms["charge"].u8().unwrap().first().unwrap();
+
+        let mz = (experimental_mass + charge as f64 * PROTON_MASS_DA) / charge as f64;
+        let precursor = Precursor::new(mz, charge);
+
+        let mut psms =
+            PeptideSpectrumMatchCollection::new(scan_id, precursor, experimental_mass, psms);
+
         calc_features(&mut psms).unwrap();
 
         assert!(psms
+            .values()
             .get_column_names()
             .contains(&&PlSmallStr::from(FEATURES[1])));
         assert!(psms
+            .values()
             .get_column_names()
             .contains(&&PlSmallStr::from(FEATURES[2])));
     }

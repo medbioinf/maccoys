@@ -30,4 +30,8 @@ impl Precursor {
     pub fn to_dalton(&self) -> f64 {
         mass_to_charge_to_dalton(self.mz, self.charge)
     }
+
+    pub fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }

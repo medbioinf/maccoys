@@ -50,15 +50,15 @@ polars = { workspace = true, features = [
     "lazy",
     "ndarray",
     "parquet",
-    "strings",
+    "polars-io",
     "serde",
-    "dtype-u8"
+    "strings",
+    "temporal"
 ] }
 postcard = { workspace = true, features = ["alloc"] }
 rand = { workspace = true }
 rayon = { workspace = true }
 reqwest = { workspace = true, features = [
-
     "blocking",
     "json",
     "stream",

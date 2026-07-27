@@ -7,7 +7,7 @@ use polars::frame::DataFrame as PlDataFrame;
 pub fn DataFrame(dataframe: PlDataFrame) -> Element {
     rsx! {
         div { class: "dataframe",
-            for (col_idx , col) in dataframe.get_columns().iter().enumerate() {
+            for (col_idx , col) in dataframe.columns().iter().enumerate() {
                 div {
                     class: "dataframe-cell dataframe-head",
                     style: "grid-column: {col_idx + 1} / span 1; grid-row: 1 / span 1",

@@ -185,7 +185,7 @@ pub fn Spectrum(search_uuid: String, ms_run_name: String, spectrum_id: String) -
                                 if let Some(goodness) = identification.get_goodnesses() {
                                     div {
                                         class: "dataframe mb-3",
-                                        for (col_idx, col) in goodness.get_columns().iter().enumerate() {
+                                        for (col_idx, col) in goodness.columns().iter().enumerate() {
                                             div {
                                                 class: "dataframe-cell dataframe-head",
                                                 style: "grid-column: {col_idx + 1} / span 1; grid-row: 1 / span 1",

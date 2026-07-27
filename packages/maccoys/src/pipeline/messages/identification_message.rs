@@ -128,7 +128,7 @@ impl IdentificationMessage {
     }
 
     /// Converts the message into a scoring message
-    ///  
+    ///
     /// # Arguments
     /// * `psms` - The PSMs to be used for scoring
     ///
@@ -141,8 +141,7 @@ impl IdentificationMessage {
             self.ms_run_name.clone(),
             self.spectrum_id.clone(),
             self.precursor.clone(),
-            psms.try_into()
-                .map_err(IdentificationError::PsmCollectionToDataFrameError)?,
+            psms,
         ))
     }
 }

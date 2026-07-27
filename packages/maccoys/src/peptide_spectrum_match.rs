@@ -1,11 +1,51 @@
-use std::{borrow::Cow, cmp::Ordering};
+use std::{borrow::Cow, io::Write};
 
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
-use polars::prelude::*;
+use local_outlier_probabilities::PointSource;
+use polars::{io::mmap::MmapBytesReader, prelude::*};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use xcorrrs::scoring_result::ScoringResult;
 
-use crate::precursor::Precursor;
+use crate::{pipeline::tasks::scoring_task::FEATURES as LOOP_FEATURES, precursor::Precursor};
+
+/// Key under which the [`PsmCollectionMetadata`] is stored in the parquet file's
+/// key-value metadata (footer), since `scan_id`/`precursor`/`experimental_mass`
+/// are not part of the columnar `values` DataFrame.
+///
+const PSM_METADATA_KEY: &str = "maccoys.psm_collection";
+
+/// Errors that can occur while reading/writing a [`PeptideSpectrumMatchCollection`]
+/// to/from a parquet file.
+///
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Polars error:\n\t{0}")]
+    Polars(#[from] polars::error::PolarsError),
+    #[error("Failed to read parquet input:\n\t{0}")]
+    Io(#[from] std::io::Error),
+    #[error("Failed to (de)serialize PSM collection metadata:\n\t{0}")]
+    Metadata(#[from] serde_json::Error),
+    #[error("Parquet file is missing metadata")]
+    MissingMetadata,
+    #[error("Parquet file is missing the `{PSM_METADATA_KEY}` key-value metadata entry")]
+    MissingPsmMetadata,
+    #[error("Parquet file is missing the `{PSM_METADATA_KEY}` key-value metadata value")]
+    MissingPsmMetadataValue,
+    #[error("Parquet file is missing column `{0}` or it has an unexpected data type")]
+    InvalidColumn(&'static str),
+}
+
+/// Scalar attributes of a [`PeptideSpectrumMatchCollection`] that are shared by
+/// every row and therefore stored once as parquet file-level metadata instead of
+/// as columns.
+///
+#[derive(Serialize, Deserialize)]
+struct PsmCollectionMetadata {
+    scan_id: String,
+    precursor: Precursor,
+    experimental_mass: f64,
+}
 
 /// Struct representing a peptide-spectrum match (PSM)
 ///
@@ -33,39 +73,6 @@ pub struct PeptideSpectrumMatch<'a> {
 }
 
 impl<'a> PeptideSpectrumMatch<'a> {
-    /// Creates a new PeptideSpectrumMatch
-    /// # Arguments
-    /// * `scan_id` - Scan ID
-    /// * `peptide` - Amino acid sequence of the peptide in ProForma format
-    /// * `precursor` - Precursor
-    /// * `scoreing_result` - Result of the scoring
-    ///
-    pub fn new(
-        scan_id: Cow<'a, str>,
-        peptide: Cow<'a, str>,
-        precursor: Cow<'a, Precursor>,
-        scoreing_result: ScoringResult,
-    ) -> Self {
-        let experimental_mass = mass_to_charge_to_dalton(precursor.mz(), precursor.charge());
-        Self {
-            scan_id,
-            peptide,
-            precursor,
-            experimental_mass,
-            xcorr: scoreing_result.score,
-            ions_total: scoreing_result.ions_total as u64,
-            ions_matched: scoreing_result.ions_matched as u64,
-            theoretical_mass: scoreing_result.min_theoretical_mass,
-            second_theoretical_mass: if scoreing_result.min_theoretical_mass
-                == scoreing_result.max_theoretical_mass
-            {
-                None
-            } else {
-                Some(scoreing_result.max_theoretical_mass)
-            },
-        }
-    }
-
     /// Returns the scan ID
     pub fn scan_id(&self) -> &str {
         &self.scan_id
@@ -102,46 +109,50 @@ impl<'a> PeptideSpectrumMatch<'a> {
     }
 }
 
-/// Collection of peptide-spectrum matches (PSMs) attributes.
-/// Each attribute is stored in a separate column (Vec).
-/// Which is easier to serialize and deserialize.
+/// Collection of peptide-spectrum matches (PSMs) for a single spectrum/precursor.
+/// Each per-PSM attribute that actually varies between peptide candidates is stored
+/// in its own column (Vec). `scan_id`, `precursor` and `experimental_mass` are
+/// identical for every PSM in the collection (one collection == one spectrum), so
+/// they're stored once instead of once per row.
 ///
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
-pub struct PeptideSpectrumMatchCollection {
-    #[serde(skip)]
-    inner_index: Vec<usize>,
-    #[serde(rename = "scan_id")]
-    scan_id_col: Vec<String>,
-    #[serde(rename = "peptide")]
+#[derive(Debug)]
+pub struct PeptideSpectrumMatchCollectionBuilder {
+    scan_id: String,
+    precursor: Precursor,
+    experimental_mass: f64,
     peptide_col: Vec<String>,
-    #[serde(rename = "precursor")]
-    precursor_col: Vec<Precursor>,
-    #[serde(rename = "experimental_mass")]
-    experimental_mass_col: Vec<f64>,
-    #[serde(rename = "xcorr")]
     xcorr_col: Vec<f64>,
-    #[serde(rename = "ions_total")]
     ions_total_col: Vec<u64>,
-    #[serde(rename = "ions_matched")]
     ions_matched_col: Vec<u64>,
-    #[serde(rename = "theoretical_mass")]
     theoretical_mass_col: Vec<f64>,
-    #[serde(rename = "second_theoretical_mass")]
     second_theoretical_mass_col: Vec<Option<f64>>,
 }
 
-impl PeptideSpectrumMatchCollection {
-    pub fn new() -> Self {
-        Self::default()
+impl PeptideSpectrumMatchCollectionBuilder {
+    /// Creates a new, empty collection for the given scan/precursor.
+    ///
+    /// # Arguments
+    /// * `scan_id` - Scan ID shared by every PSM in this collection
+    /// * `precursor` - Precursor shared by every PSM in this collection
+    ///
+    pub fn new(scan_id: String, precursor: Precursor) -> Self {
+        Self::with_capacity(scan_id, precursor, 0)
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
+    /// Creates a new, empty collection for the given scan/precursor with preallocated capacity.
+    ///
+    /// # Arguments
+    /// * `scan_id` - Scan ID shared by every PSM in this collection
+    /// * `precursor` - Precursor shared by every PSM in this collection
+    /// * `capacity` - Number of PSMs to preallocate space for
+    ///
+    pub fn with_capacity(scan_id: String, precursor: Precursor, capacity: usize) -> Self {
+        let experimental_mass = mass_to_charge_to_dalton(precursor.mz(), precursor.charge());
         Self {
-            inner_index: Vec::with_capacity(capacity),
-            scan_id_col: Vec::with_capacity(capacity),
+            scan_id,
+            precursor,
+            experimental_mass,
             peptide_col: Vec::with_capacity(capacity),
-            precursor_col: Vec::with_capacity(capacity),
-            experimental_mass_col: Vec::with_capacity(capacity),
             xcorr_col: Vec::with_capacity(capacity),
             ions_total_col: Vec::with_capacity(capacity),
             ions_matched_col: Vec::with_capacity(capacity),
@@ -150,101 +161,216 @@ impl PeptideSpectrumMatchCollection {
         }
     }
 
-    pub fn push(&mut self, psm: PeptideSpectrumMatch) {
-        self.inner_index.push(self.len());
-        self.scan_id_col.push(psm.scan_id.into_owned());
-        self.peptide_col.push(psm.peptide.into_owned());
-        self.precursor_col.push(psm.precursor.into_owned());
-        self.experimental_mass_col.push(psm.experimental_mass);
-        self.xcorr_col.push(psm.xcorr);
-        self.ions_total_col.push(psm.ions_total);
-        self.ions_matched_col.push(psm.ions_matched);
-        self.theoretical_mass_col.push(psm.theoretical_mass);
-        self.second_theoretical_mass_col
-            .push(psm.second_theoretical_mass);
+    /// Adds a PSM for the given peptide/scoring result to the collection.
+    ///
+    /// # Arguments
+    /// * `peptide` - Amino acid sequence of the peptide in ProForma format
+    /// * `scoring_result` - Result of the scoring
+    ///
+    pub fn push(&mut self, peptide: String, scoring_result: ScoringResult) {
+        self.peptide_col.push(peptide);
+        self.xcorr_col.push(scoring_result.score);
+        self.ions_total_col.push(scoring_result.ions_total as u64);
+        self.ions_matched_col
+            .push(scoring_result.ions_matched as u64);
+        self.theoretical_mass_col
+            .push(scoring_result.min_theoretical_mass);
+        self.second_theoretical_mass_col.push(
+            if scoring_result.min_theoretical_mass == scoring_result.max_theoretical_mass {
+                None
+            } else {
+                Some(scoring_result.max_theoretical_mass)
+            },
+        );
     }
 
     pub fn len(&self) -> usize {
-        self.scan_id_col.len()
+        self.peptide_col.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn get(&self, index: usize) -> Option<PeptideSpectrumMatch<'_>> {
-        if index >= self.len() {
-            return None;
-        }
-        let index = self.inner_index[index];
-        Some(PeptideSpectrumMatch {
-            scan_id: Cow::Borrowed(&self.scan_id_col[index]),
-            peptide: Cow::Borrowed(&self.peptide_col[index]),
-            precursor: Cow::Borrowed(&self.precursor_col[index]),
-            experimental_mass: self.experimental_mass_col[index],
-            xcorr: self.xcorr_col[index],
-            ions_total: self.ions_total_col[index],
-            ions_matched: self.ions_matched_col[index],
-            theoretical_mass: self.theoretical_mass_col[index],
-            second_theoretical_mass: self.second_theoretical_mass_col[index],
-        })
-    }
-
-    /// Sorts the PSMs by their Xcorr score in descending order
-    pub fn sort(&mut self) {
-        let mut indices = (0..self.len()).collect::<Vec<_>>();
-        indices.sort_by(|i, j| {
-            self.xcorr_col[*i]
-                .partial_cmp(&self.xcorr_col[*j])
-                .unwrap_or(Ordering::Equal)
-        });
-        indices.reverse();
-        self.inner_index = indices;
+        self.peptide_col.is_empty()
     }
 }
 
-impl TryInto<DataFrame> for PeptideSpectrumMatchCollection {
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+pub struct PeptideSpectrumMatchCollection {
+    scan_id: String,
+    precursor: Precursor,
+    experimental_mass: f64,
+    values: DataFrame,
+}
+
+impl PeptideSpectrumMatchCollection {
+    pub fn new(
+        scan_id: String,
+        precursor: Precursor,
+        experimental_mass: f64,
+        values: DataFrame,
+    ) -> Self {
+        Self {
+            scan_id,
+            precursor,
+            experimental_mass,
+            values,
+        }
+    }
+
+    pub fn scan_id(&self) -> &str {
+        &self.scan_id
+    }
+
+    pub fn precursor(&self) -> &Precursor {
+        &self.precursor
+    }
+
+    pub fn experimental_mass(&self) -> f64 {
+        self.experimental_mass
+    }
+
+    pub fn values(&self) -> &DataFrame {
+        &self.values
+    }
+
+    pub(crate) fn values_mut(&mut self) -> &mut DataFrame {
+        &mut self.values
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.height()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.height() == 0
+    }
+
+    pub fn estimated_size(&self) -> usize {
+        self.scan_id.len() + self.precursor.size() + self.values.estimated_size()
+    }
+
+    pub async fn write_parquet<W: Write + Send>(&mut self, writer: W) -> Result<(), Error> {
+        let metadata = PsmCollectionMetadata {
+            scan_id: self.scan_id.clone(),
+            precursor: self.precursor.clone(),
+            experimental_mass: self.experimental_mass,
+        };
+
+        let metadata = KeyValueMetadata::from_static(vec![(
+            PSM_METADATA_KEY.to_string(),
+            serde_json::to_string(&metadata)?,
+        )]);
+
+        ParquetWriter::new(writer)
+            .with_compression(ParquetCompression::Zstd(None))
+            .with_key_value_metadata(Some(metadata))
+            .finish(&mut self.values)
+            .unwrap();
+
+        Ok(())
+    }
+
+    pub async fn read_parquet<R: MmapBytesReader>(reader: R) -> Result<Self, Error> {
+        let mut parquet_reader = ParquetReader::new(reader);
+
+        let file_metadata = parquet_reader
+            .get_metadata()?
+            .key_value_metadata()
+            .as_ref()
+            .ok_or(Error::MissingMetadata)?;
+
+        let metadata = file_metadata
+            .iter()
+            .find(|elem| elem.key == PSM_METADATA_KEY)
+            .ok_or(Error::MissingPsmMetadata)?
+            .value
+            .as_ref()
+            .map(|value| serde_json::from_str::<PsmCollectionMetadata>(value))
+            .ok_or(Error::MissingPsmMetadataValue)??;
+
+        let values = parquet_reader.finish()?;
+
+        Ok(Self {
+            scan_id: metadata.scan_id,
+            precursor: metadata.precursor,
+            experimental_mass: metadata.experimental_mass,
+            values,
+        })
+    }
+}
+
+impl TryFrom<PeptideSpectrumMatchCollectionBuilder> for PeptideSpectrumMatchCollection {
     type Error = PolarsError;
 
-    fn try_into(self) -> Result<DataFrame, Self::Error> {
-        let mut precusor_mz: Vec<f64> = Vec::with_capacity(self.len());
-        let mut precusor_charge: Vec<u8> = Vec::with_capacity(self.len());
-        let mut precursor_da: Vec<f64> = Vec::with_capacity(self.len());
-        for precursor in self.precursor_col.into_iter() {
-            precursor_da.push(precursor.to_dalton());
-            precusor_mz.push(precursor.mz());
-            precusor_charge.push(precursor.charge());
-        }
-
-        let scan_id_series = Column::new("scan_id".into(), self.scan_id_col);
-        let peptide_series = Column::new("peptide".into(), self.peptide_col);
-        let charge_series = Column::new("charge".into(), precusor_charge);
-        let precursor_mz_series = Column::new("precursor_mz".into(), precusor_mz);
-        let precursor_da_series = Column::new("precursor_da".into(), precursor_da);
-        let experimental_mass_series =
-            Column::new("experimental_mass".into(), self.experimental_mass_col);
-        let xcorr_series = Column::new("xcorr".into(), self.xcorr_col);
-        let ions_total_series = Column::new("ions_total".into(), self.ions_total_col);
-        let ions_matched_series = Column::new("ions_matched".into(), self.ions_matched_col);
+    fn try_from(builder: PeptideSpectrumMatchCollectionBuilder) -> Result<Self, Self::Error> {
+        let len = builder.len();
+        let peptide_series = Column::new("peptide".into(), builder.peptide_col);
+        let xcorr_series = Column::new("xcorr".into(), builder.xcorr_col);
+        let ions_total_series = Column::new("ions_total".into(), builder.ions_total_col);
+        let ions_matched_series = Column::new("ions_matched".into(), builder.ions_matched_col);
         let min_theoretical_mass_series =
-            Column::new("theoretical_mass".into(), self.theoretical_mass_col);
+            Column::new("theoretical_mass".into(), builder.theoretical_mass_col);
         let max_theoretical_mass_series = Column::new(
             "second_theoretical_mass".into(),
-            self.second_theoretical_mass_col,
+            builder.second_theoretical_mass_col,
         );
 
-        DataFrame::new(vec![
-            scan_id_series,
-            peptide_series,
-            charge_series,
-            precursor_mz_series,
-            precursor_da_series,
-            experimental_mass_series,
-            xcorr_series,
-            ions_total_series,
-            ions_matched_series,
-            min_theoretical_mass_series,
-            max_theoretical_mass_series,
-        ])
+        let dataframe = DataFrame::new(
+            len,
+            vec![
+                peptide_series,
+                xcorr_series,
+                ions_total_series,
+                ions_matched_series,
+                min_theoretical_mass_series,
+                max_theoretical_mass_series,
+            ],
+        )?;
+
+        Ok(PeptideSpectrumMatchCollection {
+            scan_id: builder.scan_id,
+            precursor: builder.precursor,
+            experimental_mass: builder.experimental_mass,
+            values: dataframe,
+        })
+    }
+}
+
+impl PointSource<f64> for PeptideSpectrumMatchCollection {
+    fn len(&self) -> usize {
+        self.values.height()
+    }
+
+    fn dim(&self) -> usize {
+        LOOP_FEATURES.len()
+    }
+
+    fn point(
+        &self,
+        idx: usize,
+    ) -> Result<Cow<'_, [f64]>, local_outlier_probabilities::error::Error> {
+        let loop_feature_values = self.values.select(LOOP_FEATURES).map_err(|err| {
+            local_outlier_probabilities::error::Error::PointExtraction(format!(
+                "Unable to select local outlier probability features {:?}: {}",
+                LOOP_FEATURES, err
+            ))
+        })?;
+
+        let row = loop_feature_values.get_row(idx).map_err(|err| {
+            local_outlier_probabilities::error::Error::PointExtraction(err.to_string())
+        })?;
+
+        let values = row
+            .0
+            .iter()
+            .map(|value| {
+                value.extract::<f64>().ok_or_else(|| {
+                    local_outlier_probabilities::error::Error::PointExtraction(format!(
+                        "could not cast {value:?} to f64"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<f64>, local_outlier_probabilities::error::Error>>()?;
+
+        Ok(Cow::Owned(values))
     }
 }

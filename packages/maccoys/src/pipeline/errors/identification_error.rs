@@ -36,8 +36,8 @@ pub enum IdentificationError {
     // Saving the error as string avoid some send+sync issues with boxed dyn errors
     #[error("Error during xcorring:\n\t{0}")]
     XcorrError(String),
-    #[error("Cannot convert PSM collection to DataFrame:\n\t{0}")]
-    PsmCollectionToDataFrameError(polars::error::PolarsError),
+    #[error("Cannot finalize PSM collection:\n\t{0}")]
+    PsmCollectionCollectionFinalization(#[from] polars::error::PolarsError),
 }
 
 impl From<XcorrError> for IdentificationError {

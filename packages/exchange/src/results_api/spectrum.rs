@@ -47,7 +47,7 @@ impl Identification {
     ///
     /// TODO: Error handling. Urgent.
     pub fn get_score_histogram(&self) -> Option<(Vec<f64>, Vec<usize>)> {
-        let score = &self.psms.as_ref()?["xcorr"].as_materialized_series();
+        let score = self.psms.as_ref()?["xcorr"].as_materialized_series();
 
         // rule of sturges to determine number of bins
         let num_bins = (1.0 + (score.len() as f64).log2()).round() as usize;
@@ -66,7 +66,7 @@ impl Identification {
         // Calculate histogram counts
         let mut histogram: Vec<usize> = vec![0; num_bins];
 
-        for val in score.f64().unwrap() {
+        for val in score.f64().unwrap().iter() {
             let val = val.unwrap();
             for (i, &bin) in bins.iter().enumerate().skip(1) {
                 if val <= bin {

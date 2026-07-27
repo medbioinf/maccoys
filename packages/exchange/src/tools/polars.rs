@@ -56,14 +56,14 @@ impl<'a> RowIter<'a> {
     pub fn new(dataframe: &'a DataFrame) -> Self {
         let col_index = Rc::new(
             dataframe
-                .get_columns()
+                .columns()
                 .iter()
                 .enumerate()
                 .map(|(i, col)| (col.name().to_string(), i))
                 .collect::<HashMap<String, usize>>(),
         );
         let col_iterators = dataframe
-            .get_columns()
+            .columns()
             .iter()
             .map(|col| col.as_materialized_series().iter())
             .collect::<Vec<SeriesIter<'_>>>();
