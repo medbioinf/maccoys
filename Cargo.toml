@@ -28,7 +28,6 @@ indicatif = "0.17.7"
 itertools = "0.13.0"
 lazy_static = "1.4.0"
 local-outlier-probabilities = "1.2.0"
-#local-outlier-probabilities = { version = "1.2.1", features = ["parallel"] }
 macpepdb = { path = "../macpepdb/packages/macpepdb" }
 macpepdb_metrics_peek = { path = "../macpepdb/packages/metrics-peek" }
 macpepdb_tui = { path = "../macpepdb/packages/tui" }
@@ -48,7 +47,6 @@ rand = "0.8.5"
 rayon = "1.11.0"
 reqwest = "0.12.8"
 rustis = "0.13.3"
-scylla = "0.8.1"
 serde = "1.0.219"
 serde_json = "1.0.143"
 serial_test = "3.2.0"
