@@ -39,6 +39,31 @@ use tracing::{debug, info};
 use maccoys::functions::post_process;
 use maccoys::web::results_api::Server as ResultApiServer;
 
+// Allocator
+// jemalloc
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+// mimalloc
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+// tcmalloc
+#[cfg(feature = "tcmalloc")]
+use tcmalloc2::TcMalloc;
+
+#[cfg(feature = "tcmalloc")]
+#[global_allocator]
+static GLOBAL: TcMalloc = TcMalloc;
+
 static DEFAULT_LOKI_TRACING_LABEL_VALUE: &str = "general";
 
 #[derive(Debug, Subcommand)]
