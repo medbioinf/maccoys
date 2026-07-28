@@ -3820,12 +3820,13 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "local-outlier-probabilities"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06b5e70a9127e80356ec37ed2789f4ee83903111f016060bf25098f0571da9f7"
+checksum = "7e7fafb29fac4ed438e8883e7c07d7204ee58eba58d14cd0b65ad1446321470f"
 dependencies = [
  "kdtree",
  "num-traits",
+ "rayon",
  "thiserror 2.0.19",
 ]
 

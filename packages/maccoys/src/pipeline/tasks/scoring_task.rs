@@ -73,12 +73,17 @@ impl ScoringTask {
         publish_queue: Arc<P>,
         error_queue: Arc<E>,
         stop_flag: Arc<AtomicBool>,
-        _threads: usize,
+        threads: usize,
     ) where
         S: PipelineQueue<ScoringMessage> + Send + Sync + 'static,
         P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
         E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
     {
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+
         'message_loop: loop {
             if stop_flag.load(Ordering::Relaxed) {
                 break;
@@ -146,7 +151,8 @@ impl ScoringTask {
                 }
             }
 
-            let loop_score = match local_outlier_probabilities(message.psms(), N_NEIGHBORS, 3, None)
+            let loop_score = match thread_pool
+                .install(|| local_outlier_probabilities(message.psms(), N_NEIGHBORS, 3, None))
             {
                 Ok(loop_score) => loop_score,
                 Err(err) => {

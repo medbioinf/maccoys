@@ -26,7 +26,7 @@ glob = "0.3.1"
 http = "1.1.0"
 itertools = "0.13.0"
 lazy_static = "1.4.0"
-local-outlier-probabilities = "1.2.0"
+local-outlier-probabilities = { version = "1.2.1", features = ["parallel"] }
 macpepdb = { path = "../macpepdb/packages/macpepdb" }
 macpepdb_metrics_peek = { path = "../macpepdb/packages/metrics-peek" }
 macpepdb_tui = { path = "../macpepdb/packages/tui" }
