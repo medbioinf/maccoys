@@ -14,7 +14,7 @@ use axum::{
 };
 use http::status::StatusCode;
 use parking_lot::RwLock;
-use paste::paste;
+use pastey::paste;
 use serde::{Deserialize, Serialize};
 use tokio::select;
 use tokio::sync::watch::Receiver as WatchReceiver;
