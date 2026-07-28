@@ -719,11 +719,7 @@ impl PipelineStorage for RedisPipelineStorage {
             .map_err(|err| RedisStorageError::RedisError("setting search done flag", err))?;
 
         self.client
-            .expire(
-                &key,
-                self.time_to_idle,
-                rustis::commands::ExpireOption::None,
-            )
+            .expire(&key, self.time_to_idle, None)
             .await
             .map_err(|err| RedisStorageError::RedisError("setting search done flag expiry", err))?;
 

@@ -2455,12 +2455,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fast-float"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95765f67b4b18863968b4a1bd5bb576f732b29a4a28c7cd84c09fa3e2875f33c"
-
-[[package]]
 name = "fast-float2"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6747,24 +6741,25 @@ dependencies = [
 
 [[package]]
 name = "rustis"
-version = "0.13.3"
+version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e44f8369b2f0de0ebdad3ab7aa8baef56fa24812daa7b91a405846634a880b16"
+checksum = "53709ab61f0c2788b0de01aa6a8cb1c57bb7bc62974cb8249ddf42356bfdbf2f"
 dependencies = [
  "atoi",
  "bytes",
  "crc16",
  "dtoa",
- "fast-float",
+ "fast-float2",
  "futures-channel",
  "futures-util",
  "itoa",
  "log",
  "memchr",
- "rand 0.8.7",
+ "rand 0.9.5",
  "serde",
  "smallvec",
- "socket2 0.5.10",
+ "socket2 0.6.5",
+ "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "url",
