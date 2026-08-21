@@ -1,21 +1,24 @@
-use std::{io::Cursor, path::PathBuf, sync::Arc};
+use std::{io::Cursor, ops::Deref, path::PathBuf, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Multipart, State},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use http::StatusCode;
-use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
+use macpepdb::{
+    post_translational_modification::{PTMCollection, PostTranslationalModification},
+    web::DEFAULT_ERROR_HEADER_MAP,
+};
 use serde_json::Value as JsonValue;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
-    errors::axum::web_error::AnyhowWebError,
     io::axum::multipart::write_streamed_file,
     pipeline::{
         queue::HttpPipelineQueue,
@@ -40,6 +43,79 @@ use super::{
 /// Loki tracing label value for the remote pipeline web api
 ///
 static LOKI_TRACING_LABEL_VALUE: &str = "remote_pipeline_web_api";
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Error creating directory `{0}`: {1}")]
+    CreateDir(PathBuf, Box<tokio::io::Error>),
+    #[error("Unbable to decode received PTMs: {0}")]
+    DecodeModificationsField(Box<axum::extract::multipart::MultipartError>),
+    #[error("Unbable to decode received search parameters: {0}")]
+    DecodeSearchParameterField(Box<axum::extract::multipart::MultipartError>),
+    #[error("Unable to deserialize modifications: {0}")]
+    DeserializeModifications(Box<csv::Error>),
+    #[error("Unable to deserialize search parameters: {0}")]
+    DeserializeSearchParameter(Box<toml::de::Error>),
+    #[error("Error writing streamed file: {0}")]
+    FileUploadStream(Box<anyhow::Error>),
+    #[error("Missing request field name")]
+    MissingRequestFieldName,
+    #[error("No mzML file names")]
+    NoMzMLFileNames,
+    #[error("No search parameters uploaded")]
+    NoSearchParameters,
+    #[error("PTMCollection error in remote pipeline API: {0}")]
+    ModificationCollection(Box<macpepdb::post_translational_modification::Error>),
+    #[error("Queue error in remote pipeline web API: {0}")]
+    QueueError(Box<crate::pipeline::errors::queue_error::QueueError>),
+    #[error("Unable to remove directory {0}`: {1}")]
+    RemoveDir(PathBuf, Box<tokio::io::Error>),
+    #[error("Stroage error in remote pipeline web API: {0}")]
+    StorageError(Box<crate::pipeline::errors::storage_error::StorageError>),
+    #[error("Error binding TCP listener to {0}:{1}: {2}")]
+    TcpListenerBind(String, u16, Box<tokio::io::Error>),
+}
+
+into_thiserror_boxed!(csv::Error, Error, DeserializeModifications);
+into_thiserror_boxed!(toml::de::Error, Error, DeserializeSearchParameter);
+into_thiserror_boxed!(
+    macpepdb::post_translational_modification::Error,
+    Error,
+    ModificationCollection
+);
+into_thiserror_boxed!(
+    crate::pipeline::errors::queue_error::QueueError,
+    Error,
+    QueueError
+);
+into_thiserror_boxed!(
+    crate::pipeline::errors::storage_error::StorageError,
+    Error,
+    StorageError
+);
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        match self {
+            Error::MissingRequestFieldName => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                DEFAULT_ERROR_HEADER_MAP.deref().clone(),
+                Body::from(self.to_string()),
+            )
+                .into_response(),
+            _ => {
+                let uuid = uuid::Uuid::now_v7();
+                tracing::error!("[{uuid}] {self}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    DEFAULT_ERROR_HEADER_MAP.deref().clone(),
+                    Body::from(format!("Internal server error. Contact the admin and provide this UUID `{uuid}` to help identifying the error.")),
+                )
+                .into_response()
+            }
+        }
+    }
+}
 
 /// Shared state for the remote entrypoint service
 ///
@@ -160,7 +236,7 @@ impl RemotePipelineWebApi {
         interface: String,
         port: u16,
         config: RemoteEntypointConfiguration,
-    ) -> Result<()> {
+    ) -> Result<(), Error> {
         let index_queue = HttpPipelineQueue::new(&config.index).await?;
         let search_space_generation_queue =
             HttpPipelineQueue::new(&config.search_space_generation).await?;
@@ -189,7 +265,9 @@ impl RemotePipelineWebApi {
             .layer(DefaultBodyLimit::disable())
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(format!("{}:{}", interface, port)).await?;
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", interface, port))
+            .await
+            .map_err(|err| Error::TcpListenerBind(interface.clone(), port, Box::new(err)))?;
         tracing::info!("ready for connections, listening on {}", interface);
         axum::serve(listener, app).await.unwrap();
 
@@ -221,7 +299,7 @@ impl RemotePipelineWebApi {
     async fn enqueue(
         State(state): State<Arc<EntrypointServiceState>>,
         mut payload: Multipart,
-    ) -> Result<Response, AnyhowWebError> {
+    ) -> Result<Response, Error> {
         // Manifest files
         let uuid = Uuid::new_v4().to_string();
         let mut search_params: Option<SearchParameters> = None;
@@ -229,10 +307,7 @@ impl RemotePipelineWebApi {
         let mut mzml_file_names: Vec<String> = Vec::new();
 
         while let Ok(Some(field)) = payload.next_field().await {
-            let field_name = match field.name() {
-                Some(name) => name,
-                None => return Err(anyhow!("Field has no name").into()),
-            };
+            let field_name = field.name().ok_or(Error::MissingRequestFieldName)?;
 
             if field_name.starts_with("mzml_") {
                 let file_name = match field.file_name() {
@@ -244,31 +319,39 @@ impl RemotePipelineWebApi {
                     .work_dir
                     .join(create_file_path_on_ms_run_level(&uuid, &file_name, "mzML"));
 
-                tokio::fs::create_dir_all(&mzml_path.parent().unwrap()).await?;
+                tokio::fs::create_dir_all(&mzml_path.parent().unwrap())
+                    .await
+                    .map_err(|err| {
+                        Error::CreateDir(mzml_path.parent().unwrap().into(), Box::new(err))
+                    })?;
 
-                write_streamed_file(&mzml_path, field).await?;
+                write_streamed_file(&mzml_path, field)
+                    .await
+                    .map_err(|err| Error::FileUploadStream(Box::new(err)))?;
                 mzml_file_names.push(file_name);
                 continue;
             }
 
             if field_name == "search_params" {
-                search_params = match &field.text().await {
-                    Ok(text) => {
-                        Some(toml::from_str(text).context("Parsing search parameters TOML")?)
-                    }
-                    Err(err) => {
-                        return Err(anyhow!("Error reading search params field: {:?}", err).into())
-                    }
-                };
+                search_params = field
+                    .text()
+                    .await
+                    .map(|text| {
+                        toml::from_str::<SearchParameters>(&text)
+                            .map(Some)
+                            .map_err(Error::from)
+                    })
+                    .map_err(|err| Error::DecodeSearchParameterField(Box::new(err)))??;
                 continue;
             }
 
             // Optional PTMs
             if field_name == "ptms" {
-                let ptm_tsv = match field.bytes().await {
-                    Ok(csv) => Cursor::new(csv),
-                    Err(err) => return Err(anyhow!("Error reading PTMs field: {:?}", err).into()),
-                };
+                let ptm_tsv = field
+                    .bytes()
+                    .await
+                    .map(Cursor::new)
+                    .map_err(|err| Error::DecodeModificationsField(Box::new(err)))?;
 
                 let reader = csv::ReaderBuilder::new()
                     .has_headers(true)
@@ -277,17 +360,16 @@ impl RemotePipelineWebApi {
 
                 ptms = reader
                     .into_deserialize::<PostTranslationalModification>()
-                    .map(|ptm_result| ptm_result.map(Arc::new).map_err(anyhow::Error::new))
-                    .collect::<Result<Vec<Arc<PostTranslationalModification>>>>()?;
+                    .map(|ptm_result| ptm_result.map(Arc::new).map_err(Error::from))
+                    .collect::<Result<Vec<Arc<PostTranslationalModification>>, Error>>()?;
             }
         }
 
         if !ptms.is_empty() {
             // validate PTMs
-            let _ = PTMCollection::new(ptms.clone())
-                .map_err(|e| anyhow!("Error validating PTMs: {:?}", e))?;
+            let _ = PTMCollection::new(ptms.clone()).map_err(Error::from)?;
         } else {
-            warn!("Not PTMs submitted, which is unusual")
+            warn!("No PTMs submitted, which is unusual")
         }
 
         for ptm in ptms.iter() {
@@ -301,14 +383,18 @@ impl RemotePipelineWebApi {
         }
 
         if mzml_file_names.is_empty() {
-            return Err(anyhow!("No mzML files uploaded").into());
+            return Err(Error::NoMzMLFileNames);
         }
+
+        let workdir = state.work_dir.join(&uuid);
 
         let search_params = match search_params {
             Some(search_params) => search_params,
             None => {
-                tokio::fs::remove_dir_all(&state.work_dir.join(&uuid)).await?;
-                return Err(anyhow!("Search parameters not uploaded").into());
+                tokio::fs::remove_dir_all(&workdir)
+                    .await
+                    .map_err(|err| Error::RemoveDir(workdir, Box::new(err)))?;
+                return Err(Error::NoSearchParameters);
             }
         };
 
@@ -321,9 +407,11 @@ impl RemotePipelineWebApi {
             .await
         {
             Ok(_) => (),
-            Err(e) => {
-                tokio::fs::remove_dir_all(&state.work_dir.join(&uuid)).await?;
-                return Err(anyhow!("Error initializing search: {:?}", e).into());
+            Err(err) => {
+                tokio::fs::remove_dir_all(&workdir)
+                    .await
+                    .map_err(|err| Error::RemoveDir(workdir, Box::new(err)))?;
+                return Err(Error::StorageError(Box::new(err)));
             }
         }
 

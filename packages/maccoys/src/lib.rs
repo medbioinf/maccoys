@@ -5,6 +5,8 @@
 pub mod constants;
 /// MaCcoyS specific errors
 pub mod errors;
+#[macro_use]
+pub mod error;
 /// Basic functions necessary for running a MaCcoyS search.
 pub mod functions;
 /// Goodness of fit record for MaCcoyS searches.
