@@ -1973,7 +1973,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "xxhash-rust",
 ]
@@ -2227,7 +2227,7 @@ dependencies = [
  "tracing",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
 ]
 
@@ -4001,6 +4001,7 @@ dependencies = [
 [[package]]
 name = "macpepdb"
 version = "0.1.0"
+source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -4018,6 +4019,8 @@ dependencies = [
  "futures",
  "glob",
  "http 1.4.2",
+ "hyper 1.11.0",
+ "hyper-util",
  "itertools 0.14.0",
  "macpepdb_metrics_peek",
  "macpepdb_peptide_hydrophobicity",
@@ -4045,6 +4048,7 @@ dependencies = [
  "tinyvec",
  "tokio",
  "tokio-postgres",
+ "tower",
  "tower-http 0.6.11",
  "tracing",
  "tracing-appender",
@@ -4061,6 +4065,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_metrics_peek"
 version = "0.1.0"
+source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
 dependencies = [
  "metrics",
 ]
@@ -4068,10 +4073,12 @@ dependencies = [
 [[package]]
 name = "macpepdb_peptide_hydrophobicity"
 version = "0.1.0"
+source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
 
 [[package]]
 name = "macpepdb_tui"
 version = "0.1.0"
+source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
@@ -4088,6 +4095,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_uniprot_reader"
 version = "0.1.0"
+source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
 dependencies = [
  "futures",
  "serde",
@@ -4098,6 +4106,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_web_common"
 version = "0.1.0"
+source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
 dependencies = [
  "serde",
 ]
@@ -6642,7 +6651,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots",
 ]
@@ -6657,6 +6666,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2 0.4.15",
  "http 1.4.2",
  "http-body 1.1.0",
@@ -6673,15 +6683,19 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper 1.0.2",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http 0.6.11",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -8825,6 +8839,19 @@ name = "wasm-streams"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",

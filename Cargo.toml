@@ -27,10 +27,10 @@ http = "1.1.0"
 itertools = "0.13.0"
 lazy_static = "1.4.0"
 local-outlier-probabilities = { version = "1.2.1", features = ["parallel"] }
-macpepdb = { path = "../macpepdb/packages/macpepdb" }
-macpepdb_metrics_peek = { path = "../macpepdb/packages/metrics-peek" }
-macpepdb_tui = { path = "../macpepdb/packages/tui" }
-macpepdb_web_common = { path = "../macpepdb/packages/web-common" }
+macpepdb = { git = "https://github.com/medbioinf/macpepdb.git" }
+macpepdb_metrics_peek = { git = "https://github.com/medbioinf/macpepdb.git" }
+macpepdb_tui = { git = "https://github.com/medbioinf/macpepdb.git" }
+macpepdb_web_common = { git = "https://github.com/medbioinf/macpepdb.git" }
 memchr = "2.8.0"
 metrics = "0.24.1"
 metrics-exporter-prometheus = "0.16.2"

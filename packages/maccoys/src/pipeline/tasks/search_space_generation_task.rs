@@ -8,7 +8,8 @@ use std::{
 };
 
 use macpepdb::{
-    mass::to_int as mass_to_int, post_translational_modification::PostTranslationalModification,
+    mass::to_int as mass_to_int,
+    post_translational_modification::{PTMCollection, PostTranslationalModification},
 };
 use metrics::counter;
 use tracing::{error, info};
@@ -78,7 +79,8 @@ impl SearchSpaceGenerationTask {
     {
         let mut last_search_uuid = String::new();
         let mut current_search_params = SearchParameters::new();
-        let mut current_ptms: Vec<Arc<PostTranslationalModification>> = Vec::new();
+        let mut current_ptms: Arc<PTMCollection<Arc<PostTranslationalModification>>> =
+            Arc::new(PTMCollection::new(vec![]).unwrap());
         let mut metrics_counter_name = COUNTER_PREFIX.to_string();
 
         'message_loop: loop {
@@ -127,7 +129,7 @@ impl SearchSpaceGenerationTask {
                     }
                 };
 
-                current_ptms = match storage.get_ptms(message.uuid()).await {
+                let ptms = match storage.get_ptms(message.uuid()).await {
                     Ok(Some(ptms)) => ptms,
                     Ok(None) => {
                         let error_message = message.to_error_message(
@@ -140,6 +142,18 @@ impl SearchSpaceGenerationTask {
                     Err(e) => {
                         let error_message = message
                             .to_error_message(SearchSpaceGenerationError::GetPTMsError(e).into());
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
+                        continue 'message_loop;
+                    }
+                };
+
+                current_ptms = match PTMCollection::new(ptms) {
+                    Ok(ptms) => Arc::new(ptms),
+                    Err(err) => {
+                        let error_message = message.to_error_message(
+                            SearchSpaceGenerationError::PTMCollection(Box::new(err)).into(),
+                        );
                         error!("{}", &error_message);
                         Self::enqueue_message(error_message, error_queue.as_ref()).await;
                         continue 'message_loop;
@@ -185,7 +199,7 @@ impl SearchSpaceGenerationTask {
                         current_search_params.lower_mass_tolerance_ppm,
                         current_search_params.upper_mass_tolerance_ppm,
                         current_search_params.max_variable_modifications,
-                        current_ptms,
+                        current_ptms.clone(),
                         current_search_params.decoys_per_peptide,
                         config.concurrent_searches,
                     )

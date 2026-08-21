@@ -28,8 +28,7 @@ use maccoys::pipeline::tasks::task::Task;
 use maccoys::search_space::search_space_generator::{FastaSearchSpace, SearchSpaceGenerator};
 use macpepdb::mass::to_int as mass_to_int;
 use macpepdb::monitoring::{MetricTarget, Monitoring, TracingLogRotation, TracingTarget};
-use macpepdb::peptide_search::PeptideSearchType;
-use macpepdb::post_translational_modification::PostTranslationalModification;
+use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
 use macpepdb_tui::Tui;
 use reqwest::Url;
 use tokio::fs::OpenOptions;
@@ -216,10 +215,6 @@ enum Commands {
         /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
         #[arg(short)]
         decoy_url: Option<String>,
-        /// Type of search to perform, multi-task search can be faster but also more memory intensive.
-        /// Only recognized if `target-url` is postgresql connection.
-        #[arg(long, default_value_t = PeptideSearchType::MultiTask)]
-        search_type: PeptideSearchType,
         /// Optional URL for checking generated decoy against targets.
         /// Can be a URL for the database (`scylla://host1,host2,host3/keyspace`),
         /// base url for MaCPepDB web API or base URL to MaCPepDB bloom filters (`bloom+http://<DOMAIN>`).
@@ -390,7 +385,6 @@ async fn main() -> Result<()> {
             concurrent_searches,
             decoy_cache_url,
             decoy_url,
-            search_type,
             target_lookup_url,
             fasta_file_path,
             ptm_file_path,
@@ -411,6 +405,8 @@ async fn main() -> Result<()> {
                 .collect::<Result<Vec<Arc<PostTranslationalModification>>, csv::Error>>()
                 .unwrap();
 
+            let ptms = PTMCollection::new(ptms).map(Arc::new).unwrap();
+
             let fasta_file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -425,7 +421,6 @@ async fn main() -> Result<()> {
 
             let search_space_generator = SearchSpaceGenerator::new(
                 &target_url,
-                search_type,
                 decoy_url,
                 target_lookup_url,
                 decoy_cache_url,
@@ -439,7 +434,7 @@ async fn main() -> Result<()> {
                     lower_mass_tolerance_ppm,
                     upper_mass_tolerance_ppm,
                     max_variable_modifications,
-                    ptms.as_slice(),
+                    ptms,
                     decoys_per_peptide,
                     concurrent_searches,
                 )
@@ -581,7 +576,7 @@ async fn main() -> Result<()> {
                     ptms_file,
                 )
                 .await?;
-                println!("Do not forget your UUID: {}", uuid);
+                tracing::info!("Do not forget your UUID: {}", uuid);
             }
             PipelineCommand::RemoteEntrypoint {
                 interface,
