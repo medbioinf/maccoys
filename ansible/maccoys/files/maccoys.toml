@@ -1,5 +1,6 @@
 prometheus_base_url = "http://localhost:9090"
 work_directory = "/searches"
+message_timeout = 600
 
 [index]
 num_tasks = 1
@@ -8,7 +9,8 @@ queue_capacity = 1000
 queue_url = "http://<QUEUE_SERVER>:8123"
 
 [search_space_generation]
-num_tasks = 16
+num_tasks = 8
+concurrent_searches = 64
 queue_name = "search_space_generation"
 queue_capacity = 100
 queue_url = "http://<QUEUE_SERVER>:8123"

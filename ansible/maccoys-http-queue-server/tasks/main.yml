@@ -1,12 +1,12 @@
 #SPDX-License-Identifier: MIT-0
 ---
 
-- name: Create grafana config directory
+- name: Queue state directory
   ansible.builtin.file:
     path: "{{ hostvars[ (groups['queue']|first) ]['queue_state_dir'] }}"
     state: directory
-    owner: root
-    group: root
+    owner: "{{ hostvars[inventory_hostname]['maccoys_docker_user']['uid'] }}"
+    group: "{{ hostvars[inventory_hostname]['maccoys_docker_user']['gid'] }}"
     mode: '755'
 
 
@@ -18,5 +18,5 @@
   vars:
     maccoys_id: queue-server
     maccoys_cmd: queue-server
-    maccoys_opts: "-s {{ hostvars[ (groups['queue']|first) ]['queue_state_dir'] }}/queues.bin 0.0.0.0 8123"
+    maccoys_opts: "{{ hostvars[ (groups['queue']|first) ]['queue_state_dir'] }} 0.0.0.0 8123"
     prometheus_scraping_port: 9497

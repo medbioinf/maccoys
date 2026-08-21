@@ -1,0 +1,73 @@
+# FOLDER_FOR_SEARCH_RESULTS Need to have the same content on all hosts,
+# e.g via NFS or one server which is running all MaCcoyS components using this folder.
+
+all:
+  vars:
+    maccoys_target_peptide_url: <http-or-psql-url-of-macpepdb>
+    # In case you built the maccoys docker image locally, use `docker images save -o <docker-image-file-path>` to write it to disk and add the path here
+    # The image file will be copied to the hosts and loaded.
+    maccoys_dockerimage_file: ~
+    # User and group ID of the user who should run maccoys in the docker containers.
+    maccoys_docker_user:
+      uid: 1000
+      gid: 1000
+
+
+  children:
+    # new hosts which need a base installation
+    new:
+      hosts:
+
+    # ONE storage host which is exchanging data with all other hosts
+    storage:
+      hosts:
+
+    # ONE monitoring host running Loki, Prometheus and Grafana
+    monitoring:
+      vars:
+        monitoring_data_dir: <FOLDER_FOR_LOGGING>
+        user: admin
+        password: admin
+      hosts:
+
+    # Indexing hosts
+    indexing:
+      vars:
+        volumes:
+          - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+      hosts:
+
+    # Search space generation hosts
+    search_space_generation:
+      hosts:
+
+    # Identification hosts
+    identification:
+      hosts:
+
+    # Scoring hosts
+    scoring:
+      hosts:
+
+    # Publishing hosts
+    publishing:
+      vars:
+        volumes:
+          - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+      hosts:
+
+    # Error handling hosts
+    error:
+      vars:
+        volumes:
+          - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+      hosts:
+
+    # Web API for MaCcoyS
+    entrypoint:
+      vars:
+        volumes:
+          - <FOLDER_FOR_SEARCH_RESULTS>:/searches
+        entrypoint_ports:
+          - "<PORT_YOU_LIKE>:8000"
+      hosts:
