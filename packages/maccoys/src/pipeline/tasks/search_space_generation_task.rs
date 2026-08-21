@@ -160,7 +160,6 @@ impl SearchSpaceGenerationTask {
 
                 let search_space_generator = match SearchSpaceGenerator::new(
                     &config.target_url,
-                    config.search_type,
                     config.decoy_url.clone(),
                     config.target_lookup_url.clone(),
                     config.decoy_cache_url.clone(),
@@ -186,7 +185,7 @@ impl SearchSpaceGenerationTask {
                         current_search_params.lower_mass_tolerance_ppm,
                         current_search_params.upper_mass_tolerance_ppm,
                         current_search_params.max_variable_modifications,
-                        current_ptms.as_slice(),
+                        current_ptms,
                         current_search_params.decoys_per_peptide,
                         config.concurrent_searches,
                     )

@@ -1,6 +1,5 @@
 use std::{num::NonZeroUsize, ops::Deref, path::PathBuf, time::Duration};
 
-use macpepdb::peptide_search::PeptideSearchType;
 use xcorrrs::configuration::Configuration as XcorrConfiguration;
 
 pub const INDEXING_QUEUE_KEY: &str = "index";
@@ -82,9 +81,6 @@ pub struct SearchSpaceGenerationTaskConfiguration {
     #[serde(flatten)]
     pub general: TaskConfiguration,
 
-    /// Search type
-    pub search_type: PeptideSearchType,
-
     /// Concurrent search, only applied on MultiTask search type
     pub concurrent_searches: NonZeroUsize,
 
@@ -162,6 +158,10 @@ pub struct QueuingConfiguration {
 impl Default for QueuingConfiguration {
     fn default() -> Self {
         Self {
+            // data_directory: PathBuf::from(format!(
+            //     "/tmp/{}-queueing-data",
+            //     env!("CARGO_CRATE_NAME")
+            // )),
             message_timeout: Duration::from_secs(900),
             reschedule_check_interval: Duration::from_secs(60),
         }
@@ -240,7 +240,6 @@ impl Default for PipelineConfiguration {
                     queue_url: None,
                 },
                 target_url: "".to_string(),
-                search_type: PeptideSearchType::MultiTask,
                 concurrent_searches: NonZeroUsize::new(16).unwrap(),
                 decoy_url: None,
                 target_lookup_url: None,

@@ -1,10 +1,8 @@
 // 3rd party imports
-use crate::search_space::macpepdb_client::MaCPepDBClient;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use macpepdb::{
     peptide::Peptide,
-    peptide_search::PeptideSearchType,
     peptide_table::PeptideTable,
     sequence::{IsSimpleSequence, PeptideSequence},
 };

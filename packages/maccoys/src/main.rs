@@ -182,9 +182,8 @@ enum PipelineCommand {
     },
     /// Http queuing server
     QueueServer {
-        /// Path to safe state if server shutsdown
-        #[arg(short, long)]
-        state_file_path: Option<PathBuf>,
+        /// Directory where queued message payloads are spooled to disk
+        data_directory: PathBuf,
         /// Interface where the service is spawned
         interface: String,
         /// Port where the service is spawned
@@ -635,14 +634,14 @@ async fn main() -> Result<()> {
             PipelineCommand::QueueServer {
                 interface,
                 port,
-                state_file_path,
+                data_directory,
                 config_file_path,
             } => {
                 let config: RemoteEntypointConfiguration = toml::from_str(
                     &fs::read_to_string(&config_file_path).context("Reading config file")?,
                 )
                 .context("Deserialize config")?;
-                QueueServer::run_standalone(interface, port, config, state_file_path).await?;
+                QueueServer::run_standalone(interface, port, config, data_directory).await?;
             }
         },
     };
@@ -710,7 +709,7 @@ fn loki_tracing_label(commands: &Commands, loki_label: String) -> String {
             PipelineCommand::QueueServer {
                 interface: _,
                 port: _,
-                state_file_path: _,
+                data_directory: _,
                 config_file_path: _,
             } => QueueServer::loki_tracing_label_value(),
             _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,

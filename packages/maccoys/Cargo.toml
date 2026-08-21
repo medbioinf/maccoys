@@ -67,7 +67,7 @@ signal-hook = { workspace = true }
 tcmalloc2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tokio-postgres = { workspace = true, features = ["array-impls"] }
 tokio-util = { workspace = true }
 toml = { workspace = true }

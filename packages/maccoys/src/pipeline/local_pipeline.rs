@@ -530,7 +530,10 @@ pub async fn build_and_run_local_pipeline(
                 .port_or_known_default()
                 .ok_or_else(|| anyhow!("No port found in queue URL"))?;
 
-            let state = Arc::new(QueueServerState::from_config(&queue_server_config));
+            let state = Arc::new(QueueServerState::from_config(
+                &queue_server_config,
+                tmp_dir.join("queue_data"),
+            ));
 
             let (stop_signal_sender, stop_signal_receiver) = tokio::sync::oneshot::channel::<()>();
 

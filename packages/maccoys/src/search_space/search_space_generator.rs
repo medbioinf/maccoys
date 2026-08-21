@@ -15,7 +15,7 @@ use fancy_regex::Regex;
 use futures::{pin_mut, StreamExt};
 use http::StatusCode;
 use macpepdb::mass::{to_float as mass_to_float, to_int as mass_to_int};
-use macpepdb::peptide_search::{MultiTaskSearch, PeptideSearchType, Search, UnionAllSearch};
+use macpepdb::peptide_search::PeptideSearch;
 use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
 use macpepdb::sequence::PeptideSequence;
 use macpepdb_web_common::requests::peptide::{SearchRequestBody, SearchRequestMass};
@@ -269,7 +269,6 @@ pub struct SearchSpaceGenerator {
 impl SearchSpaceGenerator {
     pub async fn new(
         target_url: &str,
-        search_type: PeptideSearchType,
         decoy_url: Option<String>,
         target_lookup_url: Option<String>,
         decoy_cache_url: Option<String>,

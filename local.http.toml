@@ -36,7 +36,6 @@ num_tasks = 20
 queue_name = "search_space_generation"
 queue_capacity = 100
 queue_url = "http://localhost:8100"
-search_type = "multi-task"
 concurrent_searches = 64
 target_url = "http://134.147.59.92"
 # decoy_url = "http://
