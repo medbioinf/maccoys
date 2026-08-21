@@ -3,6 +3,7 @@ use std::{borrow::Cow, io::Write, sync::Arc};
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
 use local_outlier_probabilities::PointSource;
 use parquet::{
+    basic::{Compression, ZstdLevel},
     column::reader::ColumnReaderImpl,
     data_type::{ByteArray, ByteArrayType, DataType, DoubleType, Int64Type},
     file::{
@@ -315,6 +316,7 @@ impl PeptideSpectrumMatchCollection {
                     PSM_METADATA_KEY.to_string(),
                     serde_json::to_string(&metadata)?,
                 )]))
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
                 .build(),
         );
 
