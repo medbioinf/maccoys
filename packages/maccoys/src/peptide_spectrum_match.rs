@@ -1,8 +1,18 @@
-use std::{borrow::Cow, io::Write};
+use std::{borrow::Cow, io::Write, sync::Arc};
 
 use dihardts_omicstools::mass_spectrometry::unit_conversions::mass_to_charge_to_dalton;
 use local_outlier_probabilities::PointSource;
-use polars::{io::mmap::MmapBytesReader, prelude::*};
+use parquet::{
+    column::reader::ColumnReaderImpl,
+    data_type::{ByteArray, ByteArrayType, DataType, DoubleType, Int64Type},
+    file::{
+        metadata::KeyValue,
+        properties::WriterProperties,
+        reader::{ChunkReader, FileReader, RowGroupReader, SerializedFileReader},
+        writer::SerializedFileWriter,
+    },
+    schema::parser::parse_message_type,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use xcorrrs::scoring_result::ScoringResult;
@@ -15,15 +25,31 @@ use crate::{pipeline::tasks::scoring_task::FEATURES as LOOP_FEATURES, precursor:
 ///
 const PSM_METADATA_KEY: &str = "maccoys.psm_collection";
 
+/// Parquet schema for the per-PSM columns of a [`PeptideSpectrumMatchCollection`].
+/// Column order here fixes the column index used by both [`PeptideSpectrumMatchCollection::write_parquet`]
+/// and [`PeptideSpectrumMatchCollection::read_parquet`].
+///
+const PSM_PARQUET_SCHEMA: &str = "
+    message psm_collection {
+        REQUIRED BYTE_ARRAY peptide (UTF8);
+        REQUIRED DOUBLE xcorr;
+        REQUIRED INT64 ions_total;
+        REQUIRED INT64 ions_matched;
+        REQUIRED DOUBLE theoretical_mass;
+        OPTIONAL DOUBLE second_theoretical_mass;
+        OPTIONAL DOUBLE loop_score;
+    }
+";
+
 /// Errors that can occur while reading/writing a [`PeptideSpectrumMatchCollection`]
 /// to/from a parquet file.
 ///
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("Polars error:\n\t{0}")]
-    Polars(#[from] polars::error::PolarsError),
     #[error("Failed to read parquet input:\n\t{0}")]
     Io(#[from] std::io::Error),
+    #[error("Parquet error:\n\t{0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
     #[error("Failed to (de)serialize PSM collection metadata:\n\t{0}")]
     Metadata(#[from] serde_json::Error),
     #[error("Parquet file is missing metadata")]
@@ -70,6 +96,8 @@ pub struct PeptideSpectrumMatch<'a> {
     theoretical_mass: f64,
     /// Second theoretical mass of the peptide, occused if the molecule is ambiguous
     second_theoretical_mass: Option<f64>,
+    /// Loop score
+    loop_score: Option<f64>,
 }
 
 impl<'a> PeptideSpectrumMatch<'a> {
@@ -107,6 +135,20 @@ impl<'a> PeptideSpectrumMatch<'a> {
     pub fn max_theoretical_mass(&self) -> Option<f64> {
         self.second_theoretical_mass
     }
+
+    /// Returns the loop score
+    pub fn loop_score(&self) -> Option<f64> {
+        self.loop_score
+    }
+
+    /// Returns the ratio of matched ions to total ions
+    pub fn ions_matched_ratio(&self) -> u64 {
+        self.ions_matched.checked_div(self.ions_total).unwrap_or(0)
+    }
+
+    pub fn mass_error(&self) -> f64 {
+        self.experimental_mass - self.theoretical_mass
+    }
 }
 
 /// Collection of peptide-spectrum matches (PSMs) for a single spectrum/precursor.
@@ -115,8 +157,8 @@ impl<'a> PeptideSpectrumMatch<'a> {
 /// identical for every PSM in the collection (one collection == one spectrum), so
 /// they're stored once instead of once per row.
 ///
-#[derive(Debug)]
-pub struct PeptideSpectrumMatchCollectionBuilder {
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct PeptideSpectrumMatchCollection {
     scan_id: String,
     precursor: Precursor,
     experimental_mass: f64,
@@ -126,9 +168,10 @@ pub struct PeptideSpectrumMatchCollectionBuilder {
     ions_matched_col: Vec<u64>,
     theoretical_mass_col: Vec<f64>,
     second_theoretical_mass_col: Vec<Option<f64>>,
+    loop_score_col: Option<Vec<f64>>,
 }
 
-impl PeptideSpectrumMatchCollectionBuilder {
+impl PeptideSpectrumMatchCollection {
     /// Creates a new, empty collection for the given scan/precursor.
     ///
     /// # Arguments
@@ -158,6 +201,7 @@ impl PeptideSpectrumMatchCollectionBuilder {
             ions_matched_col: Vec::with_capacity(capacity),
             theoretical_mass_col: Vec::with_capacity(capacity),
             second_theoretical_mass_col: Vec::with_capacity(capacity),
+            loop_score_col: None,
         }
     }
 
@@ -191,30 +235,6 @@ impl PeptideSpectrumMatchCollectionBuilder {
     pub fn is_empty(&self) -> bool {
         self.peptide_col.is_empty()
     }
-}
-
-#[derive(Clone, PartialEq, Deserialize, Serialize)]
-pub struct PeptideSpectrumMatchCollection {
-    scan_id: String,
-    precursor: Precursor,
-    experimental_mass: f64,
-    values: DataFrame,
-}
-
-impl PeptideSpectrumMatchCollection {
-    pub fn new(
-        scan_id: String,
-        precursor: Precursor,
-        experimental_mass: f64,
-        values: DataFrame,
-    ) -> Self {
-        Self {
-            scan_id,
-            precursor,
-            experimental_mass,
-            values,
-        }
-    }
 
     pub fn scan_id(&self) -> &str {
         &self.scan_id
@@ -228,116 +248,328 @@ impl PeptideSpectrumMatchCollection {
         self.experimental_mass
     }
 
-    pub fn values(&self) -> &DataFrame {
-        &self.values
+    pub fn peptide_col(&self) -> &[String] {
+        &self.peptide_col
     }
 
-    pub(crate) fn values_mut(&mut self) -> &mut DataFrame {
-        &mut self.values
+    pub fn xcorr_col(&self) -> &[f64] {
+        &self.xcorr_col
     }
 
-    pub fn len(&self) -> usize {
-        self.values.height()
+    pub fn ions_total_col(&self) -> &[u64] {
+        &self.ions_total_col
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.values.height() == 0
+    pub fn ions_matched_col(&self) -> &[u64] {
+        &self.ions_matched_col
     }
 
-    pub fn estimated_size(&self) -> usize {
-        self.scan_id.len() + self.precursor.size() + self.values.estimated_size()
+    pub fn theoretical_mass_col(&self) -> &[f64] {
+        &self.theoretical_mass_col
     }
 
-    pub async fn write_parquet<W: Write + Send>(&mut self, writer: W) -> Result<(), Error> {
+    pub fn second_theoretical_mass_col(&self) -> &[Option<f64>] {
+        &self.second_theoretical_mass_col
+    }
+
+    pub fn loop_score_col(&self) -> Option<&[f64]> {
+        self.loop_score_col.as_deref()
+    }
+
+    pub fn set_loop_score_col(&mut self, loop_score_col: Vec<f64>) {
+        self.loop_score_col = Some(loop_score_col);
+    }
+
+    pub fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.scan_id.capacity()
+            + self.precursor.size()
+            + self.peptide_col.capacity() * std::mem::size_of::<String>()
+            + self
+                .peptide_col
+                .iter()
+                .map(|peptide| peptide.capacity())
+                .sum::<usize>()
+            + self.xcorr_col.capacity() * std::mem::size_of::<f64>()
+            + self.ions_total_col.capacity() * std::mem::size_of::<u64>()
+            + self.ions_matched_col.capacity() * std::mem::size_of::<u64>()
+            + self.theoretical_mass_col.capacity() * std::mem::size_of::<f64>()
+            + self.second_theoretical_mass_col.capacity() * std::mem::size_of::<Option<f64>>()
+            + self
+                .loop_score_col
+                .as_ref()
+                .map_or(0, |col| col.capacity() * std::mem::size_of::<f64>())
+    }
+
+    pub async fn write_parquet<W: Write + Send>(&self, writer: W) -> Result<(), Error> {
         let metadata = PsmCollectionMetadata {
             scan_id: self.scan_id.clone(),
             precursor: self.precursor.clone(),
             experimental_mass: self.experimental_mass,
         };
 
-        let metadata = KeyValueMetadata::from_static(vec![(
-            PSM_METADATA_KEY.to_string(),
-            serde_json::to_string(&metadata)?,
-        )]);
+        let schema = Arc::new(parse_message_type(PSM_PARQUET_SCHEMA)?);
+        let properties = Arc::new(
+            WriterProperties::builder()
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    PSM_METADATA_KEY.to_string(),
+                    serde_json::to_string(&metadata)?,
+                )]))
+                .build(),
+        );
 
-        ParquetWriter::new(writer)
-            .with_compression(ParquetCompression::Zstd(None))
-            .with_key_value_metadata(Some(metadata))
-            .finish(&mut self.values)
-            .unwrap();
+        let mut file_writer = SerializedFileWriter::new(writer, schema, properties)?;
+        let mut row_group_writer = file_writer.next_row_group()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have a `peptide` column");
+        let peptide_values: Vec<ByteArray> = self
+            .peptide_col
+            .iter()
+            .map(|peptide| ByteArray::from(peptide.as_str()))
+            .collect();
+        column_writer
+            .typed::<ByteArrayType>()
+            .write_batch(&peptide_values, None, None)?;
+        column_writer.close()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have an `xcorr` column");
+        column_writer
+            .typed::<DoubleType>()
+            .write_batch(&self.xcorr_col, None, None)?;
+        column_writer.close()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have an `ions_total` column");
+        let ions_total_values: Vec<i64> = self
+            .ions_total_col
+            .iter()
+            .map(|value| *value as i64)
+            .collect();
+        column_writer
+            .typed::<Int64Type>()
+            .write_batch(&ions_total_values, None, None)?;
+        column_writer.close()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have an `ions_matched` column");
+        let ions_matched_values: Vec<i64> = self
+            .ions_matched_col
+            .iter()
+            .map(|value| *value as i64)
+            .collect();
+        column_writer
+            .typed::<Int64Type>()
+            .write_batch(&ions_matched_values, None, None)?;
+        column_writer.close()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have a `theoretical_mass` column");
+        column_writer
+            .typed::<DoubleType>()
+            .write_batch(&self.theoretical_mass_col, None, None)?;
+        column_writer.close()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have a `second_theoretical_mass` column");
+        let mut second_mass_values = Vec::new();
+        let mut second_mass_def_levels = Vec::with_capacity(self.len());
+        for value in &self.second_theoretical_mass_col {
+            match value {
+                Some(value) => {
+                    second_mass_values.push(*value);
+                    second_mass_def_levels.push(1i16);
+                }
+                None => second_mass_def_levels.push(0i16),
+            }
+        }
+        column_writer.typed::<DoubleType>().write_batch(
+            &second_mass_values,
+            Some(&second_mass_def_levels),
+            None,
+        )?;
+        column_writer.close()?;
+
+        let mut column_writer = row_group_writer
+            .next_column()?
+            .expect("psm_collection schema should have a `loop_score` column");
+        match &self.loop_score_col {
+            Some(loop_score_col) => {
+                let def_levels = vec![1i16; loop_score_col.len()];
+                column_writer.typed::<DoubleType>().write_batch(
+                    loop_score_col,
+                    Some(&def_levels),
+                    None,
+                )?;
+            }
+            None => {
+                let def_levels = vec![0i16; self.len()];
+                column_writer
+                    .typed::<DoubleType>()
+                    .write_batch(&[], Some(&def_levels), None)?;
+            }
+        }
+        column_writer.close()?;
+
+        row_group_writer.close()?;
+        file_writer.close()?;
 
         Ok(())
     }
 
-    pub async fn read_parquet<R: MmapBytesReader>(reader: R) -> Result<Self, Error> {
-        let mut parquet_reader = ParquetReader::new(reader);
+    pub async fn read_parquet<R: ChunkReader + 'static>(reader: R) -> Result<Self, Error> {
+        let file_reader = SerializedFileReader::new(reader)?;
 
-        let file_metadata = parquet_reader
-            .get_metadata()?
+        let metadata_json = file_reader
+            .metadata()
+            .file_metadata()
             .key_value_metadata()
-            .as_ref()
-            .ok_or(Error::MissingMetadata)?;
-
-        let metadata = file_metadata
+            .ok_or(Error::MissingMetadata)?
             .iter()
-            .find(|elem| elem.key == PSM_METADATA_KEY)
+            .find(|kv| kv.key == PSM_METADATA_KEY)
             .ok_or(Error::MissingPsmMetadata)?
             .value
             .as_ref()
-            .map(|value| serde_json::from_str::<PsmCollectionMetadata>(value))
-            .ok_or(Error::MissingPsmMetadataValue)??;
+            .ok_or(Error::MissingPsmMetadataValue)?;
+        let metadata: PsmCollectionMetadata = serde_json::from_str(metadata_json)?;
 
-        let values = parquet_reader.finish()?;
+        let row_group_reader = file_reader.get_row_group(0)?;
+        let num_rows = row_group_reader.metadata().num_rows() as usize;
+        let row_group_reader = row_group_reader.as_ref();
+
+        let mut peptide_values = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<ByteArrayType>(row_group_reader, 0, "peptide")?.read_records(
+            num_rows,
+            None,
+            None,
+            &mut peptide_values,
+        )?;
+        let peptide_col = peptide_values
+            .into_iter()
+            .map(|value| Ok(value.as_utf8()?.to_string()))
+            .collect::<Result<Vec<String>, Error>>()?;
+
+        let mut xcorr_col = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<DoubleType>(row_group_reader, 1, "xcorr")?.read_records(
+            num_rows,
+            None,
+            None,
+            &mut xcorr_col,
+        )?;
+
+        let mut ions_total_raw = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<Int64Type>(row_group_reader, 2, "ions_total")?.read_records(
+            num_rows,
+            None,
+            None,
+            &mut ions_total_raw,
+        )?;
+        let ions_total_col: Vec<u64> = ions_total_raw
+            .into_iter()
+            .map(|value| value as u64)
+            .collect();
+
+        let mut ions_matched_raw = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<Int64Type>(row_group_reader, 3, "ions_matched")?.read_records(
+            num_rows,
+            None,
+            None,
+            &mut ions_matched_raw,
+        )?;
+        let ions_matched_col: Vec<u64> = ions_matched_raw
+            .into_iter()
+            .map(|value| value as u64)
+            .collect();
+
+        let mut theoretical_mass_col = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<DoubleType>(row_group_reader, 4, "theoretical_mass")?
+            .read_records(num_rows, None, None, &mut theoretical_mass_col)?;
+
+        let mut second_mass_values = Vec::new();
+        let mut second_mass_def_levels = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<DoubleType>(row_group_reader, 5, "second_theoretical_mass")?
+            .read_records(
+                num_rows,
+                Some(&mut second_mass_def_levels),
+                None,
+                &mut second_mass_values,
+            )?;
+        let mut second_mass_values = second_mass_values.into_iter();
+        let second_theoretical_mass_col: Vec<Option<f64>> = second_mass_def_levels
+            .into_iter()
+            .map(|def_level| {
+                if def_level == 1 {
+                    second_mass_values.next()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut loop_score_values = Vec::new();
+        let mut loop_score_def_levels = Vec::with_capacity(num_rows);
+        Self::typed_column_reader::<DoubleType>(row_group_reader, 6, "loop_score")?.read_records(
+            num_rows,
+            Some(&mut loop_score_def_levels),
+            None,
+            &mut loop_score_values,
+        )?;
+        let loop_score_col = if loop_score_def_levels
+            .iter()
+            .all(|&def_level| def_level == 0)
+        {
+            None
+        } else {
+            let mut loop_score_values = loop_score_values.into_iter();
+            Some(
+                loop_score_def_levels
+                    .into_iter()
+                    .map(|_| {
+                        loop_score_values
+                            .next()
+                            .expect("loop_score column value/level count mismatch")
+                    })
+                    .collect(),
+            )
+        };
 
         Ok(Self {
             scan_id: metadata.scan_id,
             precursor: metadata.precursor,
             experimental_mass: metadata.experimental_mass,
-            values,
+            peptide_col,
+            xcorr_col,
+            ions_total_col,
+            ions_matched_col,
+            theoretical_mass_col,
+            second_theoretical_mass_col,
+            loop_score_col,
         })
     }
-}
 
-impl TryFrom<PeptideSpectrumMatchCollectionBuilder> for PeptideSpectrumMatchCollection {
-    type Error = PolarsError;
-
-    fn try_from(builder: PeptideSpectrumMatchCollectionBuilder) -> Result<Self, Self::Error> {
-        let len = builder.len();
-        let peptide_series = Column::new("peptide".into(), builder.peptide_col);
-        let xcorr_series = Column::new("xcorr".into(), builder.xcorr_col);
-        let ions_total_series = Column::new("ions_total".into(), builder.ions_total_col);
-        let ions_matched_series = Column::new("ions_matched".into(), builder.ions_matched_col);
-        let min_theoretical_mass_series =
-            Column::new("theoretical_mass".into(), builder.theoretical_mass_col);
-        let max_theoretical_mass_series = Column::new(
-            "second_theoretical_mass".into(),
-            builder.second_theoretical_mass_col,
-        );
-
-        let dataframe = DataFrame::new(
-            len,
-            vec![
-                peptide_series,
-                xcorr_series,
-                ions_total_series,
-                ions_matched_series,
-                min_theoretical_mass_series,
-                max_theoretical_mass_series,
-            ],
-        )?;
-
-        Ok(PeptideSpectrumMatchCollection {
-            scan_id: builder.scan_id,
-            precursor: builder.precursor,
-            experimental_mass: builder.experimental_mass,
-            values: dataframe,
-        })
+    /// Returns the column reader for the `index`-th leaf column of the row group as `T`, or
+    /// [`Error::InvalidColumn`] if the column is missing or has an unexpected physical type.
+    ///
+    fn typed_column_reader<T: DataType>(
+        row_group_reader: &dyn RowGroupReader,
+        index: usize,
+        column_name: &'static str,
+    ) -> Result<ColumnReaderImpl<T>, Error> {
+        T::get_column_reader(row_group_reader.get_column_reader(index)?)
+            .ok_or(Error::InvalidColumn(column_name))
     }
 }
 
 impl PointSource<f64> for PeptideSpectrumMatchCollection {
     fn len(&self) -> usize {
-        self.values.height()
+        self.peptide_col.len()
     }
 
     fn dim(&self) -> usize {
@@ -348,29 +580,88 @@ impl PointSource<f64> for PeptideSpectrumMatchCollection {
         &self,
         idx: usize,
     ) -> Result<Cow<'_, [f64]>, local_outlier_probabilities::error::Error> {
-        let loop_feature_values = self.values.select(LOOP_FEATURES).map_err(|err| {
-            local_outlier_probabilities::error::Error::PointExtraction(format!(
-                "Unable to select local outlier probability features {:?}: {}",
-                LOOP_FEATURES, err
-            ))
-        })?;
-
-        let row = loop_feature_values.get_row(idx).map_err(|err| {
-            local_outlier_probabilities::error::Error::PointExtraction(err.to_string())
-        })?;
-
-        let values = row
-            .0
-            .iter()
-            .map(|value| {
-                value.extract::<f64>().ok_or_else(|| {
-                    local_outlier_probabilities::error::Error::PointExtraction(format!(
-                        "could not cast {value:?} to f64"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<f64>, local_outlier_probabilities::error::Error>>()?;
+        let values = vec![
+            self.xcorr_col[idx],
+            self.ions_matched_col[idx] as f64 / self.ions_total_col[idx] as f64,
+            (self.theoretical_mass_col[idx] - self.experimental_mass).abs(),
+        ];
 
         Ok(Cow::Owned(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env::temp_dir, fs::File};
+
+    use super::*;
+
+    fn scoring_result(
+        score: f64,
+        ions_total: usize,
+        ions_matched: usize,
+        min_theoretical_mass: f64,
+        max_theoretical_mass: f64,
+    ) -> ScoringResult {
+        ScoringResult {
+            score,
+            ions_total,
+            ions_matched,
+            min_theoretical_mass,
+            max_theoretical_mass,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_psm_collection_parquet_roundtrip() {
+        let mut psms =
+            PeptideSpectrumMatchCollection::new("scan_1".to_string(), Precursor::new(500.25, 2));
+        // Ambiguous mass -> `second_theoretical_mass_col` entry is `Some(_)`
+        psms.push(
+            "PEPTIDE".to_string(),
+            scoring_result(1.23, 10, 7, 999.5, 999.9),
+        );
+        // Unambiguous mass -> `second_theoretical_mass_col` entry is `None`
+        psms.push(
+            "PEPTIDEK".to_string(),
+            scoring_result(0.98, 12, 9, 1000.1, 1000.1),
+        );
+        psms.set_loop_score_col(vec![0.1, 0.2]);
+
+        let path = temp_dir()
+            .join("maccoys.tests.peptide_spectrum_match.psm_collection_roundtrip.parquet");
+        psms.write_parquet(File::create(&path).unwrap())
+            .await
+            .unwrap();
+        let read_back = PeptideSpectrumMatchCollection::read_parquet(File::open(&path).unwrap())
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(psms, read_back);
+    }
+
+    #[tokio::test]
+    async fn test_psm_collection_parquet_roundtrip_without_loop_score() {
+        let mut psms =
+            PeptideSpectrumMatchCollection::new("scan_2".to_string(), Precursor::new(600.5, 3));
+        psms.push(
+            "SEQVENCE".to_string(),
+            scoring_result(2.5, 8, 4, 800.0, 800.0),
+        );
+
+        let path = temp_dir().join(
+            "maccoys.tests.peptide_spectrum_match.psm_collection_roundtrip_without_loop_score.parquet",
+        );
+        psms.write_parquet(File::create(&path).unwrap())
+            .await
+            .unwrap();
+        let read_back = PeptideSpectrumMatchCollection::read_parquet(File::open(&path).unwrap())
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(read_back.loop_score_col(), None);
+        assert_eq!(psms, read_back);
     }
 }

@@ -36,6 +36,7 @@ mini-moka = { workspace = true }
 murmur3 = { workspace = true }
 ndarray = { workspace = true, features = ["serde"] }
 parking_lot = { workspace = true }
+parquet = { workspace = true }
 pastey = { workspace = true }
 polars = { workspace = true, features = [
     "abs",

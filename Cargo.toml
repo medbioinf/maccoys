@@ -39,6 +39,7 @@ mini-moka = "0.10.3"
 murmur3 = "0.5.2"
 ndarray = "0.16.1"
 parking_lot = "0.12.5"
+parquet = "59.2"
 pastey = "~0.2.1"
 plotly = "0.14.1"
 polars = { version = "0.54", default-features = false }

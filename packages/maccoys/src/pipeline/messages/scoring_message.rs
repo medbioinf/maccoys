@@ -1,12 +1,10 @@
 use std::{fmt::Debug, path::PathBuf};
 
-use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 use crate::{
-    peptide_spectrum_match::{PeptideSpectrumMatch, PeptideSpectrumMatchCollection},
-    pipeline::errors::pipeline_error::PipelineError,
+    peptide_spectrum_match::PeptideSpectrumMatchCollection,
+    pipeline::errors::{pipeline_error::PipelineError, scoring_error::IntoPublicationMessageError},
     precursor::Precursor,
 };
 
@@ -91,19 +89,22 @@ impl ScoringMessage {
     /// # Arguments
     /// * `file_path` - The relative path to the file to write content to
     ///
-    pub fn into_final_publication_message(
-        mut self,
+    pub async fn into_final_publication_message(
+        self,
         file_path: PathBuf,
-    ) -> Result<PublicationMessage, Box<IntoPublicationMessageError>> {
+    ) -> Result<PublicationMessage, (Self, IntoPublicationMessageError)> {
         // Lets assume the Parquet file has roughly half the same size as the PSMs due to compression
-        let mut content: Vec<u8> = Vec::with_capacity(
-            self.psms.estimated_size() * std::mem::size_of::<PeptideSpectrumMatch>() / 2,
-        );
+        let mut content: Vec<u8> = Vec::with_capacity(self.psms.size() / 2);
 
-        ParquetWriter::new(&mut content)
-            .with_compression(ParquetCompression::Zstd(None))
-            .finish(self.psms.values_mut())
-            .unwrap();
+        match self.psms().write_parquet(&mut content).await {
+            Ok(_) => (),
+            Err(err) => {
+                return Err((
+                    self,
+                    IntoPublicationMessageError::ParquetConversionError(Box::new(err)),
+                ))
+            }
+        }
 
         Ok(PublicationMessage::new(
             self.uuid,
@@ -170,10 +171,4 @@ impl Debug for ScoringMessage {
             .field("precursor", &self.precursor)
             .finish()
     }
-}
-
-#[derive(Debug, Error)]
-pub enum IntoPublicationMessageError {
-    #[error("Error writing PSMs to CSV:\n\t{0}")]
-    CsvWriteError(PolarsError, ScoringMessage),
 }

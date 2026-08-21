@@ -16,9 +16,7 @@ use xcorrrs::{
 };
 
 use crate::{
-    peptide_spectrum_match::{
-        PeptideSpectrumMatchCollection, PeptideSpectrumMatchCollectionBuilder,
-    },
+    peptide_spectrum_match::PeptideSpectrumMatchCollection,
     pipeline::{
         configuration::{
             IdentificationTaskConfiguration, SearchParameters,
@@ -330,13 +328,12 @@ pub fn run_xcorr_search(
 ) -> Result<PeptideSpectrumMatchCollection, IdentificationError> {
     let score_threshold = score_threshold.unwrap_or(f64::NEG_INFINITY);
 
-    let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollectionBuilder>> = Arc::new(Mutex::new(
-        PeptideSpectrumMatchCollectionBuilder::with_capacity(
+    let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollection>> =
+        Arc::new(Mutex::new(PeptideSpectrumMatchCollection::with_capacity(
             scan_id.to_string(),
             precursor.clone(),
             peptides.len(),
-        ),
-    ));
+        )));
 
     let xcorrer = FastXcorr::new(config, experimental_spectrum, precursor.charge() as usize)
         .map_err(IdentificationError::from)?;
@@ -380,7 +377,7 @@ pub fn run_xcorr_search(
         .map_err(|_| IdentificationError::MutexLockError("Errors".to_string()))?;
 
     if errors.is_empty() {
-        Ok(psm_collect.try_into()?)
+        Ok(psm_collect)
     } else {
         error!("Errors occurred during XCorr search:");
         for e in errors.iter() {

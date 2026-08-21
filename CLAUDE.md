@@ -90,7 +90,7 @@ IndexingMessage → SearchSpaceGenerationMessage → IdentificationMessage
   space by querying MaCPepDB (`search_space/search_space_generator.rs`), forwards to stage 3.
 - **`identification_task.rs`** — runs the actual search via the internal `xcorrrs` crate,
   producing a `PeptideSpectrumMatchCollection` (`src/peptide_spectrum_match.rs`).
-- **`scoring_task.rs`** — Local Outlier Probability (LoOP) rescoring over Polars DataFrames
+- **`scoring_task.rs`** — Local Outlier Probability (LoOP) rescoring over PeptideSpectruMatchCollection
   (features: `xcorr`, `ions_matched_ratio`, `mass_error`), producing the `loop_score` column
   (`LOOP_COL_NAME` in `scoring_task.rs`) used to rank/validate PSMs.
 - **`publication_task.rs`** — writes the final result bytes to disk under
