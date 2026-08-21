@@ -38,19 +38,6 @@ ndarray = { workspace = true, features = ["serde"] }
 parking_lot = { workspace = true }
 parquet = { workspace = true }
 pastey = { workspace = true }
-polars = { workspace = true, features = [
-    "abs",
-    "csv",
-    "cum_agg",
-    "json",
-    "lazy",
-    "ndarray",
-    "parquet",
-    "polars-io",
-    "serde",
-    "strings",
-    "temporal"
-] }
 postcard = { workspace = true, features = ["alloc"] }
 rand = { workspace = true }
 rayon = { workspace = true }

@@ -35,7 +35,6 @@ use tokio::fs::OpenOptions;
 use tracing::{debug, info};
 
 // internal imports
-use maccoys::functions::post_process;
 use maccoys::web::results_api::Server as ResultApiServer;
 
 // Allocator
@@ -262,13 +261,6 @@ enum Commands {
         /// Path to output file
         output_file_path: String,
     },
-    /// Calculates the goodness of fit and the the exponential and distances scores for the given PSM file.
-    PostProcess {
-        /// Path to PSM file
-        psm_file_path: String,
-        /// Path to goodness of fit output file
-        goodness_of_fit_file_path: String,
-    },
     /// Prints a new pipeline configuration to stdout
     Config {},
     /// MaCcoyS search pipeline
@@ -488,16 +480,6 @@ async fn main() -> Result<()> {
                 Path::new(&output_file_path),
                 mzml_file.extract_spectrum(&spectrum_id, true)?,
             )?;
-        }
-        Commands::PostProcess {
-            psm_file_path,
-            goodness_of_fit_file_path,
-        } => {
-            post_process(
-                Path::new(&psm_file_path),
-                Path::new(&goodness_of_fit_file_path),
-            )
-            .await?
         }
         Commands::Config {} => {
             let new_config = PipelineConfiguration::default();

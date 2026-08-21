@@ -13,5 +13,4 @@ documentation = "https://github.com/medbioinf/maccoys-exchange-entities"
 license-file = "../LICENSE"
 
 [dependencies]
-polars = { workspace = true, features = ["serde", "json"] } # Features are very limited to make it run in WASM
 serde = { workspace = true }

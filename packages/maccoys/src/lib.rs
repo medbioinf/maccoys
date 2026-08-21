@@ -7,8 +7,6 @@ pub mod constants;
 pub mod errors;
 #[macro_use]
 pub mod error;
-/// Basic functions necessary for running a MaCcoyS search.
-pub mod functions;
 /// IO module for reading and writing files.
 pub mod io;
 /// Peptide spectruim match
