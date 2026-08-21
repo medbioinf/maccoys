@@ -15,4 +15,6 @@
 !/LICENSE
 !/README.md
 !/rust-toolchain.toml
-!/src/**/*.rs
+!/packages/**/README.md
+!/packages/**/*.rs
+!/packages/**/Cargo*

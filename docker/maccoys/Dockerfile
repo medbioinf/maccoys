@@ -1,9 +1,9 @@
-FROM rust:1.89 AS build-stage
+FROM rust:1.95 AS build-stage
 
 WORKDIR /usr/src/maccoys
 COPY . .
 
-RUN cargo build -r
+RUN cargo build -r --package maccoys
 
 
 
