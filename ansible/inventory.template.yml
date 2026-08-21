@@ -30,10 +30,20 @@ all:
         password: admin
       hosts:
 
+    # ONE queue host running the HTTP queue server
+    queue:
+      vars:
+        queue_ports:
+          - "8123:8123"
+        queue_state_dir: /var/lib/maccoys
+        queue_volumes:
+          - /var/lib/maccoys:/var/lib/maccoys
+      hosts:
+
     # Indexing hosts
     indexing:
       vars:
-        volumes:
+        indexing_volumes:
           - <FOLDER_FOR_SEARCH_RESULTS>:/searches
       hosts:
 
@@ -52,21 +62,21 @@ all:
     # Publishing hosts
     publishing:
       vars:
-        volumes:
+        publishing_volumes:
           - <FOLDER_FOR_SEARCH_RESULTS>:/searches
       hosts:
 
     # Error handling hosts
     error:
       vars:
-        volumes:
+        error_volumes:
           - <FOLDER_FOR_SEARCH_RESULTS>:/searches
       hosts:
 
     # Web API for MaCcoyS
     entrypoint:
       vars:
-        volumes:
+        entrypoint_volumes:
           - <FOLDER_FOR_SEARCH_RESULTS>:/searches
         entrypoint_ports:
           - "<PORT_YOU_LIKE>:8000"

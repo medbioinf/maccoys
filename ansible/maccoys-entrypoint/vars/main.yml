@@ -3,3 +3,4 @@
 # vars file for maccoys-entrypoint
 
 ports: "{{ hostvars[inventory_hostname]['entrypoint_ports'] | default([]) }}"
+maccoys_volumes: "{{ hostvars[inventory_hostname]['entrypoint_volumes'] | default([]) }}"

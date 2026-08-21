@@ -79,7 +79,7 @@ conda activate ansible
 ansible-galaxy collection install community.docker 
 ```
 
-Copy `ansible/hosts.template.yml` to a persistant place and fill in the needed information.
+Copy `ansible/inventory.template.yml` to a persistant place and fill in the needed information.
 
 Start the services with: 
 ```shell

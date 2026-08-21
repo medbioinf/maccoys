@@ -91,7 +91,7 @@
     name: maccoys-{{ maccoys_id }}
     # auto_remove: true
     user: "{{ hostvars[inventory_hostname]['maccoys_docker_user']['uid'] }}:{{ hostvars[inventory_hostname]['maccoys_docker_user']['gid'] }}"
-    volumes: "{{ volumes + (hostvars[inventory_hostname]['volumes'] | default([])) }}"
+    volumes: "{{ volumes + (maccoys_volumes | default([])) }}"
     ulimits: nofile:4096:65535
     published_ports: "{{ (ports | default([])) + ['0.0.0.0:' ~ prometheus_scraping_port|string ~ ':' ~ prometheus_scraping_port|string] }}"
     command: >

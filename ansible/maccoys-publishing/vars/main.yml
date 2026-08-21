@@ -1,0 +1,5 @@
+#SPDX-License-Identifier: MIT-0
+---
+# vars file for maccoys-publishing
+
+maccoys_volumes: "{{ hostvars[inventory_hostname]['publishing_volumes'] | default([]) }}"

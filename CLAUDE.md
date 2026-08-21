@@ -143,7 +143,7 @@ Production deployment is one Docker image (`docker/maccoys/Dockerfile`) run repe
 different `pipeline <subcommand>` per role, orchestrated by a single Ansible playbook
 (`ansible/main.yml`) — not docker-compose (the root `docker-compose.yaml` only stands up a
 local dev Redis on port 6380). Inventory groups map 1:1 to pipeline stages
-(`ansible/hosts.template.yml`): `storage` (Redis), `queue` (the HTTP queue server, port 8123),
+(`ansible/inventory.template.yml`): `storage` (Redis), `queue` (the HTTP queue server, port 8123),
 `entrypoint` (public API, port 8000), `indexing`, `search_space_generation`, `identification`,
 `scoring`, `publishing`, `error`, plus `monitoring` (Prometheus/Grafana/Loki) and `monitored`
 (node-exporter on every host). All `maccoys-*` Ansible roles are thin wrappers that

@@ -2,3 +2,4 @@
 ---
 # vars file for maccoys-http-queue-server
 ports: "{{ hostvars[inventory_hostname]['queue_ports'] | default([]) }}"
+maccoys_volumes: "{{ hostvars[inventory_hostname]['queue_volumes'] | default([]) }}"
