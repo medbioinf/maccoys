@@ -63,7 +63,7 @@ tower-http = { workspace = true, features = ["cors", "trace"] }
 tracing = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 xcorrrs = { workspace = true }
 
 [dev-dependencies]
