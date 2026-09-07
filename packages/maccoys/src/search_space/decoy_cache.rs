@@ -85,7 +85,7 @@ impl DecoyCache {
             .map_err(|e| Error::WebClientBuild(Box::new(e)))
     }
 
-    pub async fn cache(&self, _decoys: Vec<(PeptideSequence, i16)>) -> Result<()> {
+    pub async fn cache(&self, _decoys: Vec<(PeptideSequence, i16)>) -> Result<(), Error> {
         // Decoys might be removed anywys
         unimplemented!()
         // match &self.client {

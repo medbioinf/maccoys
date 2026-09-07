@@ -5,7 +5,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 // 3rd party imports
-use anyhow::Result;
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
 use dihardts_omicstools::proteomics::peptide::Terminus;
 use dihardts_omicstools::proteomics::post_translational_modifications::Position as PtmPosition;
@@ -35,8 +34,20 @@ use crate::search_space::target_lookup::TargetLookup;
 pub enum Error {
     #[error("MaCPepDB returned error in stream: {0}")]
     ApiStream(String),
+    #[error("Regex error in search space generator: {0}")]
+    CleavageRegex(Box<fancy_regex::Error>),
+    #[error("Decoy cache error in search space generator: {0}")]
+    DecoyCache(Box<crate::search_space::decoy_cache::Error>),
+    #[error("Decoy generator error in search space generator: {0}")]
+    DecoyGenerator(anyhow::Error),
+    #[error("Unable to flush FASTA file: {0}")]
+    FastaFlush(Box<std::io::Error>),
+    #[error("Unable to write to FASTA file: {0}")]
+    FastaWrite(Box<std::io::Error>),
     #[error("Error getting next peptide from HTTP stream: {0}")]
     NextFromHttpStream(Box<reqwest::Error>),
+    #[error("Error getting next decoy from HTTP stream: {0}")]
+    NextDecoyFromStream(anyhow::Error),
     #[error("Peptifoform search client error in search space generator: {0}")]
     PeptidoformSearchClient(Box<macpepdb::peptidoform_search_client::Error>),
     #[error("Post-translational modification error in search space generator: {0}")]
@@ -47,11 +58,31 @@ pub enum Error {
     SearchRequest(Box<reqwest::Error>),
     #[error("Seqeunce error in search space generator: {0}")]
     Sequence(Box<macpepdb::sequence::Error>),
+    #[error("target lookup error in search space generator: {0}")]
+    TargetLookup(Box<crate::search_space::target_lookup::Error>),
     #[error(
         "Unsuccessful search request, status code: {0}, content type: {1}, response text: {2}"
     )]
     UnsuccessfullSearchRequest(StatusCode, String, String),
 }
+
+into_thiserror_boxed!(fancy_regex::Error, Error, CleavageRegex);
+into_thiserror_boxed!(crate::search_space::decoy_cache::Error, Error, DecoyCache);
+into_thiserror_boxed!(
+    macpepdb::peptidoform_search_client::Error,
+    Error,
+    PeptidoformSearchClient
+);
+into_thiserror_boxed!(
+    macpepdb::post_translational_modification::Error,
+    Error,
+    PostTranslationalModification
+);
+into_thiserror_boxed!(
+    crate::search_space::target_lookup::Error,
+    Error,
+    TargetLookup
+);
 
 /// Trait defining a search space to accumulate target and decoy peptides
 ///
@@ -64,7 +95,7 @@ pub trait IsSearchSpace {
     fn add_target(
         &mut self,
         seqeunce: String,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Adds a decoy peptide sequence to the search space
     ///
@@ -74,7 +105,7 @@ pub trait IsSearchSpace {
     fn add_decoys(
         &mut self,
         seqeunce: String,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 
     /// Returns the number of target peptides in the search space
     ///
@@ -86,7 +117,7 @@ pub trait IsSearchSpace {
 
     /// Finalizes the search space, e.g by flushing buffers
     ///
-    fn done(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn done(&mut self) -> impl std::future::Future<Output = Result<(), Error>> + Send;
 }
 
 /// In-memory implementation of a search space
@@ -105,12 +136,12 @@ impl InMemorySearchSpace {
 }
 
 impl IsSearchSpace for InMemorySearchSpace {
-    async fn add_target(&mut self, sequence: String) -> Result<()> {
+    async fn add_target(&mut self, sequence: String) -> Result<(), Error> {
         self.targets.push(sequence);
         Ok(())
     }
 
-    async fn add_decoys(&mut self, sequence: String) -> Result<()> {
+    async fn add_decoys(&mut self, sequence: String) -> Result<(), Error> {
         self.decoys.push(sequence);
         Ok(())
     }
@@ -123,7 +154,7 @@ impl IsSearchSpace for InMemorySearchSpace {
         self.decoys.len()
     }
 
-    async fn done(&mut self) -> Result<()> {
+    async fn done(&mut self) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -187,7 +218,7 @@ impl FastaSearchSpace {
 }
 
 impl IsSearchSpace for FastaSearchSpace {
-    async fn add_target(&mut self, sequence: String) -> Result<()> {
+    async fn add_target(&mut self, sequence: String) -> Result<(), Error> {
         self.fasta
             .write_all(
                 Self::gen_fasta_entry(
@@ -198,15 +229,19 @@ impl IsSearchSpace for FastaSearchSpace {
                 )
                 .as_bytes(),
             )
-            .await?;
+            .await
+            .map_err(|err| Error::FastaWrite(Box::new(err)))?;
         self.target_ctr += 1;
         if self.target_ctr.is_multiple_of(1000) {
-            self.fasta.flush().await?;
+            self.fasta
+                .flush()
+                .await
+                .map_err(|err| Error::FastaFlush(Box::new(err)))?;
         }
         Ok(())
     }
 
-    async fn add_decoys(&mut self, sequence: String) -> Result<()> {
+    async fn add_decoys(&mut self, sequence: String) -> Result<(), Error> {
         self.fasta
             .write_all(
                 Self::gen_fasta_entry(
@@ -217,10 +252,14 @@ impl IsSearchSpace for FastaSearchSpace {
                 )
                 .as_bytes(),
             )
-            .await?;
+            .await
+            .map_err(|err| Error::FastaWrite(Box::new(err)))?;
         self.decoy_ctr += 1;
         if self.decoy_ctr.is_multiple_of(1000) {
-            self.fasta.flush().await?;
+            self.fasta
+                .flush()
+                .await
+                .map_err(|err| Error::FastaFlush(Box::new(err)))?;
         }
         Ok(())
     }
@@ -235,8 +274,11 @@ impl IsSearchSpace for FastaSearchSpace {
 
     /// This flushs the underlying writer
     ///
-    async fn done(&mut self) -> Result<()> {
-        self.fasta.flush().await?;
+    async fn done(&mut self) -> Result<(), Error> {
+        self.fasta
+            .flush()
+            .await
+            .map_err(|err| Error::FastaFlush(Box::new(err)))?;
         Ok(())
     }
 }
@@ -256,7 +298,7 @@ impl SearchSpaceGenerator {
         decoy_url: Option<String>,
         target_lookup_url: Option<String>,
         decoy_cache_url: Option<String>,
-    ) -> Result<Self> {
+    ) -> Result<Self, Error> {
         let target_client = PeptidoformSearchClient::try_from_url(target_url).await?;
         let decoy_client = match decoy_url.as_ref() {
             Some(url) => Some(PeptidoformSearchClient::try_from_url(url).await?),
@@ -364,7 +406,7 @@ impl SearchSpaceGenerator {
         upper_mass_tolerance_ppm: i64,
         max_variable_modifications: usize,
         ptms: Arc<PTMCollection<Arc<PostTranslationalModification>>>,
-    ) -> Result<()>
+    ) -> Result<(), Error>
     where
         T: IsSearchSpace,
     {
@@ -461,7 +503,8 @@ impl SearchSpaceGenerator {
             static_n_terminus_modification,
             static_c_terminus_modification,
         )
-        .await?;
+        .await
+        .map_err(Error::DecoyGenerator)?;
         let decoy_stream = decoy_gen
             .stream(
                 mass,
@@ -474,12 +517,13 @@ impl SearchSpaceGenerator {
                 180.0,
                 false,
             )
-            .await?;
+            .await
+            .map_err(Error::DecoyGenerator)?;
 
         pin_mut!(decoy_stream);
 
         while let Some(decoy) = decoy_stream.next().await {
-            let sequence = decoy?;
+            let sequence = decoy.map_err(Error::NextDecoyFromStream)?;
             if let Some(ref target_lookup) = target_lookup {
                 if target_lookup.is_target(&sequence).await? {
                     continue;
@@ -509,7 +553,7 @@ impl SearchSpaceGenerator {
         ptms: Arc<PTMCollection<Arc<PostTranslationalModification>>>,
         decoys_per_peptide: usize,
         concurrent_searches: NonZeroUsize,
-    ) -> Result<()>
+    ) -> Result<(), Error>
     where
         T: IsSearchSpace,
     {

@@ -181,9 +181,9 @@ impl SearchSpaceGenerationTask {
                 .await
                 {
                     Ok(generator) => generator,
-                    Err(e) => {
+                    Err(err) => {
                         let error_message = message.to_error_message_with_precursor(
-                            SearchSpaceGenerationError::FastaGenerationError(e).into(),
+                            SearchSpaceGenerationError::from(err).into(),
                             precursor.clone(),
                         );
                         error!("{}", &error_message);
@@ -206,9 +206,9 @@ impl SearchSpaceGenerationTask {
                     .await
                 {
                     Ok(_) => (),
-                    Err(e) => {
+                    Err(err) => {
                         let error_message = message.to_error_message_with_precursor(
-                            SearchSpaceGenerationError::FastaGenerationError(e).into(),
+                            SearchSpaceGenerationError::from(err).into(),
                             precursor.clone(),
                         );
                         error!("{}", &error_message);

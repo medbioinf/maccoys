@@ -19,7 +19,7 @@ pub enum SearchSpaceGenerationError {
     #[error("Error while reading the spectrum `{0}`:\n\t{1}")]
     SpectrumReadError(String, anyhow::Error),
     #[error("Error generating FASTA:\n\t{0}")]
-    FastaGenerationError(anyhow::Error),
+    SearchSpaceGenerator(Box<crate::search_space::search_space_generator::Error>),
     #[error("Error when flushing FASTA:\n\t{0}")]
     FastaFlushError(std::io::Error),
     #[error("Could not increased total spectrum count:\n\t{0}")]
@@ -37,3 +37,9 @@ pub enum SearchSpaceGenerationError {
     #[error("Target lookup error in search space generation: {0}")]
     TargetLookup(crate::search_space::target_lookup::Error),
 }
+
+into_thiserror_boxed!(
+    crate::search_space::search_space_generator::Error,
+    SearchSpaceGenerationError,
+    SearchSpaceGenerator
+);
