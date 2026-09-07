@@ -1,9 +1,9 @@
 {
   "[rust]": {
-    "editor.defaultFormatter": "statiolake.vscode-rustfmt",
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
     "editor.formatOnSave": true
   },
   "[python]": {
     "editor.defaultFormatter": "ms-python.black-formatter",
     "editor.formatOnSave": true
-}
+  }
