@@ -1,3 +1,6 @@
+# Ansible
+.ansible/
+
 #IDE
 .zed/
 .vscode/
