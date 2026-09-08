@@ -17,10 +17,7 @@ bin_offset = 0.0
 use_flanking_peaks = true
 minimum_intensity = 0.0
 max_fragment_charge = 3
-ions = [
-    "B",
-    "Y",
-]
+ions = ["B", "Y"]
 use_neutral_loss_ions = false
 
 [index]
@@ -34,6 +31,7 @@ num_tasks = 1
 queue_name = "search_space_generation"
 queue_capacity = 10
 queue_url = "http://127.0.0.1:0"
+concurrent_searches = 1
 target_url = "httpa://macpepdb.cubimed.rub.de"
 # decoy_url = "http://
 # target_lookup_url = "http://
