@@ -15,6 +15,7 @@ use macpepdb::mass::to_int as mass_to_int;
 use macpepdb::peptidoform_search_client::PeptidoformSearchClient;
 use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
 use macpepdb::sequence::PeptideSequence;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::error;
@@ -27,6 +28,7 @@ use crate::constants::{
     FASTA_DECOY_ENTRY_NAME_PREFIX, FASTA_DECOY_ENTRY_PREFIX, FASTA_TARGET_ENTRY_NAME_PREFIX,
     FASTA_TARGET_ENTRY_PREFIX,
 };
+use crate::peptide_arena::PeptideArena;
 use crate::search_space::decoy_cache::DecoyCache;
 use crate::search_space::target_lookup::TargetLookup;
 
@@ -123,15 +125,34 @@ pub trait IsSearchSpace {
 /// In-memory implementation of a search space
 ///
 ///
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InMemorySearchSpace {
-    targets: Vec<String>,
-    decoys: Vec<String>,
+    targets: PeptideArena,
+    decoys: PeptideArena,
 }
 
 impl InMemorySearchSpace {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.targets.len() + self.decoys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty() && self.decoys.is_empty()
+    }
+
+    pub fn into_single_peptide_arena(self) -> PeptideArena {
+        let mut combined = PeptideArena::new();
+        combined.merge(self.targets);
+        combined.merge(self.decoys);
+        combined
+    }
+
+    pub fn size(&self) -> usize {
+        self.targets.size() + self.decoys.size()
     }
 }
 
@@ -162,7 +183,7 @@ impl IsSearchSpace for InMemorySearchSpace {
 #[allow(clippy::from_over_into)]
 impl Into<(Vec<String>, Vec<String>)> for InMemorySearchSpace {
     fn into(self) -> (Vec<String>, Vec<String>) {
-        (self.targets, self.decoys)
+        (self.targets.into(), self.decoys.into())
     }
 }
 

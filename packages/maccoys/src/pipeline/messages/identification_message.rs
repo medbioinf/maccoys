@@ -7,6 +7,7 @@ use crate::{
     peptide_spectrum_match::PeptideSpectrumMatchCollection,
     pipeline::errors::{identification_error::IdentificationError, pipeline_error::PipelineError},
     precursor::Precursor,
+    search_space::search_space_generator::InMemorySearchSpace,
 };
 
 use super::{
@@ -18,7 +19,7 @@ const ID_PREFIX: &str = "maccoys_itentification_message";
 
 /// Indexing message
 ///
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct IdentificationMessage {
     /// Search uuid
     uuid: String,
@@ -33,7 +34,7 @@ pub struct IdentificationMessage {
     /// Precursor (m/z, charge) used for generating the search space
     precursor: Precursor,
     /// peptide candidates in ProForma format
-    peptides: Vec<String>,
+    search_space: InMemorySearchSpace,
 }
 
 impl IdentificationMessage {
@@ -46,7 +47,7 @@ impl IdentificationMessage {
         mz_list: Array1<f64>,
         intensity_list: Array1<f64>,
         precursor: Precursor,
-        peptides: Vec<String>,
+        search_space: InMemorySearchSpace,
     ) -> Self {
         Self {
             uuid,
@@ -55,7 +56,7 @@ impl IdentificationMessage {
             mz_list,
             intensity_list,
             precursor,
-            peptides,
+            search_space,
         }
     }
 
@@ -96,14 +97,14 @@ impl IdentificationMessage {
 
     /// Get the peptide candidates in ProForma format
     ///
-    pub fn peptides(&self) -> &Vec<String> {
-        &self.peptides
+    pub fn search_space(&self) -> &InMemorySearchSpace {
+        &self.search_space
     }
 
-    /// Takes and returns peptides, leaving an empty vector in its place
+    /// Takes and returns search_space, leaving an empty vector in its place
     ///
-    pub fn take_peptides(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.peptides)
+    pub fn take_search_space(&mut self) -> InMemorySearchSpace {
+        std::mem::take(&mut self.search_space)
     }
 
     /// Creates a publication message for non result publication

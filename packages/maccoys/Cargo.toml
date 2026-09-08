@@ -46,7 +46,7 @@ reqwest = { workspace = true, features = [
     "json",
     "stream",
     "multipart",
-    "http2"
+    "http2",
 ] }
 rustis = { workspace = true, features = ["tokio-runtime"] }
 serde = { workspace = true }

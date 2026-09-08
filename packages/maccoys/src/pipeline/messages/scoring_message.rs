@@ -16,7 +16,7 @@ const ID_PREFIX: &str = "maccoys_scoring_message";
 
 /// Scoring message
 ///
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize)]
 pub struct ScoringMessage {
     /// Search uuid
     uuid: String,

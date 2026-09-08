@@ -217,16 +217,10 @@ impl SearchSpaceGenerationTask {
                     }
                 };
 
-                let (target, decoys): (Vec<String>, Vec<String>) = search_space.into();
-
-                let mut candidates = target;
-                candidates.extend(decoys);
-
-                let cadidates_size =
-                    candidates.iter().map(|p| p.len()).sum::<usize>() * std::mem::size_of::<char>();
-                let candidates_len = candidates.len();
-
                 let elapsed = now.elapsed();
+
+                let search_space_size = search_space.size();
+                let search_space_len = search_space.len();
 
                 info!(
                     "[search space generation] Took {:.4}s to process message {}/{}/{} with {} m/z & {} charge. Found {} candidate peptides",
@@ -236,11 +230,11 @@ impl SearchSpaceGenerationTask {
                     message.spectrum_id(),
                     precursor.mz(),
                     precursor.charge(),
-                    candidates.len(),
+                    search_space.len(),
                 );
 
                 let identification_message =
-                    message.into_identification_message(precursor.clone(), candidates);
+                    message.into_identification_message(precursor.clone(), search_space);
 
                 Self::enqueue_message(identification_message, identification_queue.as_ref()).await;
                 Self::ack_message(&message_id, search_space_generation_queue.as_ref()).await;
@@ -276,7 +270,7 @@ impl SearchSpaceGenerationTask {
                 Self::enqueue_message(
                     message.into_publication_message(
                         metrics_path,
-                        cadidates_size.to_string().into_bytes(),
+                        search_space_size.to_string().into_bytes(),
                     ),
                     publication_queue.as_ref(),
                 )
@@ -293,7 +287,7 @@ impl SearchSpaceGenerationTask {
                 Self::enqueue_message(
                     message.into_publication_message(
                         metrics_path,
-                        candidates_len.to_string().into_bytes(),
+                        search_space_len.to_string().into_bytes(),
                     ),
                     publication_queue.as_ref(),
                 )

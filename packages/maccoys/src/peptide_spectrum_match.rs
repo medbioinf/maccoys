@@ -16,9 +16,11 @@ use parquet::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use xcorrrs::scoring_result::ScoringResult;
 
-use crate::{pipeline::tasks::scoring_task::FEATURES as LOOP_FEATURES, precursor::Precursor};
+use crate::{
+    peptide_arena::PeptideArena, pipeline::tasks::scoring_task::FEATURES as LOOP_FEATURES,
+    precursor::Precursor,
+};
 
 /// Key under which the [`PsmCollectionMetadata`] is stored in the parquet file's
 /// key-value metadata (footer), since `scan_id`/`precursor`/`experimental_mass`
@@ -61,6 +63,8 @@ pub enum Error {
     MissingPsmMetadataValue,
     #[error("Parquet file is missing column `{0}` or it has an unexpected data type")]
     InvalidColumn(&'static str),
+    #[error("Peptide (incl. ProForma modification annotations) is too long:\n\t{0}")]
+    PeptideTooLong(#[from] crate::peptide_arena::SequenceTooLongError),
 }
 
 /// Scalar attributes of a [`PeptideSpectrumMatchCollection`] that are shared by
@@ -158,83 +162,152 @@ impl<'a> PeptideSpectrumMatch<'a> {
 /// identical for every PSM in the collection (one collection == one spectrum), so
 /// they're stored once instead of once per row.
 ///
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+/// Peptides are stored in a [`PeptideArena`] rather than as `Vec<String>`, so at up
+/// to ~1M rows this avoids one heap allocation per peptide.
+///
+/// `second_theoretical_mass_col` uses `f64::NAN` as a sentinel for "no second mass"
+/// instead of `Option<f64>`, which has no niche for `f64` and so costs 16 bytes/row
+/// instead of 8.
+///
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PeptideSpectrumMatchCollection {
     scan_id: String,
     precursor: Precursor,
     experimental_mass: f64,
-    peptide_col: Vec<String>,
+    peptides: PeptideArena,
     xcorr_col: Vec<f64>,
     ions_total_col: Vec<u64>,
     ions_matched_col: Vec<u64>,
     theoretical_mass_col: Vec<f64>,
-    second_theoretical_mass_col: Vec<Option<f64>>,
+    second_theoretical_mass_col: Vec<f64>,
     loop_score_col: Option<Vec<f64>>,
 }
 
-impl PeptideSpectrumMatchCollection {
-    /// Creates a new, empty collection for the given scan/precursor.
-    ///
-    /// # Arguments
-    /// * `scan_id` - Scan ID shared by every PSM in this collection
-    /// * `precursor` - Precursor shared by every PSM in this collection
-    ///
-    pub fn new(scan_id: String, precursor: Precursor) -> Self {
-        Self::with_capacity(scan_id, precursor, 0)
-    }
+impl PartialEq for PeptideSpectrumMatchCollection {
+    fn eq(&self, other: &Self) -> bool {
+        // `xcorr_col`/`theoretical_mass_col`/`second_theoretical_mass_col` are seeded
+        // with the `f64::NAN` sentinel (`with_capacity`) for "no result yet"/"no second
+        // mass", and a computed `loop_score` could in principle also be `NaN`; `NaN !=
+        // NaN` under `==`, so compare bit patterns instead everywhere an `f64` column
+        // is involved.
+        fn f64_cols_eq(a: &[f64], b: &[f64]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
+        }
 
+        self.scan_id == other.scan_id
+            && self.precursor == other.precursor
+            && self.experimental_mass == other.experimental_mass
+            && self.peptides == other.peptides
+            && f64_cols_eq(&self.xcorr_col, &other.xcorr_col)
+            && self.ions_total_col == other.ions_total_col
+            && self.ions_matched_col == other.ions_matched_col
+            && f64_cols_eq(&self.theoretical_mass_col, &other.theoretical_mass_col)
+            && f64_cols_eq(
+                &self.second_theoretical_mass_col,
+                &other.second_theoretical_mass_col,
+            )
+            && match (&self.loop_score_col, &other.loop_score_col) {
+                (Some(a), Some(b)) => f64_cols_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl PeptideSpectrumMatchCollection {
     /// Creates a new, empty collection for the given scan/precursor with preallocated capacity.
     ///
     /// # Arguments
     /// * `scan_id` - Scan ID shared by every PSM in this collection
     /// * `precursor` - Precursor shared by every PSM in this collection
-    /// * `capacity` - Number of PSMs to preallocate space for
+    /// * `peptides` - Peptides to preallocate space for
     ///
-    pub fn with_capacity(scan_id: String, precursor: Precursor, capacity: usize) -> Self {
+    pub fn with_capacity(scan_id: String, precursor: Precursor, peptides: PeptideArena) -> Self {
         let experimental_mass = mass_to_charge_to_dalton(precursor.mz(), precursor.charge());
         Self {
             scan_id,
             precursor,
             experimental_mass,
-            peptide_col: Vec::with_capacity(capacity),
-            xcorr_col: Vec::with_capacity(capacity),
-            ions_total_col: Vec::with_capacity(capacity),
-            ions_matched_col: Vec::with_capacity(capacity),
-            theoretical_mass_col: Vec::with_capacity(capacity),
-            second_theoretical_mass_col: Vec::with_capacity(capacity),
+            xcorr_col: vec![f64::NAN; peptides.len()],
+            ions_total_col: vec![0; peptides.len()],
+            ions_matched_col: vec![0; peptides.len()],
+            theoretical_mass_col: vec![f64::NAN; peptides.len()],
+            second_theoretical_mass_col: vec![f64::NAN; peptides.len()],
             loop_score_col: None,
+            peptides,
         }
     }
 
-    /// Adds a PSM for the given peptide/scoring result to the collection.
+    /// Returns an iterator over this collection's peptides (O(n) total, via
+    /// [`PeptideArena::iter`]) together with mutable slices into every scoring-result
+    /// column, for callers that want to fill in scores directly by index (e.g. from a
+    /// parallel iterator).
     ///
-    /// # Arguments
-    /// * `peptide` - Amino acid sequence of the peptide in ProForma format
-    /// * `scoring_result` - Result of the scoring
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn peptides_and_columns_mut(
+        &mut self,
+    ) -> (
+        impl Iterator<Item = &str>,
+        &mut [f64],
+        &mut [u64],
+        &mut [u64],
+        &mut [f64],
+        &mut [f64],
+    ) {
+        (
+            self.peptides.iter(),
+            &mut self.xcorr_col,
+            &mut self.ions_total_col,
+            &mut self.ions_matched_col,
+            &mut self.theoretical_mass_col,
+            &mut self.second_theoretical_mass_col,
+        )
+    }
+
+    /// Drops every row whose `xcorr_col` entry is still the `f64::NAN` "no result yet"
+    /// sentinel (see [`Self::with_capacity`]) — i.e. every candidate this collection
+    /// preallocated a row for but that a caller filling it via
+    /// [`Self::peptides_and_columns_mut`] never actually wrote a result into, e.g.
+    /// because its score was below a threshold or scoring it errored. Keeps the
+    /// relative order of the remaining rows.
     ///
-    pub fn push(&mut self, peptide: String, scoring_result: ScoringResult) {
-        self.peptide_col.push(peptide);
-        self.xcorr_col.push(scoring_result.score);
-        self.ions_total_col.push(scoring_result.ions_total as u64);
-        self.ions_matched_col
-            .push(scoring_result.ions_matched as u64);
-        self.theoretical_mass_col
-            .push(scoring_result.min_theoretical_mass);
-        self.second_theoretical_mass_col.push(
-            if scoring_result.min_theoretical_mass == scoring_result.max_theoretical_mass {
-                None
-            } else {
-                Some(scoring_result.max_theoretical_mass)
-            },
+    /// Callers that only conditionally write a row's columns (as `run_xcorr_search`
+    /// does) must call this before returning/publishing the collection, or every
+    /// unwritten candidate ends up in the result as a bogus all-NaN/all-zero row.
+    ///
+    /// Must be called before [`Self::set_loop_score_col`]; panics (in debug builds)
+    /// if `loop_score_col` is already set, since this method doesn't filter it.
+    ///
+    pub fn retain_scored(&mut self) {
+        debug_assert!(
+            self.loop_score_col.is_none(),
+            "retain_scored must be called before set_loop_score_col"
         );
+
+        let keep: Vec<bool> = self.xcorr_col.iter().map(|x| !x.is_nan()).collect();
+
+        self.peptides.retain(&keep);
+
+        // Filters a column `Vec` in lockstep with `keep`, using an external index
+        // counter into the mask rather than duplicating this loop 5 times.
+        fn retain_by_mask<T>(col: &mut Vec<T>, keep: &[bool]) {
+            let mut keep_iter = keep.iter();
+            col.retain(|_| *keep_iter.next().unwrap());
+        }
+
+        retain_by_mask(&mut self.xcorr_col, &keep);
+        retain_by_mask(&mut self.ions_total_col, &keep);
+        retain_by_mask(&mut self.ions_matched_col, &keep);
+        retain_by_mask(&mut self.theoretical_mass_col, &keep);
+        retain_by_mask(&mut self.second_theoretical_mass_col, &keep);
     }
 
     pub fn len(&self) -> usize {
-        self.peptide_col.len()
+        self.peptides.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.peptide_col.is_empty()
+        self.peptides.is_empty()
     }
 
     pub fn scan_id(&self) -> &str {
@@ -249,8 +322,19 @@ impl PeptideSpectrumMatchCollection {
         self.experimental_mass
     }
 
-    pub fn peptide_col(&self) -> &[String] {
-        &self.peptide_col
+    /// Returns the peptide of the `idx`-th PSM in the collection.
+    ///
+    /// O(idx); prefer [`Self::peptides`] over calling this in a loop.
+    ///
+    pub fn peptide(&self, idx: usize) -> &str {
+        self.peptides.get(idx)
+    }
+
+    /// Returns an iterator over the peptides of every PSM in the collection, in
+    /// order. O(n) total, unlike calling [`Self::peptide`] in a loop.
+    ///
+    pub fn peptides(&self) -> impl Iterator<Item = &str> {
+        self.peptides.iter()
     }
 
     pub fn xcorr_col(&self) -> &[f64] {
@@ -269,8 +353,22 @@ impl PeptideSpectrumMatchCollection {
         &self.theoretical_mass_col
     }
 
-    pub fn second_theoretical_mass_col(&self) -> &[Option<f64>] {
+    /// Returns the raw second-theoretical-mass column, using `f64::NAN` as the
+    /// "no second mass" sentinel (see [`Self::second_theoretical_mass`] for the
+    /// `Option<f64>` view of a single row).
+    pub fn second_theoretical_mass_col(&self) -> &[f64] {
         &self.second_theoretical_mass_col
+    }
+
+    /// Returns the second theoretical mass of the `idx`-th PSM, or `None` if the
+    /// peptide's mass is unambiguous.
+    pub fn second_theoretical_mass(&self, idx: usize) -> Option<f64> {
+        let value = self.second_theoretical_mass_col[idx];
+        if value.is_nan() {
+            None
+        } else {
+            Some(value)
+        }
     }
 
     pub fn loop_score_col(&self) -> Option<&[f64]> {
@@ -285,17 +383,12 @@ impl PeptideSpectrumMatchCollection {
         std::mem::size_of::<Self>()
             + self.scan_id.capacity()
             + self.precursor.size()
-            + self.peptide_col.capacity() * std::mem::size_of::<String>()
-            + self
-                .peptide_col
-                .iter()
-                .map(|peptide| peptide.capacity())
-                .sum::<usize>()
+            + self.peptides.size()
             + self.xcorr_col.capacity() * std::mem::size_of::<f64>()
             + self.ions_total_col.capacity() * std::mem::size_of::<u64>()
             + self.ions_matched_col.capacity() * std::mem::size_of::<u64>()
             + self.theoretical_mass_col.capacity() * std::mem::size_of::<f64>()
-            + self.second_theoretical_mass_col.capacity() * std::mem::size_of::<Option<f64>>()
+            + self.second_theoretical_mass_col.capacity() * std::mem::size_of::<f64>()
             + self
                 .loop_score_col
                 .as_ref()
@@ -326,11 +419,7 @@ impl PeptideSpectrumMatchCollection {
         let mut column_writer = row_group_writer
             .next_column()?
             .expect("psm_collection schema should have a `peptide` column");
-        let peptide_values: Vec<ByteArray> = self
-            .peptide_col
-            .iter()
-            .map(|peptide| ByteArray::from(peptide.as_str()))
-            .collect();
+        let peptide_values: Vec<ByteArray> = self.peptides().map(ByteArray::from).collect();
         column_writer
             .typed::<ByteArrayType>()
             .write_batch(&peptide_values, None, None)?;
@@ -383,13 +472,12 @@ impl PeptideSpectrumMatchCollection {
             .expect("psm_collection schema should have a `second_theoretical_mass` column");
         let mut second_mass_values = Vec::new();
         let mut second_mass_def_levels = Vec::with_capacity(self.len());
-        for value in &self.second_theoretical_mass_col {
-            match value {
-                Some(value) => {
-                    second_mass_values.push(*value);
-                    second_mass_def_levels.push(1i16);
-                }
-                None => second_mass_def_levels.push(0i16),
+        for &value in &self.second_theoretical_mass_col {
+            if value.is_nan() {
+                second_mass_def_levels.push(0i16);
+            } else {
+                second_mass_values.push(value);
+                second_mass_def_levels.push(1i16);
             }
         }
         column_writer.typed::<DoubleType>().write_batch(
@@ -453,10 +541,10 @@ impl PeptideSpectrumMatchCollection {
             None,
             &mut peptide_values,
         )?;
-        let peptide_col = peptide_values
-            .into_iter()
-            .map(|value| Ok(value.as_utf8()?.to_string()))
-            .collect::<Result<Vec<String>, Error>>()?;
+        let mut peptides = PeptideArena::with_capacity(num_rows);
+        for value in peptide_values {
+            peptides.try_push(value.as_utf8()?)?;
+        }
 
         let mut xcorr_col = Vec::with_capacity(num_rows);
         Self::typed_column_reader::<DoubleType>(row_group_reader, 1, "xcorr")?.read_records(
@@ -504,13 +592,15 @@ impl PeptideSpectrumMatchCollection {
                 &mut second_mass_values,
             )?;
         let mut second_mass_values = second_mass_values.into_iter();
-        let second_theoretical_mass_col: Vec<Option<f64>> = second_mass_def_levels
+        let second_theoretical_mass_col: Vec<f64> = second_mass_def_levels
             .into_iter()
             .map(|def_level| {
                 if def_level == 1 {
-                    second_mass_values.next()
+                    second_mass_values
+                        .next()
+                        .expect("second_theoretical_mass column value/level count mismatch")
                 } else {
-                    None
+                    f64::NAN
                 }
             })
             .collect();
@@ -546,7 +636,7 @@ impl PeptideSpectrumMatchCollection {
             scan_id: metadata.scan_id,
             precursor: metadata.precursor,
             experimental_mass: metadata.experimental_mass,
-            peptide_col,
+            peptides,
             xcorr_col,
             ions_total_col,
             ions_matched_col,
@@ -571,7 +661,7 @@ impl PeptideSpectrumMatchCollection {
 
 impl PointSource<f64> for PeptideSpectrumMatchCollection {
     fn len(&self) -> usize {
-        self.peptide_col.len()
+        PeptideSpectrumMatchCollection::len(self)
     }
 
     fn dim(&self) -> usize {
@@ -596,6 +686,8 @@ impl PointSource<f64> for PeptideSpectrumMatchCollection {
 mod tests {
     use std::{env::temp_dir, fs::File};
 
+    use xcorrrs::scoring_result::ScoringResult;
+
     use super::*;
 
     fn scoring_result(
@@ -614,20 +706,97 @@ mod tests {
         }
     }
 
+    /// Test helper mirroring the direct-column-write pattern `run_xcorr_search` uses via
+    /// [`PeptideSpectrumMatchCollection::peptides_and_columns_mut`].
+    fn set_scoring_result_at_index(
+        psms: &mut PeptideSpectrumMatchCollection,
+        idx: usize,
+        scoring_result: ScoringResult,
+    ) {
+        let (_, xcorr_col, ions_total_col, ions_matched_col, theoretical_mass_col, second_theoretical_mass_col) =
+            psms.peptides_and_columns_mut();
+        xcorr_col[idx] = scoring_result.score;
+        ions_total_col[idx] = scoring_result.ions_total as u64;
+        ions_matched_col[idx] = scoring_result.ions_matched as u64;
+        theoretical_mass_col[idx] = scoring_result.min_theoretical_mass;
+        second_theoretical_mass_col[idx] =
+            if scoring_result.min_theoretical_mass == scoring_result.max_theoretical_mass {
+                f64::NAN
+            } else {
+                scoring_result.max_theoretical_mass
+            };
+    }
+
+    #[test]
+    fn test_retain_scored() {
+        let mut peptide_arena = PeptideArena::new();
+        peptide_arena.push("PASSES_1");
+        peptide_arena.push("BELOW_THRESHOLD"); // never written -> stays NaN placeholder
+        peptide_arena.push("PASSES_2");
+        peptide_arena.push("ERRORED"); // never written -> stays NaN placeholder
+
+        let mut psms = PeptideSpectrumMatchCollection::with_capacity(
+            "scan_1".to_string(),
+            Precursor::new(500.25, 2),
+            peptide_arena,
+        );
+        // Mirrors `run_xcorr_search`: only indices that passed the score threshold get
+        // written; below-threshold and erroring candidates (indices 1 and 3) are left
+        // untouched at their `with_capacity` NaN/0 sentinel.
+        set_scoring_result_at_index(&mut psms, 0, scoring_result(1.23, 10, 7, 999.5, 999.9));
+        set_scoring_result_at_index(&mut psms, 2, scoring_result(2.5, 8, 4, 800.0, 800.0));
+
+        psms.retain_scored();
+
+        assert_eq!(psms.len(), 2);
+        assert_eq!(
+            psms.peptides().collect::<Vec<_>>(),
+            vec!["PASSES_1", "PASSES_2"]
+        );
+        assert_eq!(psms.xcorr_col(), &[1.23, 2.5]);
+        assert_eq!(psms.ions_total_col(), &[10, 8]);
+        assert_eq!(psms.ions_matched_col(), &[7, 4]);
+        assert_eq!(psms.theoretical_mass_col(), &[999.5, 800.0]);
+        // Row 0 was ambiguous-mass, row 1 (originally index 2) was unambiguous —
+        // confirms `second_theoretical_mass_col` stayed aligned after filtering.
+        assert_eq!(psms.second_theoretical_mass(0), Some(999.9));
+        assert_eq!(psms.second_theoretical_mass(1), None);
+    }
+
+    #[test]
+    fn test_retain_scored_all_below_threshold() {
+        let mut peptide_arena = PeptideArena::new();
+        peptide_arena.push("BELOW_THRESHOLD_1");
+        peptide_arena.push("BELOW_THRESHOLD_2");
+
+        let mut psms = PeptideSpectrumMatchCollection::with_capacity(
+            "scan_2".to_string(),
+            Precursor::new(500.25, 2),
+            peptide_arena,
+        );
+        // Nothing written -> every row stays a NaN placeholder.
+
+        psms.retain_scored();
+
+        assert_eq!(psms.len(), 0);
+        assert!(psms.is_empty());
+    }
+
     #[tokio::test]
     async fn test_psm_collection_parquet_roundtrip() {
-        let mut psms =
-            PeptideSpectrumMatchCollection::new("scan_1".to_string(), Precursor::new(500.25, 2));
+        let mut peptide_arena = PeptideArena::new();
+        peptide_arena.push("PEPTIDE");
+        peptide_arena.push("PEPTIDEK");
+
+        let mut psms = PeptideSpectrumMatchCollection::with_capacity(
+            "scan_1".to_string(),
+            Precursor::new(500.25, 2),
+            peptide_arena,
+        );
         // Ambiguous mass -> `second_theoretical_mass_col` entry is `Some(_)`
-        psms.push(
-            "PEPTIDE".to_string(),
-            scoring_result(1.23, 10, 7, 999.5, 999.9),
-        );
+        set_scoring_result_at_index(&mut psms, 0, scoring_result(1.23, 10, 7, 999.5, 999.9));
         // Unambiguous mass -> `second_theoretical_mass_col` entry is `None`
-        psms.push(
-            "PEPTIDEK".to_string(),
-            scoring_result(0.98, 12, 9, 1000.1, 1000.1),
-        );
+        set_scoring_result_at_index(&mut psms, 1, scoring_result(0.98, 12, 9, 1000.1, 1000.1));
         psms.set_loop_score_col(vec![0.1, 0.2]);
 
         let path = temp_dir()
@@ -645,12 +814,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_psm_collection_parquet_roundtrip_without_loop_score() {
-        let mut psms =
-            PeptideSpectrumMatchCollection::new("scan_2".to_string(), Precursor::new(600.5, 3));
-        psms.push(
-            "SEQVENCE".to_string(),
-            scoring_result(2.5, 8, 4, 800.0, 800.0),
+        let mut peptide_arena = PeptideArena::new();
+        peptide_arena.push("SEQVENCE");
+        peptide_arena.push("PEPTIDEK");
+        let mut psms = PeptideSpectrumMatchCollection::with_capacity(
+            "scan_2".to_string(),
+            Precursor::new(600.5, 3),
+            peptide_arena,
         );
+        set_scoring_result_at_index(&mut psms, 0, scoring_result(2.5, 8, 4, 800.0, 800.0));
 
         let path = temp_dir().join(
             "maccoys.tests.peptide_spectrum_match.psm_collection_roundtrip_without_loop_score.parquet",

@@ -9,6 +9,8 @@ pub mod errors;
 pub mod error;
 /// IO module for reading and writing files.
 pub mod io;
+/// Arena-backed accumulator for peptide sequences
+pub mod peptide_arena;
 /// Peptide spectruim match
 pub mod peptide_spectrum_match;
 /// Pipeline for MaCcoyS searches

@@ -8,6 +8,7 @@ use crate::{
         errors::pipeline_error::PipelineError, messages::publication_message::PublicationMessage,
     },
     precursor::Precursor,
+    search_space::search_space_generator::InMemorySearchSpace,
 };
 
 use super::{
@@ -100,7 +101,7 @@ impl SearchSpaceGenerationMessage {
     pub fn into_identification_message(
         &self,
         precursor: Precursor,
-        peptides: Vec<String>,
+        search_space: InMemorySearchSpace,
     ) -> IdentificationMessage {
         IdentificationMessage::new(
             self.uuid.clone(),
@@ -109,7 +110,7 @@ impl SearchSpaceGenerationMessage {
             self.mz_list.clone(),
             self.intensity_list.clone(),
             precursor,
-            peptides,
+            search_space,
         )
     }
 

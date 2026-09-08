@@ -30,9 +30,10 @@ use crate::{
         },
         queue::{HttpPipelineQueue, PipelineQueue},
         storage::{PipelineStorage, RedisPipelineStorage},
-        utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
+        utils::create_metrics_file_path_on_precursor_level,
     },
     precursor::Precursor,
+    search_space::search_space_generator::InMemorySearchSpace,
 };
 
 use super::task::Task;
@@ -109,7 +110,7 @@ impl IdentificationTask {
                 message.uuid(),
                 message.ms_run_name(),
                 message.spectrum_id(),
-                message.peptides().len()
+                message.search_space().len()
             );
 
             if last_search_uuid != *message.uuid() {
@@ -137,32 +138,33 @@ impl IdentificationTask {
                 metrics_counter_name = Self::get_counter_name(message.uuid());
             }
 
-            if current_search_params.keep_fasta_files {
-                let relative_fasta_path = create_file_path_on_precursor_level(
-                    message.uuid(),
-                    message.ms_run_name(),
-                    message.spectrum_id(),
-                    message.precursor(),
-                    "fasta",
-                );
-                let fasta_publication_message = message.into_publication_message(
-                    relative_fasta_path,
-                    message.peptides().join("\n").into_bytes(),
-                );
-                Self::enqueue_message(fasta_publication_message, publication_queue.as_ref()).await;
-            }
+            // TODO: Remove alongside setting `keep_fasta_files` in the search parameters
+            // if current_search_params.keep_fasta_files {
+            //     let relative_fasta_path = create_file_path_on_precursor_level(
+            //         message.uuid(),
+            //         message.ms_run_name(),
+            //         message.spectrum_id(),
+            //         message.precursor(),
+            //         "fasta",
+            //     );
+            //     let fasta_publication_message = message.into_publication_message(
+            //         relative_fasta_path,
+            //         message.peptides().join("\n").into_bytes(),
+            //     );
+            //     Self::enqueue_message(fasta_publication_message, publication_queue.as_ref()).await;
+            // }
 
             let now = std::time::Instant::now();
 
-            let peptides = message.take_peptides();
-            let peptides_len = peptides.len();
+            let search_space = message.take_search_space();
+            let peptides_len = search_space.len();
 
             let psms = match run_xcorr_search(
                 &FinalizedXcorrConfiguration::from(current_search_params.xcorr.clone()),
                 message.spectrum_id(),
                 (message.mz_list(), message.intensity_list()),
                 message.precursor(),
-                peptides,
+                search_space,
                 config.threads,
                 Some(current_search_params.score_threshold),
             ) {
@@ -322,62 +324,91 @@ pub fn run_xcorr_search(
     scan_id: &str,
     experimental_spectrum: (&ndarray::Array1<f64>, &ndarray::Array1<f64>),
     precursor: &Precursor,
-    peptides: Vec<String>,
+    search_space: InMemorySearchSpace,
     threads: usize,
     score_threshold: Option<f64>,
 ) -> Result<PeptideSpectrumMatchCollection, IdentificationError> {
     let score_threshold = score_threshold.unwrap_or(f64::NEG_INFINITY);
+    let peptides = search_space.into_single_peptide_arena();
 
-    let psm_collection: Arc<Mutex<PeptideSpectrumMatchCollection>> =
-        Arc::new(Mutex::new(PeptideSpectrumMatchCollection::with_capacity(
-            scan_id.to_string(),
-            precursor.clone(),
-            peptides.len(),
-        )));
+    let mut psm_collection = PeptideSpectrumMatchCollection::with_capacity(
+        scan_id.to_string(),
+        precursor.clone(),
+        peptides,
+    );
 
     let xcorrer = FastXcorr::new(config, experimental_spectrum, precursor.charge() as usize)
         .map_err(IdentificationError::from)?;
 
-    let errors: Arc<Mutex<Vec<IdentificationError>>> = Arc::new(Mutex::new(Vec::new()));
+    let errors: Mutex<Vec<IdentificationError>> = Mutex::new(Vec::new());
 
     let thread_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
         .map_err(IdentificationError::CreateIdentificationThreadPoolError)?;
 
+    let (
+        peptides_iter,
+        xcorr_col,
+        ions_total_col,
+        ions_matched_col,
+        theoretical_mass_col,
+        second_theoretical_mass_col,
+    ) = psm_collection.peptides_and_columns_mut();
+
+    // Materialized once
+    let peptide_refs: Vec<&str> = peptides_iter.collect();
+
+    // Every iteration writes straight into its own column slot
     thread_pool.install(|| {
-        peptides
+        (
+            peptide_refs,
+            xcorr_col,
+            ions_total_col,
+            ions_matched_col,
+            theoretical_mass_col,
+            second_theoretical_mass_col,
+        )
             .into_par_iter()
-            .for_each(|peptide| match xcorrer.xcorr_peptide(&peptide) {
-                Ok(scoring_result) => {
-                    if scoring_result.score >= score_threshold {
-                        let mut guard = psm_collection.lock().unwrap();
-                        guard.push(peptide, scoring_result);
+            .for_each(
+                |(
+                    peptide,
+                    xcorr,
+                    ions_total,
+                    ions_matched,
+                    theoretical_mass,
+                    second_theoretical_mass,
+                )| {
+                    match xcorrer.xcorr_peptide(peptide) {
+                        Ok(scoring_result) if scoring_result.score >= score_threshold => {
+                            *xcorr = scoring_result.score;
+                            *ions_total = scoring_result.ions_total as u64;
+                            *ions_matched = scoring_result.ions_matched as u64;
+                            *theoretical_mass = scoring_result.min_theoretical_mass;
+                            *second_theoretical_mass = if scoring_result.min_theoretical_mass
+                                == scoring_result.max_theoretical_mass
+                            {
+                                f64::NAN
+                            } else {
+                                scoring_result.max_theoretical_mass
+                            };
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            errors.lock().unwrap().push(IdentificationError::from(e));
+                        }
                     }
-                }
-                Err(e) => {
-                    let mut error_guard = errors.lock().unwrap();
-                    error_guard.push(IdentificationError::from(e));
-                }
-            })
+                },
+            );
     });
 
-    let psm_collect = Arc::try_unwrap(psm_collection)
-        .map_err(|_| {
-            IdentificationError::ArcIntoError("PeptideSpectrumMatchCollection".to_string())
-        })?
-        .into_inner()
-        .map_err(|_| {
-            IdentificationError::MutexLockError("PeptideSpectrumMatchCollection".to_string())
-        })?;
-
-    let errors = Arc::try_unwrap(errors)
-        .map_err(|_| IdentificationError::ArcIntoError("Errors".to_string()))?
+    let errors = errors
         .into_inner()
         .map_err(|_| IdentificationError::MutexLockError("Errors".to_string()))?;
 
     if errors.is_empty() {
-        Ok(psm_collect)
+        psm_collection.retain_scored();
+        Ok(psm_collection)
     } else {
         error!("Errors occurred during XCorr search:");
         for e in errors.iter() {
