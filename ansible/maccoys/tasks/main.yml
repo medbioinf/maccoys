@@ -99,7 +99,7 @@
       --terminal
       --log-file {{ log_dir }}/{{ maccoys_id }}.log
       --log-rotation  daily
-      --loki http://{{ groups['monitoring'][0] }}:3100
+      --loki http://{{ lookup('community.general.dig', groups['monitoring'][0]) }}:3100
       --prometheus 0.0.0.0:{{ prometheus_scraping_port }}
       pipeline {{ maccoys_cmd }} {{ maccoys_opts }} {{ config_file }}
 

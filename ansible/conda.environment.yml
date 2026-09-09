@@ -6,3 +6,4 @@ dependencies:
   - pip:
     - ansible
     - ansible-lint
+    - dnspython
