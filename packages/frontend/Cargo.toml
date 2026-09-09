@@ -18,7 +18,7 @@ dioxus = { workspace = true, features = ["router", "logger"] }
 dioxus-free-icons = { workspace = true, features = ["font-awesome-brands", "font-awesome-regular", "font-awesome-solid"] }
 dioxus-logger = { workspace = true }
 maccoys-exchange-entities = { workspace = true }
-plotly = { workspace = true }
+# plotly = { workspace = true }
 reqwest = {workspace = true, features=["json"]}
 serde = { workspace = true }
 serde_json = { workspace = true }
