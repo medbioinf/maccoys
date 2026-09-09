@@ -379,7 +379,7 @@ pub fn run_xcorr_search(
                     theoretical_mass,
                     second_theoretical_mass,
                 )| {
-                    match xcorrer.xcorr_peptide(peptide) {
+                    match xcorrer.xcorr_peptide(peptide, None) {
                         Ok(scoring_result) if scoring_result.score >= score_threshold => {
                             *xcorr = scoring_result.score;
                             *ions_total = scoring_result.ions_total as u64;
