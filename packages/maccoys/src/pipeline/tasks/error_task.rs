@@ -29,7 +29,7 @@ use super::task::Task;
 
 /// Prefix for the scoring counter
 ///
-pub const COUNTER_PREFIX: &str = "maccyos_errors";
+pub const COUNTER_PREFIX: &str = "maccoys_errors";
 
 /// Task to write errors to the corresponding search directories
 /// This taks should run on the same server which is hosting the filesystems

@@ -343,8 +343,14 @@ async fn main() -> Result<()> {
     }
 
     if let Some(loki_url) = cli.loki {
-        let loki_label = loki_tracing_label(&cli.command, cli.loki_label.clone());
-        tracing_targets.push(TracingTarget::Loki(loki_url, loki_label));
+        let labels = vec![
+            ("instance".to_string(), cli.loki_label.clone()),
+            (
+                "pipeline_stage".to_string(),
+                pipeline_stage_label(&cli.command).to_string(),
+            ),
+        ];
+        tracing_targets.push(TracingTarget::Loki(loki_url, labels));
     }
 
     if let Some(prometheus_socket) = cli.prometheus {
