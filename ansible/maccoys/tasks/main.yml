@@ -53,7 +53,7 @@
   ansible.builtin.replace:
     path: "{{ config_file }}"
     regexp: '<QUEUE_SERVER>'
-    replace: "{{ groups['queue'][0] }}"
+    replace: "{{ lookup('community.general.dig', groups['monitoring'][0]) }}"
 
 - name: Set target peptide URL
   when: maccoys_action == "start"

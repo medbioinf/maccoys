@@ -14,7 +14,6 @@ use http::StatusCode;
 use macpepdb::mass::to_int as mass_to_int;
 use macpepdb::peptidoform_search_client::PeptidoformSearchClient;
 use macpepdb::post_translational_modification::{PTMCollection, PostTranslationalModification};
-use macpepdb::sequence::PeptideSequence;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -29,7 +28,6 @@ use crate::constants::{
     FASTA_TARGET_ENTRY_PREFIX,
 };
 use crate::peptide_arena::PeptideArena;
-use crate::search_space::decoy_cache::DecoyCache;
 use crate::search_space::target_lookup::TargetLookup;
 
 #[derive(Debug, Error)]
@@ -38,8 +36,6 @@ pub enum Error {
     ApiStream(String),
     #[error("Regex error in search space generator: {0}")]
     CleavageRegex(Box<fancy_regex::Error>),
-    #[error("Decoy cache error in search space generator: {0}")]
-    DecoyCache(Box<crate::search_space::decoy_cache::Error>),
     #[error("Decoy generator error in search space generator: {0}")]
     DecoyGenerator(anyhow::Error),
     #[error("Unable to flush FASTA file: {0}")]
@@ -58,8 +54,6 @@ pub enum Error {
     SearchSpaceAddition(String),
     #[error("Unable to send search request: {0}")]
     SearchRequest(Box<reqwest::Error>),
-    #[error("Seqeunce error in search space generator: {0}")]
-    Sequence(Box<macpepdb::sequence::Error>),
     #[error("target lookup error in search space generator: {0}")]
     TargetLookup(Box<crate::search_space::target_lookup::Error>),
     #[error(
@@ -69,7 +63,6 @@ pub enum Error {
 }
 
 into_thiserror_boxed!(fancy_regex::Error, Error, CleavageRegex);
-into_thiserror_boxed!(crate::search_space::decoy_cache::Error, Error, DecoyCache);
 into_thiserror_boxed!(
     macpepdb::peptidoform_search_client::Error,
     Error,
@@ -310,7 +303,6 @@ pub struct SearchSpaceGenerator {
     target_client: PeptidoformSearchClient,
     decoy_client: Option<PeptidoformSearchClient>,
     target_lookup_url: Option<String>,
-    decoy_cache_url: Option<String>,
 }
 
 impl SearchSpaceGenerator {
@@ -318,7 +310,6 @@ impl SearchSpaceGenerator {
         target_url: &str,
         decoy_url: Option<String>,
         target_lookup_url: Option<String>,
-        decoy_cache_url: Option<String>,
     ) -> Result<Self, Error> {
         let target_client = PeptidoformSearchClient::try_from_url(target_url).await?;
         let decoy_client = match decoy_url.as_ref() {
@@ -330,7 +321,6 @@ impl SearchSpaceGenerator {
             target_client,
             decoy_client,
             target_lookup_url,
-            decoy_cache_url,
         })
     }
 
@@ -433,11 +423,6 @@ impl SearchSpaceGenerator {
     {
         let target_lookup: Option<TargetLookup> = match self.target_lookup_url {
             Some(ref url) => Some(TargetLookup::try_from_url(url).await?),
-            None => None,
-        };
-
-        let decoy_cache: Option<DecoyCache> = match self.decoy_cache_url {
-            Some(ref url) => Some(DecoyCache::try_from_url(url).await?),
             None => None,
         };
 
@@ -549,11 +534,6 @@ impl SearchSpaceGenerator {
                 if target_lookup.is_target(&sequence).await? {
                     continue;
                 }
-            }
-            if let Some(ref decoy_cache) = decoy_cache {
-                let seqeunce = PeptideSequence::try_from(sequence.as_str())
-                    .map_err(|err| Error::Sequence(Box::new(err)))?;
-                decoy_cache.cache(vec![(seqeunce, 0)]).await?;
             }
             fasta.add_decoys(sequence).await?;
             if fasta.decoy_count() == needed_decoys {

@@ -140,7 +140,8 @@
     state: absent
     stop_timeout: 60
 
-- name: Check loki container is running
+- name: Start loki container
+  when: maccoys_action == "start"
   community.docker.docker_container:
     image: grafana/loki
     name: maccoys-loki
@@ -165,7 +166,8 @@
     state: absent
     stop_timeout: 60
 
-- name: Check prometheus container is running
+- name: Start prometheus container
+  when: maccoys_action == "start"
   community.docker.docker_container:
     image: prom/prometheus
     name: maccoys-prometheus
@@ -192,7 +194,8 @@
     state: absent
     stop_timeout: 60
 
-- name: Check grafana container is running
+- name: Start grafana container
+  when: maccoys_action == "start"
   community.docker.docker_container:
     image: grafana/grafana
     name: maccoys-grafana

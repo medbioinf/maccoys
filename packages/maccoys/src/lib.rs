@@ -21,5 +21,5 @@ pub mod precursor;
 pub mod search_space;
 /// Utility funtions and extensions based on external crates.
 pub mod utils;
-/// Web API endpoints for adding decoys to a MaCPepDB database used only for decoys.
+/// Web API for reading search results.
 pub mod web;

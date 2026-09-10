@@ -17,7 +17,6 @@ queue_url = "http://<QUEUE_SERVER>:8123"
 target_url = "<TARGET_PEPTIDE_URL>"
 # decoy_url = "http://
 # target_lookup_url = "http://
-# decoy_cache_url = "http://
 
 [identification]
 num_tasks = 1

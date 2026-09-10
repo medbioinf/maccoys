@@ -176,7 +176,6 @@ impl SearchSpaceGenerationTask {
                     &config.target_url,
                     config.decoy_url.clone(),
                     config.target_lookup_url.clone(),
-                    config.decoy_cache_url.clone(),
                 )
                 .await
                 {

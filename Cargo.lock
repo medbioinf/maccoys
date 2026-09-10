@@ -3650,7 +3650,7 @@ dependencies = [
 [[package]]
 name = "macpepdb"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
+source = "git+https://github.com/medbioinf/macpepdb.git#ca17e30babfb599dfda7d561866b2ff505fcb019"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -3714,7 +3714,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_metrics_peek"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
+source = "git+https://github.com/medbioinf/macpepdb.git#ca17e30babfb599dfda7d561866b2ff505fcb019"
 dependencies = [
  "metrics",
 ]
@@ -3722,12 +3722,12 @@ dependencies = [
 [[package]]
 name = "macpepdb_peptide_hydrophobicity"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
+source = "git+https://github.com/medbioinf/macpepdb.git#ca17e30babfb599dfda7d561866b2ff505fcb019"
 
 [[package]]
 name = "macpepdb_tui"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
+source = "git+https://github.com/medbioinf/macpepdb.git#ca17e30babfb599dfda7d561866b2ff505fcb019"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
@@ -3744,7 +3744,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_uniprot_reader"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
+source = "git+https://github.com/medbioinf/macpepdb.git#ca17e30babfb599dfda7d561866b2ff505fcb019"
 dependencies = [
  "futures",
  "serde",
@@ -3755,7 +3755,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_web_common"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#2d0d419649b446bd1a1c603c42486a6d2b14cb7b"
+source = "git+https://github.com/medbioinf/macpepdb.git#ca17e30babfb599dfda7d561866b2ff505fcb019"
 dependencies = [
  "serde",
 ]
@@ -4060,7 +4060,7 @@ checksum = "3b1863ecf7fe598e28aba6fd767866d1115dd3feec4b7d8e73c5ecaa8425902c"
 dependencies = [
  "context_error",
  "indexmap",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "mzcore",
  "mzcv",
  "mzdata",
@@ -4081,7 +4081,7 @@ dependencies = [
  "bincode",
  "context_error",
  "flate2",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "mzcv",
  "ordered-float 5.3.0",
  "roxmltree",
@@ -5012,7 +5012,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2 1.0.107",
  "quote",
  "syn 2.0.119",
@@ -5025,7 +5025,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2 1.0.107",
  "quote",
  "syn 2.0.119",

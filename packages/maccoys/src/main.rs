@@ -208,9 +208,6 @@ enum Commands {
         /// Number of concurrent searches for MultiTask search type
         #[arg(long, default_value_t = NonZeroUsize::new(16).unwrap())]
         concurrent_searches: NonZeroUsize,
-        /// URL for caching decoys, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
-        #[arg(short = 'c')]
-        decoy_cache_url: Option<String>,
         /// URL for decoys targets, can be URL for the database (`scylla://host1,host2,host3/keyspace`) or base url for MaCPepDB web API.
         #[arg(short)]
         decoy_url: Option<String>,
@@ -287,7 +284,7 @@ struct Cli {
     /// Endpoint for Loki API to send logs to
     #[arg(long)]
     loki: Option<Url>,
-    /// Label to  distinguish logs from this app instance in Loki
+    /// Value for the `instance` label used to distinguish logs from this app instance in Loki
     #[arg(long, default_value_t = String::from(env!("CARGO_CRATE_NAME")))]
     loki_label: String,
     /// Socket for prometheus collection endpoint
@@ -381,7 +378,6 @@ async fn main() -> Result<()> {
         },
         Commands::SearchSpaceBuild {
             concurrent_searches,
-            decoy_cache_url,
             decoy_url,
             target_lookup_url,
             fasta_file_path,
@@ -417,13 +413,8 @@ async fn main() -> Result<()> {
 
             let mut search_space = FastaSearchSpace::new(fasta_file);
 
-            let search_space_generator = SearchSpaceGenerator::new(
-                &target_url,
-                decoy_url,
-                target_lookup_url,
-                decoy_cache_url,
-            )
-            .await?;
+            let search_space_generator =
+                SearchSpaceGenerator::new(&target_url, decoy_url, target_lookup_url).await?;
 
             search_space_generator
                 .create(
@@ -656,8 +647,8 @@ fn convert_str_paths_and_resolve_globs(paths: Vec<String>) -> Result<Vec<PathBuf
         .collect())
 }
 
-fn loki_tracing_label(commands: &Commands, loki_label: String) -> String {
-    let command_label = match commands {
+fn pipeline_stage_label(commands: &Commands) -> &'static str {
+    match commands {
         Commands::Web(web_command) => match &web_command.command {
             WebCommand::ResultApi {
                 socket: _,
@@ -698,9 +689,7 @@ fn loki_tracing_label(commands: &Commands, loki_label: String) -> String {
             _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
         },
         _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,
-    };
-
-    format!("{}:{}", loki_label, command_label)
+    }
 }
 
 /// Axum shutdown signal handler for ctrl-c and terminate signals

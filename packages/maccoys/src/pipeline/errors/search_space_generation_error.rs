@@ -4,8 +4,6 @@ use super::storage_error::StorageError;
 
 #[derive(Error, Debug)]
 pub enum SearchSpaceGenerationError {
-    #[error("Decoy cache error in search space generation: {0}")]
-    DecoyCache(crate::search_space::decoy_cache::Error),
     #[error("Search parameters not found in storage.")]
     SearchParametersNotFoundError(),
     #[error("Could not get search parameters:\n\t{0}")]

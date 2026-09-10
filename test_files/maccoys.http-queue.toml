@@ -35,7 +35,6 @@ concurrent_searches = 1
 target_url = "httpa://macpepdb.cubimed.rub.de"
 # decoy_url = "http://
 # target_lookup_url = "http://
-# decoy_cache_url = "http://
 
 [identification]
 num_tasks = 6

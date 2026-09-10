@@ -40,7 +40,6 @@ concurrent_searches = 64
 target_url = "http://134.147.59.92"
 # decoy_url = "http://
 # target_lookup_url = "http://
-# decoy_cache_url = "http://
 
 [identification]
 num_tasks = 2

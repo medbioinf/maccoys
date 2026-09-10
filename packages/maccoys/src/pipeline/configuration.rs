@@ -92,9 +92,6 @@ pub struct SearchSpaceGenerationTaskConfiguration {
 
     /// Optional URL to the target lookup database
     pub target_lookup_url: Option<String>,
-
-    /// Optional URL to the decoy cache database
-    pub decoy_cache_url: Option<String>,
 }
 
 impl Deref for SearchSpaceGenerationTaskConfiguration {
@@ -243,7 +240,6 @@ impl Default for PipelineConfiguration {
                 concurrent_searches: NonZeroUsize::new(16).unwrap(),
                 decoy_url: None,
                 target_lookup_url: None,
-                decoy_cache_url: None,
             },
             identification: IdentificationTaskConfiguration {
                 general: TaskConfiguration {
