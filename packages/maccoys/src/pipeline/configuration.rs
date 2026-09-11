@@ -144,6 +144,8 @@ impl Deref for ScoringTaskConfiguration {
 ///
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct QueuingConfiguration {
+    /// Directory where queued message payloads are spooled to disk
+    pub data_directory: PathBuf,
     /// Message timeout, after which a message is considered failed and requeued
     #[serde(with = "crate::utils::serde::duration_as_secs")]
     pub message_timeout: Duration,
@@ -155,10 +157,10 @@ pub struct QueuingConfiguration {
 impl Default for QueuingConfiguration {
     fn default() -> Self {
         Self {
-            // data_directory: PathBuf::from(format!(
-            //     "/tmp/{}-queueing-data",
-            //     env!("CARGO_CRATE_NAME")
-            // )),
+            data_directory: PathBuf::from(format!(
+                "/tmp/{}-queueing-data",
+                env!("CARGO_CRATE_NAME")
+            )),
             message_timeout: Duration::from_secs(900),
             reschedule_check_interval: Duration::from_secs(60),
         }

@@ -90,7 +90,7 @@ enum PipelineCommand {
         #[arg(short, long, value_enum, default_value = "memory")]
         storage: StorageTarget,
         /// Queue used by the local pipeline
-        #[arg(short, long, value_enum, default_value = "memory")]
+        #[arg(short, long, value_enum, default_value = "local")]
         queue: QueueTarget,
         /// Optional temp folder for intermediate files, default: `<system temp folder>/maccoys`
         #[arg(short, long)]
@@ -179,8 +179,6 @@ enum PipelineCommand {
     },
     /// Http queuing server
     QueueServer {
-        /// Directory where queued message payloads are spooled to disk
-        data_directory: PathBuf,
         /// Interface where the service is spawned
         interface: String,
         /// Port where the service is spawned
@@ -607,14 +605,13 @@ async fn main() -> Result<()> {
             PipelineCommand::QueueServer {
                 interface,
                 port,
-                data_directory,
                 config_file_path,
             } => {
                 let config: RemoteEntypointConfiguration = toml::from_str(
                     &fs::read_to_string(&config_file_path).context("Reading config file")?,
                 )
                 .context("Deserialize config")?;
-                QueueServer::run_standalone(interface, port, config, data_directory).await?;
+                QueueServer::run_standalone(interface, port, config).await?;
             }
         },
     };
@@ -682,7 +679,6 @@ fn pipeline_stage_label(commands: &Commands) -> &'static str {
             PipelineCommand::QueueServer {
                 interface: _,
                 port: _,
-                data_directory: _,
                 config_file_path: _,
             } => QueueServer::loki_tracing_label_value(),
             _ => DEFAULT_LOKI_TRACING_LABEL_VALUE,

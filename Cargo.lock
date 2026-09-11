@@ -1459,16 +1459,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deadqueue"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72ff1266be84e4e04a81e2d1cbb998cb271b374fb73ce780245ef96c037c50cd"
-dependencies = [
- "crossbeam-queue",
- "tokio",
-]
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3576,7 +3566,6 @@ dependencies = [
  "axum 0.7.9",
  "clap",
  "csv",
- "deadqueue",
  "dihardts_omicstools",
  "fancy-regex 0.11.0",
  "flate2",

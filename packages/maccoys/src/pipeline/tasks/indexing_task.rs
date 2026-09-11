@@ -107,7 +107,6 @@ where
             stop_flag,
         }
     }
-
 }
 
 /// Standalone entrypoint used by the `maccoys pipeline index` CLI command; always talks to
@@ -279,8 +278,8 @@ where
                 match MzMlReader::read_pre_indexed(&mut mzml_bytes_reader, index, None, false) {
                     Ok(reader) => reader,
                     Err(e) => {
-                        let error_message =
-                            message.to_error_message(IndexingError::OpenMzMlWithIndexError(e).into());
+                        let error_message = message
+                            .to_error_message(IndexingError::OpenMzMlWithIndexError(e).into());
                         error!("{}", &error_message);
                         Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
                         return;
@@ -314,7 +313,11 @@ where
                 // This increases the total spectrum count in the storage by one.
                 // The speach space generation task will increase the count further if the spectrum
                 // has multiple precursors or charge states.
-                match self.storage.increase_total_spectrum_count(message.uuid()).await {
+                match self
+                    .storage
+                    .increase_total_spectrum_count(message.uuid())
+                    .await
+                {
                     Ok(_) => {}
                     Err(e) => {
                         let error_message = message.to_error_message(e.into());
@@ -358,7 +361,9 @@ where
                         let mz: f64 = ion
                             .get_cv_param("MS:1000744")
                             .first()
-                            .ok_or_else(|| IndexingError::MissingSelectedIonMzError(spec_id.clone()))?
+                            .ok_or_else(|| {
+                                IndexingError::MissingSelectedIonMzError(spec_id.clone())
+                            })?
                             .value
                             .parse()
                             .map_err(|err| IndexingError::MzParsingError(spec_id.clone(), err))?;
@@ -371,9 +376,9 @@ where
                             charge_cv_params
                                 .into_iter()
                                 .map(|x| {
-                                    x.value
-                                        .parse()
-                                        .map_err(|err| IndexingError::ChargeParsingError(spec_id.clone(), err))
+                                    x.value.parse().map_err(|err| {
+                                        IndexingError::ChargeParsingError(spec_id.clone(), err)
+                                    })
                                 })
                                 .collect::<Result<Vec<u8>, IndexingError>>()?
                         } else {
@@ -410,12 +415,13 @@ where
                     return; // as this was the only MS2 spectrum we can continue with the next message
                 }
 
-                let search_space_generation_message = match message.into_search_space_generation_message(
-                    ms_run_name.clone(),
-                    spec_id,
-                    spectrum,
-                    precursors,
-                ) {
+                let search_space_generation_message = match message
+                    .into_search_space_generation_message(
+                        ms_run_name.clone(),
+                        spec_id,
+                        spectrum,
+                        precursors,
+                    ) {
                     Ok(msg) => msg,
                     Err(e) => {
                         let error_message = message.to_error_message(e.into());

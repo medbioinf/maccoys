@@ -1,10 +1,8 @@
-use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, OriginalUri};
 use axum::{
@@ -14,7 +12,6 @@ use axum::{
     Router,
 };
 use http::status::StatusCode;
-use parking_lot::RwLock;
 use pastey::paste;
 use serde::{Deserialize, Serialize};
 use tokio::select;
@@ -28,7 +25,7 @@ use crate::pipeline::messages::identification_message::IdentificationMessage;
 use crate::pipeline::messages::publication_message::PublicationMessage;
 use crate::pipeline::messages::scoring_message::ScoringMessage;
 use crate::pipeline::messages::search_space_generation_message::SearchSpaceGenerationMessage;
-use crate::pipeline::utils::sanatize_string_for_path;
+use crate::pipeline::queue::{LocalPipelineQueue, SerializableLocalPipelineQueue};
 use crate::pipeline::{
     errors::http_queue_server_error::HttpQueueServerError,
     messages::{
@@ -38,284 +35,6 @@ use crate::pipeline::{
 };
 
 static LOKI_TRACING_LABEL_VALUE: &str = "http_queue_server";
-
-/// Type alias for the RwLock holding the pending storage keys (in push order) and the
-/// work-in-progress map of message ID to (storage key, absolute timeout).
-/// Message payloads are not held in memory; they are spooled to disk under
-/// `RedundantQueue::directory`, keyed by storage key rather than message ID, since a
-/// message's own ID is not guaranteed unique across pushes (e.g. reprocessing/retries).
-///
-type RWLockedMessages = RwLock<(VecDeque<String>, HashMap<String, (String, Duration)>)>;
-
-/// A redundant queue implementation that holds messages to be processed
-/// and messages being processed with timestamp of when processing started
-/// Operations are lockfree where possible
-///
-/// Message payloads are written to disk as soon as they are pushed and only read back
-/// into memory when popped, since they can be quite large. Only storage keys, message
-/// IDs and work-in-progress timeouts are kept in memory.
-///
-pub struct RedundantQueue<M>
-where
-    M: IsMessage,
-{
-    capacity: usize,
-    /// After this duration a message in work_in_progress is considered timed out and eligible for rescheduling
-    timeout: Duration,
-    /// Directory where message payloads for this queue are spooled to disk
-    directory: PathBuf,
-    messages: RWLockedMessages,
-    /// Monotonic counter used to derive a storage key unique to each push, even if two
-    /// pushed messages share the same `IsMessage::get_id()`
-    sequence: AtomicU64,
-    _message_type: std::marker::PhantomData<M>,
-}
-
-impl<M> RedundantQueue<M>
-where
-    M: IsMessage,
-{
-    pub fn new(capacity: usize, timeout: Duration, directory: PathBuf) -> Self {
-        Self::with_state(
-            capacity,
-            timeout,
-            directory,
-            VecDeque::with_capacity(capacity),
-            HashMap::new(),
-            0,
-        )
-    }
-
-    /// Constructs a queue from an existing state, e.g. loaded from a state file.
-    /// Ensures the spool directory exists.
-    ///
-    fn with_state(
-        capacity: usize,
-        timeout: Duration,
-        directory: PathBuf,
-        work: VecDeque<String>,
-        work_in_progress: HashMap<String, (String, Duration)>,
-        next_sequence: u64,
-    ) -> Self {
-        std::fs::create_dir_all(&directory).unwrap_or_else(|e| {
-            panic!(
-                "[HttpQueueServer] Could not create queue data directory {:?}: {}",
-                directory, e
-            )
-        });
-        Self {
-            capacity,
-            timeout,
-            directory,
-            messages: RwLock::new((work, work_in_progress)),
-            sequence: AtomicU64::new(next_sequence),
-            _message_type: std::marker::PhantomData,
-        }
-    }
-
-    /// Builds a storage key unique to this push, so that two messages sharing the same
-    /// `IsMessage::get_id()` never overwrite each other's spooled payload on disk.
-    ///
-    fn new_storage_key(&self, message_id: &str) -> String {
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        format!("{}__{}", sanatize_string_for_path(message_id), sequence)
-    }
-
-    /// Tries to push a message into the queue, spooling its payload to disk
-    ///
-    /// # Arguments
-    /// * `message` - CompressedBinaryMessage to be pushed into the queue
-    ///
-    pub async fn try_push(
-        &self,
-        message: CompressedBinaryMessage<M>,
-    ) -> Result<(), (Box<CompressedBinaryMessage<M>>, HttpQueueServerError)> {
-        if self.len() >= self.capacity {
-            return Err((Box::new(message), HttpQueueServerError::QueueFullError));
-        }
-
-        let bytes = match message.to_postcard() {
-            Ok(bytes) => bytes,
-            Err(e) => return Err((Box::new(message), HttpQueueServerError::MessageError(e))),
-        };
-
-        let storage_key = self.new_storage_key(message.id());
-        let file_path = self.directory.join(&storage_key);
-        if tokio::fs::write(&file_path, bytes).await.is_err() {
-            return Err((
-                Box::new(message),
-                HttpQueueServerError::UnwritableQueueError,
-            ));
-        }
-
-        self.messages.write().0.push_back(storage_key);
-
-        Ok(())
-    }
-
-    /// Tries to pop a message from the queue, reading its payload back from disk
-    /// If a message is popped, it is added to the work_in_progress map with the current timestamp
-    ///
-    pub async fn try_pop(&self) -> Result<CompressedBinaryMessage<M>, HttpQueueServerError> {
-        let storage_key = self
-            .messages
-            .write()
-            .0
-            .pop_front()
-            .ok_or(HttpQueueServerError::QueueEmptyError)?;
-
-        let file_path = self.directory.join(&storage_key);
-        let message = match tokio::fs::read(&file_path).await {
-            Ok(bytes) => CompressedBinaryMessage::<M>::from_postcard(&bytes)
-                .map_err(HttpQueueServerError::MessageError),
-            Err(_) => Err(HttpQueueServerError::UnreadableQueueError),
-        };
-
-        let message = match message {
-            Ok(message) => message,
-            Err(e) => {
-                // Put the storage key back so the message is not silently lost
-                self.messages.write().0.push_front(storage_key);
-                return Err(e);
-            }
-        };
-
-        let unix_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0));
-
-        let timeout = unix_now + self.timeout;
-
-        self.messages
-            .write()
-            .1
-            .insert(message.id().to_string(), (storage_key, timeout));
-
-        Ok(message)
-    }
-
-    /// Acknowledges a message as processed, removing it from the work_in_progress map
-    /// and deleting its spooled payload from disk
-    ///
-    /// # Arguments
-    /// * `message_id` - ID of the message to acknowledge
-    ///
-    pub async fn acknowledge(&self, message_id: &str) -> Result<(), HttpQueueServerError> {
-        let (storage_key, _timeout) = self
-            .messages
-            .write()
-            .1
-            .remove(message_id)
-            .ok_or_else(|| HttpQueueServerError::KeyNotFoundError(message_id.to_string()))?;
-
-        let file_path = self.directory.join(&storage_key);
-        tokio::fs::remove_file(&file_path)
-            .await
-            .map_err(|_| HttpQueueServerError::UnwritableQueueError)?;
-
-        Ok(())
-    }
-
-    pub fn len(&self) -> usize {
-        let (work, work_in_progress) = &*self.messages.read();
-        work.len() + work_in_progress.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        let (work, work_in_progress) = &*self.messages.read();
-        work.is_empty() && work_in_progress.is_empty()
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.len() >= self.capacity
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Moves timed out work-in-progress messages back onto the pending queue.
-    /// No disk I/O is necessary here, the spooled payload is left untouched.
-    ///
-    pub fn reschedule(&self) -> Result<(), HttpQueueServerError> {
-        let (work, work_in_progress) = &mut *self.messages.write();
-
-        let now: usize = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_secs() as usize;
-
-        let ids_to_reschedule = work_in_progress
-            .iter()
-            .filter_map(|(message_id, (_, timeout))| {
-                if now >= timeout.as_secs() as usize {
-                    Some(message_id.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        for message_id in ids_to_reschedule.into_iter() {
-            if let Some((storage_key, _)) = work_in_progress.remove(&message_id) {
-                work.push_back(storage_key);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Serializable version of RedundantQueue's bookkeeping (storage keys, message IDs &
-/// timeouts) for saving/loading state. Message payloads themselves are not part of this
-/// snapshot, they already live on disk under the queue's data directory.
-///
-#[derive(Serialize, Deserialize)]
-struct SerializableRedundantQueue {
-    capacity: usize,
-    #[serde(with = "crate::utils::serde::duration_as_secs")]
-    timeout: Duration,
-    work: VecDeque<String>,
-    work_in_progress: HashMap<String, (String, Duration)>,
-    next_sequence: u64,
-}
-
-impl SerializableRedundantQueue {
-    /// Reconstructs a `RedundantQueue<M>` from this snapshot, pointing it at `directory`
-    /// for its message payloads.
-    ///
-    fn into_redundant_queue<M>(self, directory: PathBuf) -> RedundantQueue<M>
-    where
-        M: IsMessage,
-    {
-        RedundantQueue::with_state(
-            self.capacity,
-            self.timeout,
-            directory,
-            self.work,
-            self.work_in_progress,
-            self.next_sequence,
-        )
-    }
-}
-
-impl<M> From<RedundantQueue<M>> for SerializableRedundantQueue
-where
-    M: IsMessage,
-{
-    fn from(queue: RedundantQueue<M>) -> Self {
-        let next_sequence = queue.sequence.load(Ordering::Relaxed);
-        let (work, work_in_progress) = queue.messages.into_inner();
-
-        Self {
-            work,
-            work_in_progress,
-            capacity: queue.capacity,
-            timeout: queue.timeout,
-            next_sequence,
-        }
-    }
-}
 
 /// Trait defining methods to get the routes for queue operations
 ///
@@ -369,7 +88,7 @@ macro_rules! queue_namespace {
             /// Collection of all queues for different message types
             ///
             pub struct QueueCollection {
-                $([< $data_type:snake _queue >]: RedundantQueue<$data_type> ),+
+                $([< $data_type:snake _queue >]: LocalPipelineQueue<$data_type> ),+
             }
 
             /// Implementation of QueueCollection
@@ -382,7 +101,7 @@ macro_rules! queue_namespace {
                      data_directory: PathBuf,
                 ) -> Self {
                     Self {
-                        $([< $data_type:snake _queue >]: RedundantQueue::<$data_type>::new(
+                        $([< $data_type:snake _queue >]: LocalPipelineQueue::<$data_type>::new_at(
                             [< $data_type:snake _queue_capacity >],
                             timeout,
                             data_directory.join(stringify!([<$data_type:snake>])),
@@ -422,7 +141,7 @@ macro_rules! queue_namespace {
             ///
             #[derive(Serialize, Deserialize)]
             pub struct SerializableQueueCollection {
-                $([< $data_type:snake _queue >]: SerializableRedundantQueue ),+
+                $([< $data_type:snake _queue >]: SerializableLocalPipelineQueue ),+
             }
 
             impl SerializableQueueCollection {
@@ -443,7 +162,7 @@ macro_rules! queue_namespace {
                 ///
                 pub fn into_queue_collection(self, data_directory: PathBuf) -> QueueCollection {
                     QueueCollection {
-                        $([< $data_type:snake _queue >]: self.[< $data_type:snake _queue >].into_redundant_queue(
+                        $([< $data_type:snake _queue >]: self.[< $data_type:snake _queue >].into_local_pipeline_queue(
                             data_directory.join(stringify!([<$data_type:snake>]))
                         ) ),+
                     }
@@ -453,7 +172,7 @@ macro_rules! queue_namespace {
             impl From<QueueCollection> for SerializableQueueCollection {
                 fn from(queue_collection: QueueCollection) -> Self {
                     Self {
-                        $([< $data_type:snake _queue >]: SerializableRedundantQueue::from(queue_collection.[< $data_type:snake _queue >]) ),+
+                        $([< $data_type:snake _queue >]: SerializableLocalPipelineQueue::from(queue_collection.[< $data_type:snake _queue >]) ),+
                     }
                 }
             }
@@ -473,7 +192,7 @@ macro_rules! queue_namespace {
                     ///
                     pub async fn [< push_ $data_type:snake >](State(state): State<Arc<QueueServerState>>, serialized_compressed_binary_message: Bytes) -> Result<(StatusCode, &'static str), HttpQueueServerError> {
                         let compressed_binary_message: CompressedBinaryMessage<$data_type> = CompressedBinaryMessage::from_postcard(&serialized_compressed_binary_message).map_err(HttpQueueServerError::MessageError)?;
-                        state.queue_collection().[< $data_type:snake _queue >].try_push(compressed_binary_message).await.map_err(|(_, e)| e)?;
+                        state.queue_collection().[< $data_type:snake _queue >].try_push_compressed(compressed_binary_message).await.map_err(|(_, e)| e)?;
                         Ok((StatusCode::OK, "Message pushed successfully"))
                     }
 
@@ -483,7 +202,7 @@ macro_rules! queue_namespace {
                     /// * `state` - State of the queue server
                     ///
                     pub async fn [< pop_ $data_type:snake >](State(state): State<Arc<QueueServerState>>) -> Result<Bytes, HttpQueueServerError> {
-                        let message = state.queue_collection().[< $data_type:snake _queue >].try_pop().await?;
+                        let message = state.queue_collection().[< $data_type:snake _queue >].try_pop_compressed().await?;
                         let serialized_message = message.to_postcard().map_err(HttpQueueServerError::MessageError)?;
                         Ok(Bytes::from(serialized_message))
                     }
@@ -721,18 +440,19 @@ impl QueueServer {
     /// # Arguments
     /// * `interface` - Interface to bind the service to
     /// * `port` - Port to bind the service to
-    /// * `config` - RemoteEntypointConfiguration for initializing the queues
-    /// * `state_path` - Optional path to load/save the server state
-    /// * `queue_data_directory` - Directory where queued message payloads are spooled to disk
+    /// * `config` - RemoteEntypointConfiguration for initializing the queues; the spool
+    ///   directory is read from `config.queueing.data_directory`
     ///
     pub async fn run_standalone(
         interface: String,
         port: u16,
         config: RemoteEntypointConfiguration,
-        data_directory: PathBuf,
     ) -> Result<(), HttpQueueServerError> {
-        let state_path = data_directory.join("queue_server_state.bin");
-        let queue_data_directory = data_directory.join("queue_data");
+        let state_path = config
+            .queueing
+            .data_directory
+            .join("queue_server_state.bin");
+        let queue_data_directory = config.queueing.data_directory.join("queue_data");
 
         let state = if state_path.is_file() {
             let collection = SerializableQueueCollection::from_file(&state_path)?;
@@ -929,12 +649,12 @@ mod tests {
 
         queue_collection
             .indexing_message_queue
-            .try_push(CompressedBinaryMessage::try_from_message(&message1).unwrap())
+            .try_push_compressed(CompressedBinaryMessage::try_from_message(&message1).unwrap())
             .await
             .unwrap();
         queue_collection
             .indexing_message_queue
-            .try_push(CompressedBinaryMessage::try_from_message(&message2).unwrap())
+            .try_push_compressed(CompressedBinaryMessage::try_from_message(&message2).unwrap())
             .await
             .unwrap();
 
@@ -953,7 +673,7 @@ mod tests {
 
         let popped_message1 = loaded_queue_collection
             .indexing_message_queue
-            .try_pop()
+            .try_pop_compressed()
             .await
             .unwrap();
         assert_eq!(popped_message1.id(), message1.get_id());
@@ -965,7 +685,7 @@ mod tests {
 
         let popped_message2 = loaded_queue_collection
             .indexing_message_queue
-            .try_pop()
+            .try_pop_compressed()
             .await
             .unwrap();
         assert_eq!(popped_message2.id(), message2.get_id());

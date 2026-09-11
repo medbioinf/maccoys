@@ -1,12 +1,14 @@
-use std::{future::IntoFuture, str::FromStr};
-
-use deadqueue::limited::Queue;
-use futures::Future;
-use rustis::{
-    client::BatchPreparedCommand,
-    commands::{GenericCommands, LMoveWhere, ListCommands, StringCommands},
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tracing::{debug, warn};
+
+use futures::Future;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::{
     configuration::TaskConfiguration, errors::queue_error::QueueError,
@@ -14,9 +16,13 @@ use super::{
 };
 
 use crate::pipeline::{
-    errors::queue_error::{HttpQueueError, RedisQueueError},
+    errors::{
+        http_queue_server_error::HttpQueueServerError,
+        queue_error::{HttpQueueError, LocalQueueError},
+    },
     messages::compressed_binary_message::CompressedBinaryMessage,
     queue_server::{IsQueueRouteable, QueueController},
+    utils::sanatize_string_for_path,
 };
 
 /// Trait defining the methods for a pipeline queue
@@ -62,262 +68,358 @@ where
     fn is_full(&self) -> impl Future<Output = Result<bool, QueueError>> + Send;
 }
 
-/// Implementation of a local pipeline queue. useful to debug, testing, reviewing or
-/// very beefy servers
+/// Type alias for the RwLock holding the pending storage keys (in push order) and the
+/// work-in-progress map of message ID to (storage key, absolute timeout).
+/// Message payloads are not held in memory; they are spooled to disk under
+/// `LocalPipelineQueue::directory`, keyed by storage key rather than message ID, since a
+/// message's own ID is not guaranteed unique across pushes (e.g. reprocessing/retries).
+///
+type RWLockedMessages = RwLock<(VecDeque<String>, HashMap<String, (String, Duration)>)>;
+
+/// Disk-backed pipeline queue. Message payloads are written to disk as soon as they are
+/// pushed and only read back into memory when popped, since they can be quite large. Only
+/// storage keys, message IDs and work-in-progress timeouts are kept in memory.
+///
+/// Exposes two API layers on the same struct:
+/// * a compressed-level API (`try_push_compressed`/`try_pop_compressed`/`acknowledge`/
+///   `reschedule`/`len`/`is_empty`/`is_full`/`capacity`), operating directly on
+///   [`CompressedBinaryMessage<M>`] and returning [`HttpQueueServerError`]. This is what
+///   [`crate::pipeline::queue_server::QueueController`]'s HTTP handlers call, so a push/pop
+///   over HTTP never gets transcoded twice.
+/// * the [`PipelineQueue<M>`] trait-level API, used in-process (no HTTP) by
+///   [`crate::pipeline::local_pipeline::LocalPipeline`], which compresses on push and
+///   decompresses on pop, delegating to the compressed-level methods.
 ///
 pub struct LocalPipelineQueue<M>
 where
     M: IsMessage,
 {
-    /// Queue for search messages to be processed
-    queue: Queue<M>,
-
-    /// Capacity of the queue
     capacity: usize,
+    /// After this duration a message in work_in_progress is considered timed out and eligible for rescheduling
+    timeout: Duration,
+    /// Directory where message payloads for this queue are spooled to disk
+    directory: PathBuf,
+    messages: RWLockedMessages,
+    /// Monotonic counter used to derive a storage key unique to each push, even if two
+    /// pushed messages share the same `IsMessage::get_id()`
+    sequence: AtomicU64,
+    _message_type: std::marker::PhantomData<M>,
+}
+
+impl<M> LocalPipelineQueue<M>
+where
+    M: IsMessage,
+{
+    pub fn new_at(capacity: usize, timeout: Duration, directory: PathBuf) -> Self {
+        Self::with_state(
+            capacity,
+            timeout,
+            directory,
+            VecDeque::with_capacity(capacity),
+            HashMap::new(),
+            0,
+        )
+    }
+
+    /// Constructs a queue from an existing state, e.g. loaded from a state file.
+    /// Ensures the spool directory exists.
+    ///
+    fn with_state(
+        capacity: usize,
+        timeout: Duration,
+        directory: PathBuf,
+        work: VecDeque<String>,
+        work_in_progress: HashMap<String, (String, Duration)>,
+        next_sequence: u64,
+    ) -> Self {
+        std::fs::create_dir_all(&directory).unwrap_or_else(|e| {
+            panic!(
+                "[LocalPipelineQueue] Could not create queue data directory {:?}: {}",
+                directory, e
+            )
+        });
+        Self {
+            capacity,
+            timeout,
+            directory,
+            messages: RwLock::new((work, work_in_progress)),
+            sequence: AtomicU64::new(next_sequence),
+            _message_type: std::marker::PhantomData,
+        }
+    }
+
+    /// Builds a storage key unique to this push, so that two messages sharing the same
+    /// `IsMessage::get_id()` never overwrite each other's spooled payload on disk.
+    ///
+    fn new_storage_key(&self, message_id: &str) -> String {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        format!("{}__{}", sanatize_string_for_path(message_id), sequence)
+    }
+
+    /// Tries to push a message into the queue, spooling its payload to disk
+    ///
+    /// # Arguments
+    /// * `message` - CompressedBinaryMessage to be pushed into the queue
+    ///
+    pub async fn try_push_compressed(
+        &self,
+        message: CompressedBinaryMessage<M>,
+    ) -> Result<(), (Box<CompressedBinaryMessage<M>>, HttpQueueServerError)> {
+        if self.len() >= self.capacity {
+            return Err((Box::new(message), HttpQueueServerError::QueueFullError));
+        }
+
+        let bytes = match message.to_postcard() {
+            Ok(bytes) => bytes,
+            Err(e) => return Err((Box::new(message), HttpQueueServerError::MessageError(e))),
+        };
+
+        let storage_key = self.new_storage_key(message.id());
+        let file_path = self.directory.join(&storage_key);
+        if tokio::fs::write(&file_path, bytes).await.is_err() {
+            return Err((
+                Box::new(message),
+                HttpQueueServerError::UnwritableQueueError,
+            ));
+        }
+
+        self.messages.write().0.push_back(storage_key);
+
+        Ok(())
+    }
+
+    /// Tries to pop a message from the queue, reading its payload back from disk
+    /// If a message is popped, it is added to the work_in_progress map with the current timestamp
+    ///
+    pub async fn try_pop_compressed(
+        &self,
+    ) -> Result<CompressedBinaryMessage<M>, HttpQueueServerError> {
+        let storage_key = self
+            .messages
+            .write()
+            .0
+            .pop_front()
+            .ok_or(HttpQueueServerError::QueueEmptyError)?;
+
+        let file_path = self.directory.join(&storage_key);
+        let message = match tokio::fs::read(&file_path).await {
+            Ok(bytes) => CompressedBinaryMessage::<M>::from_postcard(&bytes)
+                .map_err(HttpQueueServerError::MessageError),
+            Err(_) => Err(HttpQueueServerError::UnreadableQueueError),
+        };
+
+        let message = match message {
+            Ok(message) => message,
+            Err(e) => {
+                // Put the storage key back so the message is not silently lost
+                self.messages.write().0.push_front(storage_key);
+                return Err(e);
+            }
+        };
+
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0));
+
+        let timeout = unix_now + self.timeout;
+
+        self.messages
+            .write()
+            .1
+            .insert(message.id().to_string(), (storage_key, timeout));
+
+        Ok(message)
+    }
+
+    /// Acknowledges a message as processed, removing it from the work_in_progress map
+    /// and deleting its spooled payload from disk
+    ///
+    /// # Arguments
+    /// * `message_id` - ID of the message to acknowledge
+    ///
+    pub async fn acknowledge(&self, message_id: &str) -> Result<(), HttpQueueServerError> {
+        let (storage_key, _timeout) = self
+            .messages
+            .write()
+            .1
+            .remove(message_id)
+            .ok_or_else(|| HttpQueueServerError::KeyNotFoundError(message_id.to_string()))?;
+
+        let file_path = self.directory.join(&storage_key);
+        tokio::fs::remove_file(&file_path)
+            .await
+            .map_err(|_| HttpQueueServerError::UnwritableQueueError)?;
+
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        let (work, work_in_progress) = &*self.messages.read();
+        work.len() + work_in_progress.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let (work, work_in_progress) = &*self.messages.read();
+        work.is_empty() && work_in_progress.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Moves timed out work-in-progress messages back onto the pending queue.
+    /// No disk I/O is necessary here, the spooled payload is left untouched.
+    ///
+    pub fn reschedule(&self) -> Result<(), HttpQueueServerError> {
+        let (work, work_in_progress) = &mut *self.messages.write();
+
+        let now: usize = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() as usize;
+
+        let ids_to_reschedule = work_in_progress
+            .iter()
+            .filter_map(|(message_id, (_, timeout))| {
+                if now >= timeout.as_secs() as usize {
+                    Some(message_id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for message_id in ids_to_reschedule.into_iter() {
+            if let Some((storage_key, _)) = work_in_progress.remove(&message_id) {
+                work.push_back(storage_key);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<M> PipelineQueue<M> for LocalPipelineQueue<M>
 where
     M: IsMessage,
 {
+    /// Not constructible from `TaskConfiguration` alone — needs a spool directory and WIP
+    /// timeout, which live on the sibling `QueuingConfiguration`, not `TaskConfiguration`.
+    /// Real construction is via [`LocalPipelineQueue::new_at`], used by
+    /// [`crate::pipeline::local_pipeline::QueueFactory::new_queue`] and
+    /// [`crate::pipeline::queue_server::QueueCollection`]. This impl exists only to satisfy
+    /// the trait bound on `QueueFactory::Queue<M>`; calling it is a bug.
+    ///
     async fn new(config: &TaskConfiguration) -> Result<Self, QueueError> {
-        Ok(Self {
-            queue: Queue::new(config.queue_capacity),
-            capacity: config.queue_capacity,
-        })
+        Err(
+            LocalQueueError::NotConstructibleFromTaskConfiguration(config.queue_name.clone())
+                .into(),
+        )
     }
 
     async fn get_capacity(&self) -> Result<usize, QueueError> {
-        Ok(self.capacity)
+        Ok(self.capacity())
     }
 
     async fn pop(&self) -> Result<Option<(String, M)>, QueueError> {
-        let message = self.queue.try_pop();
-        if let Some(message) = message {
-            return Ok(Some((message.get_id(), message)));
-        }
-        Ok(None)
-    }
-
-    async fn push(&self, message: M) -> Result<(), (QueueError, Box<M>)> {
-        match self.queue.try_push(message) {
-            Ok(_) => Ok(()),
-            Err(message) => Err((QueueError::QueueFullError, Box::new(message))),
-        }
-    }
-
-    async fn ack(&self, _message_id: &str) -> Result<(), QueueError> {
-        // No need to do anything for local queue
-        Ok(())
-    }
-
-    async fn len(&self) -> Result<usize, QueueError> {
-        Ok(self.queue.len())
-    }
-
-    async fn is_full(&self) -> Result<bool, QueueError> {
-        Ok(self.queue.is_full())
-    }
-}
-
-/// Queue implemented to use Redis as backend
-/// The messages are stored as string with their ID as key. The queue itself is a list
-/// containing the message IDs. When popping a message, the ID is moved to a backup list (WIP)
-/// It is important to note, that redis lists seem to have no maximum capacity. So the capacity
-/// is enforced by this implementation. and can slightly differ from the configured capacity.
-///
-/// This implementation proofed unstable with very large messages (20MB +) as Redis seems to
-/// to close connections to client when the transfer takes to long.
-///
-pub struct RedisPipelineQueue<M>
-where
-    M: IsMessage,
-{
-    /// Redis client
-    client: rustis::client::Client,
-
-    /// Capacity of the queue
-    capacity: usize,
-
-    /// Name of the queue
-    queue_name: String,
-
-    /// WIP queue name
-    wip_queue_name: String,
-
-    _phantom_message: std::marker::PhantomData<M>,
-}
-
-impl<M> RedisPipelineQueue<M>
-where
-    M: IsMessage,
-{
-    /// Creates a new WIP queue name
-    ///
-    /// # Arguments
-    /// * `queue_name` - Name of the queue
-    ///
-    fn create_wip_queue_name(queue_name: &str) -> String {
-        format!("{}_wip", queue_name)
-    }
-}
-
-impl<M> PipelineQueue<M> for RedisPipelineQueue<M>
-where
-    M: IsMessage,
-{
-    async fn new(config: &TaskConfiguration) -> Result<Self, QueueError> {
-        // Check redis URL as it is optional in the config
-        if config.queue_url.is_none() {
-            return Err(RedisQueueError::RedisUrlMissing(config.queue_name.clone()).into());
-        }
-
-        debug!("Storages: {:?} / {}", &config.queue_url, &config.queue_name);
-
-        let mut redis_client_config =
-            match rustis::client::Config::from_str(config.queue_url.as_ref().unwrap()) {
-                Ok(config) => config,
-                Err(e) => {
-                    return Err(RedisQueueError::ConfigError(config.queue_name.clone(), e).into())
-                }
-            };
-
-        redis_client_config.retry_on_error = true;
-        redis_client_config.reconnection = rustis::client::ReconnectionConfig::new_constant(0, 5);
-
-        let client = match rustis::client::Client::connect(redis_client_config).await {
-            Ok(client) => client,
-            Err(e) => {
-                return Err(RedisQueueError::ConnectionError(config.queue_name.clone(), e).into())
+        match self.try_pop_compressed().await {
+            Ok(compressed) => {
+                let message = compressed
+                    .try_into_message()
+                    .map_err(LocalQueueError::MessageError)?;
+                Ok(Some((message.get_id(), message)))
             }
-        };
-
-        Ok(Self {
-            client,
-            queue_name: config.queue_name.clone(),
-            wip_queue_name: Self::create_wip_queue_name(&config.queue_name),
-            capacity: config.queue_capacity,
-            _phantom_message: std::marker::PhantomData,
-        })
-    }
-
-    async fn get_capacity(&self) -> Result<usize, QueueError> {
-        Ok(self
-            .client
-            .llen(self.queue_name.clone())
-            .await
-            .map_err(|e| {
-                RedisQueueError::RedisError(self.queue_name.clone(), "getting capacity", e)
-            })?)
-    }
-
-    async fn pop(&self) -> Result<Option<(String, M)>, QueueError> {
-        let message_id: String = self
-            .client
-            .lmove(
-                &self.queue_name,
-                &self.wip_queue_name,
-                LMoveWhere::Right,
-                LMoveWhere::Left,
-            )
-            .into_future()
-            .await
-            .map_err(|e| {
-                RedisQueueError::RedisError(
-                    self.queue_name.clone(),
-                    "getting message ID during message popping",
-                    e,
-                )
-            })?;
-
-        if message_id.is_empty() {
-            return Ok(None);
-        }
-
-        let serialized_message: String = self.client.get(&message_id).await.map_err(|e| {
-            RedisQueueError::RedisError(
-                self.queue_name.clone(),
-                "getting message during message popping",
-                e,
-            )
-        })?;
-
-        match serde_json::from_str::<M>(&serialized_message) {
-            Ok(message) => Ok(Some((message_id, message))),
-            Err(e) => Err(RedisQueueError::DeserializationError(
-                self.queue_name.clone(),
-                "popping message",
-                e,
-            )
-            .into()),
+            Err(HttpQueueServerError::QueueEmptyError) => Ok(None),
+            Err(e) => Err(LocalQueueError::DiskSpoolError(e).into()),
         }
     }
 
     async fn push(&self, message: M) -> Result<(), (QueueError, Box<M>)> {
-        let current_len = match self.len().await {
-            Ok(len) => len,
-            Err(e) => {
-                return Err((e, Box::new(message)));
-            }
+        let compressed = match CompressedBinaryMessage::try_from_message(&message) {
+            Ok(compressed) => compressed,
+            Err(e) => return Err((LocalQueueError::MessageError(e).into(), Box::new(message))),
         };
 
-        if current_len >= self.capacity {
-            return Err((QueueError::QueueFullError, Box::new(message)));
+        match self.try_push_compressed(compressed).await {
+            Ok(()) => Ok(()),
+            Err((_, HttpQueueServerError::QueueFullError)) => {
+                Err((QueueError::QueueFullError, Box::new(message)))
+            }
+            Err((_, e)) => Err((LocalQueueError::DiskSpoolError(e).into(), Box::new(message))),
         }
-
-        let serialized_message = match serde_json::to_string(&message) {
-            Ok(serialized_message) => serialized_message,
-            Err(e) => {
-                return Err((
-                    RedisQueueError::SerializationError(
-                        self.queue_name.clone(),
-                        "pushing message",
-                        e,
-                    )
-                    .into(),
-                    Box::new(message),
-                ))
-            }
-        };
-        let message_id = message.get_id();
-
-        let mut transaction = self.client.create_transaction();
-
-        transaction.set(&message_id, serialized_message).forget();
-        transaction.rpush(&self.queue_name, message_id).forget();
-        let _: Vec<rustis::resp::Value> = transaction.execute().await.map_err(|e| {
-            (
-                RedisQueueError::RedisError(self.queue_name.clone(), "pushing message", e).into(),
-                Box::new(message),
-            )
-        })?;
-
-        Ok(())
     }
 
     async fn ack(&self, message_id: &str) -> Result<(), QueueError> {
-        let mut transaction = self.client.create_transaction();
-
-        transaction.del(message_id).forget();
-        transaction
-            .lrem(&self.wip_queue_name, 0, message_id)
-            .forget();
-        let _: Vec<rustis::resp::Value> = transaction.execute().await.map_err(|e| {
-            RedisQueueError::RedisError(self.queue_name.clone(), "acknowledging message", e)
-        })?;
-
-        Ok(())
+        match self.acknowledge(message_id).await {
+            Ok(()) => Ok(()),
+            // Mirrors HttpPipelineQueue's client-side handling of a 410 on ack: already-acked
+            // or unknown IDs are not an error.
+            Err(HttpQueueServerError::KeyNotFoundError(_)) => Ok(()),
+            Err(e) => Err(LocalQueueError::DiskSpoolError(e).into()),
+        }
     }
 
     async fn len(&self) -> Result<usize, QueueError> {
-        Ok(self.client.llen(&self.queue_name).await.map_err(|e| {
-            RedisQueueError::RedisError(self.queue_name.clone(), "getting length", e)
-        })?)
+        Ok(self.len())
     }
 
     async fn is_full(&self) -> Result<bool, QueueError> {
-        let len = self.len().await?;
-        Ok(len >= self.capacity)
+        Ok(self.is_full())
+    }
+}
+
+/// Serializable version of LocalPipelineQueue's bookkeeping (storage keys, message IDs &
+/// timeouts) for saving/loading state. Message payloads themselves are not part of this
+/// snapshot, they already live on disk under the queue's data directory.
+///
+#[derive(Serialize, Deserialize)]
+pub struct SerializableLocalPipelineQueue {
+    capacity: usize,
+    #[serde(with = "crate::utils::serde::duration_as_secs")]
+    timeout: Duration,
+    work: VecDeque<String>,
+    work_in_progress: HashMap<String, (String, Duration)>,
+    next_sequence: u64,
+}
+
+impl SerializableLocalPipelineQueue {
+    /// Reconstructs a `LocalPipelineQueue<M>` from this snapshot, pointing it at `directory`
+    /// for its message payloads.
+    ///
+    pub fn into_local_pipeline_queue<M>(self, directory: PathBuf) -> LocalPipelineQueue<M>
+    where
+        M: IsMessage,
+    {
+        LocalPipelineQueue::with_state(
+            self.capacity,
+            self.timeout,
+            directory,
+            self.work,
+            self.work_in_progress,
+            self.next_sequence,
+        )
+    }
+}
+
+impl<M> From<LocalPipelineQueue<M>> for SerializableLocalPipelineQueue
+where
+    M: IsMessage,
+{
+    fn from(queue: LocalPipelineQueue<M>) -> Self {
+        let next_sequence = queue.sequence.load(Ordering::Relaxed);
+        let (work, work_in_progress) = queue.messages.into_inner();
+
+        Self {
+            work,
+            work_in_progress,
+            capacity: queue.capacity,
+            timeout: queue.timeout,
+            next_sequence,
+        }
     }
 }
 
@@ -636,5 +738,93 @@ where
         })?;
 
         Ok(is_full)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env::temp_dir;
+
+    use crate::pipeline::messages::indexing_message::IndexingMessage;
+
+    use super::*;
+
+    /// Exercises the trait-level `PipelineQueue<M>` API (used in-process by `LocalPipeline`,
+    /// unlike `queue_server`'s tests which only exercise the compressed-level API), asserting
+    /// that pushed payloads actually land on disk and are removed again on ack.
+    ///
+    #[tokio::test]
+    async fn test_local_pipeline_queue_push_pop_ack_len_is_full() {
+        let directory = temp_dir()
+            .join("maccoys.tests.queue.test_local_pipeline_queue_push_pop_ack_len_is_full");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let queue = LocalPipelineQueue::<IndexingMessage>::new_at(
+            2,
+            Duration::from_secs(900),
+            directory.clone(),
+        );
+
+        let message1 = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+        let message2 = IndexingMessage::new("test2".to_string(), vec!["run1".to_string()]);
+
+        queue.push(message1.clone()).await.unwrap();
+        queue.push(message2.clone()).await.unwrap();
+
+        assert_eq!(queue.len(), 2);
+        assert!(queue.is_full());
+        // Both payloads should have been spooled to disk
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+
+        let (id1, popped1) = queue.pop().await.unwrap().unwrap();
+        assert_eq!(popped1.get_id(), message1.get_id());
+
+        queue.ack(&id1).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        // The acked message's spooled payload should have been removed
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        let (id2, popped2) = queue.pop().await.unwrap().unwrap();
+        assert_eq!(popped2.get_id(), message2.get_id());
+        queue.ack(&id2).await.unwrap();
+
+        assert_eq!(queue.len(), 0);
+        assert!(queue.pop().await.unwrap().is_none());
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Pops without acking, waits past the WIP timeout, and confirms `reschedule()` makes the
+    /// message poppable again - the mechanism `LocalPipeline`'s reschedule loop relies on.
+    ///
+    #[tokio::test]
+    async fn test_local_pipeline_queue_reschedule() {
+        let directory = temp_dir().join("maccoys.tests.queue.test_local_pipeline_queue_reschedule");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let queue = LocalPipelineQueue::<IndexingMessage>::new_at(
+            1,
+            Duration::from_millis(1),
+            directory.clone(),
+        );
+
+        let message = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+        queue.push(message.clone()).await.unwrap();
+
+        let (_id, popped) = queue.pop().await.unwrap().unwrap();
+        assert_eq!(popped.get_id(), message.get_id());
+        // Not acked - still counted, and no longer poppable until rescheduled
+        assert_eq!(queue.len(), 1);
+        assert!(queue.pop().await.unwrap().is_none());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        queue.reschedule().unwrap();
+
+        let (rescheduled_id, rescheduled) = queue.pop().await.unwrap().unwrap();
+        assert_eq!(rescheduled.get_id(), message.get_id());
+        queue.ack(&rescheduled_id).await.unwrap();
+        assert_eq!(queue.len(), 0);
+
+        std::fs::remove_dir_all(&directory).ok();
     }
 }

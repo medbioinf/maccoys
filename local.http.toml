@@ -74,5 +74,6 @@ url = "redis://localhost:6380"
 
 
 [queueing]
+data_directory = "/mnt/results/tests/queue-state"
 message_timeout = 300
 reschedule_check_interval = 300

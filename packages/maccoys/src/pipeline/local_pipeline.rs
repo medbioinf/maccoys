@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use futures::future::join_all;
+use futures::{future::join_all, Future};
 use macpepdb::post_translational_modification::PostTranslationalModification;
 use macpepdb_tui::{MetricConfig, TuiHandle};
 use tokio::{fs::create_dir_all, time::sleep};
@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::pipeline::{
     errors::queue_error::QueueError,
     messages::is_message::IsMessage,
-    queue::{HttpPipelineQueue, LocalPipelineQueue, RedisPipelineQueue},
+    queue::{HttpPipelineQueue, LocalPipelineQueue},
     queue_server::{IsQueueRouteable, QueueServer, QueueServerState},
     storage::{LocalPipelineStorage, RedisPipelineStorage},
     tasks::{
@@ -35,7 +35,9 @@ use crate::pipeline::{
 };
 
 use super::{
-    configuration::{PipelineConfiguration, SearchParameters},
+    configuration::{
+        PipelineConfiguration, QueuingConfiguration, SearchParameters, TaskConfiguration,
+    },
     messages::{
         error_message::ErrorMessage, identification_message::IdentificationMessage,
         indexing_message::IndexingMessage, publication_message::PublicationMessage,
@@ -58,13 +60,35 @@ pub enum StorageTarget {
 ///
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum QueueTarget {
-    Memory,
-    Redis,
+    Local,
     Http,
 }
 
 pub trait QueueFactory {
     type Queue<M>: PipelineQueue<M>
+    where
+        M: IsMessage + IsQueueRouteable;
+
+    /// Constructs one of this factory's queues for a pipeline stage.
+    ///
+    /// # Arguments
+    /// * `config` - The stage's own task configuration
+    /// * `queueing` - The pipeline-wide queueing configuration (spool directory / WIP
+    ///   timeout); only consumed by disk-backed implementations (`LocalQueue`), `HttpQueue`
+    ///   ignores it since the broker owns its own spool directory/timeout.
+    ///
+    fn new_queue<M>(
+        config: &TaskConfiguration,
+        queueing: &QueuingConfiguration,
+    ) -> impl Future<Output = Result<Self::Queue<M>, QueueError>> + Send
+    where
+        M: IsMessage + IsQueueRouteable;
+
+    /// Reschedules any timed-out work-in-progress messages of `queue` back onto its pending
+    /// queue. A no-op for queue implementations that don't track WIP state in-process (e.g.
+    /// `HttpQueue`'s broker runs its own rescheduling loop out-of-process).
+    ///
+    fn reschedule<M>(queue: &Self::Queue<M>)
     where
         M: IsMessage + IsQueueRouteable;
 }
@@ -75,14 +99,35 @@ impl QueueFactory for LocalQueue {
         = LocalPipelineQueue<M>
     where
         M: IsMessage + IsQueueRouteable;
-}
 
-pub struct RedisQueue;
-impl QueueFactory for RedisQueue {
-    type Queue<M>
-        = RedisPipelineQueue<M>
+    async fn new_queue<M>(
+        config: &TaskConfiguration,
+        queueing: &QueuingConfiguration,
+    ) -> Result<Self::Queue<M>, QueueError>
     where
-        M: IsMessage + IsQueueRouteable;
+        M: IsMessage + IsQueueRouteable,
+    {
+        Ok(LocalPipelineQueue::new_at(
+            config.queue_capacity,
+            queueing.message_timeout,
+            queueing
+                .data_directory
+                .join("queue_data")
+                .join(&config.queue_name),
+        ))
+    }
+
+    fn reschedule<M>(queue: &Self::Queue<M>)
+    where
+        M: IsMessage + IsQueueRouteable,
+    {
+        if let Err(e) = queue.reschedule() {
+            error!(
+                "[LocalPipeline / Rescheduling] Could not reschedule: {:?}",
+                e
+            );
+        }
+    }
 }
 
 pub struct HttpQueue;
@@ -91,6 +136,23 @@ impl QueueFactory for HttpQueue {
         = HttpPipelineQueue<M>
     where
         M: IsMessage + IsQueueRouteable;
+
+    async fn new_queue<M>(
+        config: &TaskConfiguration,
+        _queueing: &QueuingConfiguration,
+    ) -> Result<Self::Queue<M>, QueueError>
+    where
+        M: IsMessage + IsQueueRouteable,
+    {
+        HttpPipelineQueue::new(config).await
+    }
+
+    fn reschedule<M>(_queue: &Self::Queue<M>)
+    where
+        M: IsMessage + IsQueueRouteable,
+    {
+        // The HTTP broker (queue_server::QueueServer) runs its own rescheduling loop.
+    }
 }
 
 /// Local pipeline for debugging and testing
@@ -130,6 +192,10 @@ where
     scoring_tasks: Vec<tokio::task::JoinHandle<()>>,
     publication_tasks: Vec<tokio::task::JoinHandle<()>>,
     error_tasks: Vec<tokio::task::JoinHandle<()>>,
+
+    /// Periodically reschedules timed-out work-in-progress messages across all 6 queues.
+    /// See [`QueueFactory::reschedule`] - a no-op for queue implementations which don't need it.
+    reschedule_task: tokio::task::JoinHandle<()>,
 }
 
 impl<Q, S> LocalPipeline<Q, S>
@@ -150,25 +216,38 @@ where
             .context("Could not create temporery directory")?;
 
         // Create the queues
-        let indexing_queue =
-            Arc::new(<Q as QueueFactory>::Queue::<IndexingMessage>::new(&config.index).await?);
+        let indexing_queue = Arc::new(
+            <Q as QueueFactory>::new_queue::<IndexingMessage>(&config.index, &config.queueing)
+                .await?,
+        );
         let search_space_generation_queue = Arc::new(
-            <Q as QueueFactory>::Queue::<SearchSpaceGenerationMessage>::new(
+            <Q as QueueFactory>::new_queue::<SearchSpaceGenerationMessage>(
                 &config.search_space_generation,
+                &config.queueing,
             )
             .await?,
         );
         let identification_queue = Arc::new(
-            <Q as QueueFactory>::Queue::<IdentificationMessage>::new(&config.identification)
+            <Q as QueueFactory>::new_queue::<IdentificationMessage>(
+                &config.identification,
+                &config.queueing,
+            )
+            .await?,
+        );
+        let scoring_queue = Arc::new(
+            <Q as QueueFactory>::new_queue::<ScoringMessage>(&config.scoring, &config.queueing)
                 .await?,
         );
-        let scoring_queue =
-            Arc::new(<Q as QueueFactory>::Queue::<ScoringMessage>::new(&config.scoring).await?);
         let publication_queue = Arc::new(
-            <Q as QueueFactory>::Queue::<PublicationMessage>::new(&config.publication).await?,
+            <Q as QueueFactory>::new_queue::<PublicationMessage>(
+                &config.publication,
+                &config.queueing,
+            )
+            .await?,
         );
-        let error_queue =
-            Arc::new(<Q as QueueFactory>::Queue::<ErrorMessage>::new(&config.error).await?);
+        let error_queue = Arc::new(
+            <Q as QueueFactory>::new_queue::<ErrorMessage>(&config.error, &config.queueing).await?,
+        );
 
         // Create the storage
         let storage = Arc::new(S::new(&config.storage).await?);
@@ -267,11 +346,25 @@ where
         let error_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.error.num_tasks)
             .map(|_| {
                 tokio::spawn(
-                    ErrorTask::new(result_dir.clone(), error_queue.clone(), error_stop_flag.clone())
-                        .run(),
+                    ErrorTask::new(
+                        result_dir.clone(),
+                        error_queue.clone(),
+                        error_stop_flag.clone(),
+                    )
+                    .run(),
                 )
             })
             .collect();
+
+        let reschedule_task = tokio::spawn(Self::reschedule_task(
+            indexing_queue.clone(),
+            search_space_generation_queue.clone(),
+            identification_queue.clone(),
+            scoring_queue.clone(),
+            publication_queue.clone(),
+            error_queue.clone(),
+            config.queueing.reschedule_check_interval,
+        ));
 
         Ok(LocalPipeline {
             // Paths
@@ -300,7 +393,35 @@ where
             scoring_tasks,
             publication_tasks,
             error_tasks,
+            reschedule_task,
         })
+    }
+
+    /// Periodically calls [`QueueFactory::reschedule`] on all 6 queues, so that messages
+    /// whose processing errored out without acking (see `Task::process_message` impls, which
+    /// route to the error queue and return early without acking on failure) don't get stuck
+    /// in a disk-backed queue's work-in-progress map forever.
+    ///
+    async fn reschedule_task(
+        indexing_queue: Arc<<Q as QueueFactory>::Queue<IndexingMessage>>,
+        search_space_generation_queue: Arc<
+            <Q as QueueFactory>::Queue<SearchSpaceGenerationMessage>,
+        >,
+        identification_queue: Arc<<Q as QueueFactory>::Queue<IdentificationMessage>>,
+        scoring_queue: Arc<<Q as QueueFactory>::Queue<ScoringMessage>>,
+        publication_queue: Arc<<Q as QueueFactory>::Queue<PublicationMessage>>,
+        error_queue: Arc<<Q as QueueFactory>::Queue<ErrorMessage>>,
+        check_interval: Duration,
+    ) {
+        loop {
+            sleep(check_interval).await;
+            Q::reschedule(indexing_queue.as_ref());
+            Q::reschedule(search_space_generation_queue.as_ref());
+            Q::reschedule(identification_queue.as_ref());
+            Q::reschedule(scoring_queue.as_ref());
+            Q::reschedule(publication_queue.as_ref());
+            Q::reschedule(error_queue.as_ref());
+        }
     }
 
     /// Run the pipeline locally for each mzML file
@@ -489,6 +610,8 @@ where
             error_task.abort();
         }
 
+        self.reschedule_task.abort();
+
         match std::fs::remove_dir_all(&self.tmp_dir) {
             Ok(_) => {
                 info!("Removed temporary directory");
@@ -550,7 +673,10 @@ pub async fn build_and_run_local_pipeline(
 
             let state = Arc::new(QueueServerState::from_config(
                 &queue_server_config,
-                tmp_dir.join("queue_data"),
+                queue_server_config
+                    .queueing
+                    .data_directory
+                    .join("queue_data"),
             ));
 
             let (stop_signal_sender, stop_signal_receiver) = tokio::sync::oneshot::channel::<()>();
@@ -576,26 +702,14 @@ pub async fn build_and_run_local_pipeline(
     };
 
     match (queue, storage) {
-        (QueueTarget::Memory, StorageTarget::Memory) => {
+        (QueueTarget::Local, StorageTarget::Memory) => {
             LocalPipeline::<LocalQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
                 .run(search_params, ptms, mzml_file_paths, tui)
                 .await?
         }
-        (QueueTarget::Memory, StorageTarget::Redis) => {
+        (QueueTarget::Local, StorageTarget::Redis) => {
             LocalPipeline::<LocalQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
-                .await?
-                .run(search_params, ptms, mzml_file_paths, tui)
-                .await?
-        }
-        (QueueTarget::Redis, StorageTarget::Memory) => {
-            LocalPipeline::<RedisQueue, LocalPipelineStorage>::new(result_dir, tmp_dir, config)
-                .await?
-                .run(search_params, ptms, mzml_file_paths, tui)
-                .await?
-        }
-        (QueueTarget::Redis, StorageTarget::Redis) => {
-            LocalPipeline::<RedisQueue, RedisPipelineStorage>::new(result_dir, tmp_dir, config)
                 .await?
                 .run(search_params, ptms, mzml_file_paths, tui)
                 .await?

@@ -50,5 +50,6 @@ time_to_idle = 900
 url = "redis://<STORAGE_SERVER>:6379"
 
 [queueing]
+data_directory = "/queue-data"
 message_timeout = 10800.0
 reschedule_check_interval = 60.0
