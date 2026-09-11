@@ -1,10 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use metrics::counter;
@@ -28,129 +25,86 @@ use super::task::Task;
 ///
 pub const COUNTER_PREFIX: &str = "maccoys_publication";
 
+/// Returns the metrics counter name for a search UUID. Free function mirroring
+/// [`Task::get_counter_name`] for use where `PublicationTask`'s generics aren't
+/// in scope to infer.
+///
+pub fn get_counter_name(uuid: &str) -> String {
+    format!("{}_{}", COUNTER_PREFIX, uuid)
+}
+
+/// Returns the Loki tracing label value for PublicationTask. Free function mirroring
+/// [`Task::loki_tracing_label_value`] for use where PublicationTask's generics aren't
+/// in scope to infer.
+///
+pub fn loki_tracing_label_value() -> &'static str {
+    COUNTER_PREFIX
+}
+
 /// Task to write files into the search directories
 ///
+/// # Generics
+/// * `P` - Type of the publication queue (this task's own queue)
+/// * `E` - Type of the error queue
+/// * `S` - Type of the storage
 ///
-pub struct PublicationTask;
+pub struct PublicationTask<P, E, S>
+where
+    P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+    S: PipelineStorage + Send + Sync + 'static,
+{
+    work_dir: PathBuf,
+    publication_queue: Arc<P>,
+    error_queue: Arc<E>,
+    storage: Arc<S>,
+    stop_flag: Arc<AtomicBool>,
+}
 
-impl PublicationTask {
-    /// Starts the task
+impl<P, E, S> PublicationTask<P, E, S>
+where
+    P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+    S: PipelineStorage + Send + Sync + 'static,
+{
+    /// Creates a new publication task
     ///
     /// # Arguments
     /// * `work_dir` - The working directory
-    /// * `publish_queue` - The queue to push the scored PSMs to
+    /// * `publication_queue` - The queue to get the messages to publish from
     /// * `error_queue` - The queue to push the errors to
     /// * `storage` - The storage to check the finished spectra
     /// * `stop_flag` - The flag to stop the task
     ///
-    pub async fn start<P, E, S>(
+    pub fn new(
         work_dir: PathBuf,
         publication_queue: Arc<P>,
         error_queue: Arc<E>,
         storage: Arc<S>,
         stop_flag: Arc<AtomicBool>,
-    ) where
-        P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
-        E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
-        S: PipelineStorage + Send + Sync + 'static,
-    {
-        'message_loop: loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            let (message_id, message) = match publication_queue.pop().await {
-                Ok(Some(message)) => message,
-                Ok(None) => {
-                    // If the queue is empty, wait for a while before checking again
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue 'message_loop;
-                }
-                Err(e) => {
-                    error!("{}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue 'message_loop;
-                }
-            };
-            info!(
-                "[publication] Got message {}/{}/{} with {} bytes to publish in {}",
-                message.uuid(),
-                message.ms_run_name(),
-                message.spectrum_id(),
-                message.content().len(),
-                message.file_path().display(),
-            );
-
-            let metrics_counter_name = Self::get_counter_name(message.uuid());
-
-            let absolute_file_path = work_dir.join(message.file_path());
-
-            match create_dir_all(absolute_file_path.parent().unwrap()).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(PipelineError::DirectoryCreationError(e));
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            match write(absolute_file_path, message.content()).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(PublicationError::FilePublishingError(e).into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            }
-
-            if message.update_spectrum_count() {
-                match storage
-                    .increase_finished_spectrum_count(message.uuid())
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let error_message = message.to_error_message(e.into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-            }
-
-            Self::ack_message(&message_id, publication_queue.as_ref()).await;
-
-            let is_search_finished = match storage.is_search_finished(message.uuid()).await {
-                Ok(is_finished) => is_finished,
-                Err(e) => {
-                    let error_message = message.to_error_message(e.into());
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                    continue 'message_loop;
-                }
-            };
-
-            if is_search_finished {
-                match storage.cleanup_search(message.uuid()).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        let error_message = message.to_error_message(e.into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                }
-            }
-
-            counter!(metrics_counter_name.clone()).increment(1);
+    ) -> Self {
+        Self {
+            work_dir,
+            publication_queue,
+            error_queue,
+            storage,
+            stop_flag,
         }
-        // wait before checking the queue again
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
+}
+
+/// Standalone entrypoint used by the `maccoys pipeline publication` CLI command; always talks
+/// to the HTTP queue broker and Redis storage, so it's implemented for the one concrete
+/// instantiation rather than the generic one used by [`super::super::local_pipeline`].
+///
+impl
+    PublicationTask<
+        HttpPipelineQueue<PublicationMessage>,
+        HttpPipelineQueue<ErrorMessage>,
+        RedisPipelineStorage,
+    >
+{
     /// Run the publication task by itself
     ///
     /// # Arguments
@@ -184,20 +138,23 @@ impl PublicationTask {
             for sig in signals.forever() {
                 if sig == SIGINT {
                     info!("Gracefully stopping.");
-                    signal_stop_flag.store(true, Ordering::Relaxed);
+                    signal_stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
 
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.publication.num_tasks)
             .map(|_| {
-                tokio::spawn(PublicationTask::start(
-                    config.work_directory.clone(),
-                    publication_queue.clone(),
-                    error_queue.clone(),
-                    storage.clone(),
-                    stop_flag.clone(),
-                ))
+                tokio::spawn(
+                    PublicationTask::new(
+                        config.work_directory.clone(),
+                        publication_queue.clone(),
+                        error_queue.clone(),
+                        storage.clone(),
+                        stop_flag.clone(),
+                    )
+                    .run(),
+                )
             })
             .collect();
 
@@ -209,8 +166,98 @@ impl PublicationTask {
     }
 }
 
-impl Task for PublicationTask {
+impl<P, E, S> Task for PublicationTask<P, E, S>
+where
+    P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+    S: PipelineStorage + Send + Sync + 'static,
+{
+    type Message = PublicationMessage;
+    type Queue = P;
+
     fn get_counter_prefix() -> &'static str {
         COUNTER_PREFIX
+    }
+
+    fn queue(&self) -> &Arc<P> {
+        &self.publication_queue
+    }
+
+    fn stop_flag(&self) -> &Arc<AtomicBool> {
+        &self.stop_flag
+    }
+
+    async fn process_message(&mut self, message_id: String, message: PublicationMessage) {
+        info!(
+            "[publication] Got message {}/{}/{} with {} bytes to publish in {}",
+            message.uuid(),
+            message.ms_run_name(),
+            message.spectrum_id(),
+            message.content().len(),
+            message.file_path().display(),
+        );
+
+        let metrics_counter_name = Self::get_counter_name(message.uuid());
+
+        let absolute_file_path = self.work_dir.join(message.file_path());
+
+        match create_dir_all(absolute_file_path.parent().unwrap()).await {
+            Ok(_) => {}
+            Err(e) => {
+                let error_message = message.to_error_message(PipelineError::DirectoryCreationError(e));
+                error!("{}", &error_message);
+                Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                return;
+            }
+        }
+
+        match write(absolute_file_path, message.content()).await {
+            Ok(_) => {}
+            Err(e) => {
+                let error_message =
+                    message.to_error_message(PublicationError::FilePublishingError(e).into());
+                error!("{}", &error_message);
+                Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                return;
+            }
+        }
+
+        if message.update_spectrum_count() {
+            match self.storage.increase_finished_spectrum_count(message.uuid()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let error_message = message.to_error_message(e.into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+            }
+        }
+
+        Self::ack_message(&message_id, self.publication_queue.as_ref()).await;
+
+        let is_search_finished = match self.storage.is_search_finished(message.uuid()).await {
+            Ok(is_finished) => is_finished,
+            Err(e) => {
+                let error_message = message.to_error_message(e.into());
+                error!("{}", &error_message);
+                Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                return;
+            }
+        };
+
+        if is_search_finished {
+            match self.storage.cleanup_search(message.uuid()).await {
+                Ok(_) => {}
+                Err(e) => {
+                    let error_message = message.to_error_message(e.into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+            }
+        }
+
+        counter!(metrics_counter_name.clone()).increment(1);
     }
 }

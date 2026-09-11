@@ -2,10 +2,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use anyhow::{Context, Result};
@@ -31,121 +28,64 @@ use super::task::Task;
 ///
 pub const COUNTER_PREFIX: &str = "maccoys_errors";
 
+/// Returns the metrics counter name for a search UUID. Free function mirroring
+/// [`Task::get_counter_name`] for use where `ErrorTask`'s generics aren't in
+/// scope to infer.
+///
+pub fn get_counter_name(uuid: &str) -> String {
+    format!("{}_{}", COUNTER_PREFIX, uuid)
+}
+
+/// Returns the Loki tracing label value for ErrorTask. Free function mirroring
+/// [`Task::loki_tracing_label_value`] for use where ErrorTask's generics aren't
+/// in scope to infer.
+///
+pub fn loki_tracing_label_value() -> &'static str {
+    COUNTER_PREFIX
+}
+
 /// Task to write errors to the corresponding search directories
 /// This taks should run on the same server which is hosting the filesystems
 /// to have minimal chance of network errors.
 ///
-pub struct ErrorTask;
+/// # Generics
+/// * `E` - Type of the error queue (this task's own queue)
+///
+pub struct ErrorTask<E>
+where
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+{
+    work_dir: PathBuf,
+    error_queue: Arc<E>,
+    stop_flag: Arc<AtomicBool>,
+}
 
-impl ErrorTask {
-    /// Starts the task
+impl<E> ErrorTask<E>
+where
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+{
+    /// Creates a new error task
     ///
     /// # Arguments
-    /// * `publish_queue` - The queue to push the scored PSMs to
+    /// * `work_dir` - The working directory
+    /// * `error_queue` - The queue to get the errors to write from
     /// * `stop_flag` - The flag to stop the task
     ///
-    pub async fn start<E>(work_dir: PathBuf, error_queue: Arc<E>, stop_flag: Arc<AtomicBool>)
-    where
-        E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
-    {
-        'message_loop: loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            let (message_id, message) = match error_queue.pop().await {
-                Ok(Some(message)) => message,
-                Ok(None) => {
-                    // If the queue is empty, wait for a while before checking again
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue 'message_loop;
-                }
-                Err(e) => {
-                    error!("{}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue 'message_loop;
-                }
-            };
-
-            info!(
-                "[error] Got message {}/{}/{}",
-                message.uuid(),
-                message.ms_run_name().as_ref().unwrap_or(&"n/a".to_string()),
-                message.spectrum_id().as_ref().unwrap_or(&"n/a".to_string()),
-            );
-
-            let metrics_counter_name = Self::get_counter_name(message.uuid());
-
-            // Create a file path depending on the level of the message
-            let relative_file_path = if message.ms_run_name().is_some()
-                && message.spectrum_id().is_some()
-                && message.precursor().is_some()
-            {
-                create_file_path_on_precursor_level(
-                    message.uuid(),
-                    message.ms_run_name().as_ref().unwrap(),
-                    message.spectrum_id().as_ref().unwrap(),
-                    message.precursor().as_ref().unwrap(),
-                    "err",
-                )
-            } else if message.ms_run_name().is_some() && message.spectrum_id().is_some() {
-                create_file_path_on_spectrum_level(
-                    message.uuid(),
-                    message.ms_run_name().as_ref().unwrap(),
-                    message.spectrum_id().as_ref().unwrap(),
-                    "err",
-                )
-            } else if message.ms_run_name().is_some() {
-                create_file_path_on_ms_run_level(
-                    message.uuid(),
-                    message.ms_run_name().as_ref().unwrap(),
-                    "err",
-                )
-            } else {
-                create_file_path_on_search_level(message.uuid(), "err")
-            };
-
-            let absolute_file_path = work_dir.join(relative_file_path);
-
-            match create_dir_all(absolute_file_path.parent().unwrap()).await {
-                Ok(_) => {}
-                Err(e) => {
-                    let error_message =
-                        message.to_error_message(PipelineError::DirectoryCreationError(e));
-                    error!("{}", &error_message);
-                    continue 'message_loop;
-                }
-            }
-
-            let mut log_file = match File::options()
-                .create(true)
-                .append(true)
-                .open(&absolute_file_path)
-            {
-                Ok(file) => file,
-                Err(e) => {
-                    let error_message = message.to_error_message(PipelineError::OpenLogError(e));
-                    error!("{}", &error_message);
-                    continue 'message_loop;
-                }
-            };
-
-            match log_file.write(message.error().as_bytes()) {
-                Ok(_) => {}
-                Err(e) => {
-                    let error_message = message.to_error_message(PipelineError::WriteLogError(e));
-                    error!("{}", &error_message);
-                    continue 'message_loop;
-                }
-            }
-
-            Self::ack_message(&message_id, error_queue.as_ref()).await;
-
-            counter!(metrics_counter_name.clone()).increment(1);
+    pub fn new(work_dir: PathBuf, error_queue: Arc<E>, stop_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            work_dir,
+            error_queue,
+            stop_flag,
         }
-        // wait before checking the queue again
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
+}
+
+/// Standalone entrypoint used by the `maccoys pipeline error` CLI command; always talks to
+/// the HTTP queue broker, so it's implemented for the one concrete instantiation rather than
+/// the generic one used by [`super::super::local_pipeline`].
+///
+impl ErrorTask<HttpPipelineQueue<ErrorMessage>> {
     /// Run the error handling task by itself
     ///
     /// # Arguments
@@ -167,18 +107,21 @@ impl ErrorTask {
             for sig in signals.forever() {
                 if sig == SIGINT {
                     info!("Gracefully stopping.");
-                    signal_stop_flag.store(true, Ordering::Relaxed);
+                    signal_stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
 
         let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.error.num_tasks)
             .map(|_| {
-                tokio::spawn(ErrorTask::start(
-                    config.work_directory.clone(),
-                    error_queue.clone(),
-                    stop_flag.clone(),
-                ))
+                tokio::spawn(
+                    ErrorTask::new(
+                        config.work_directory.clone(),
+                        error_queue.clone(),
+                        stop_flag.clone(),
+                    )
+                    .run(),
+                )
             })
             .collect();
 
@@ -190,8 +133,95 @@ impl ErrorTask {
     }
 }
 
-impl Task for ErrorTask {
+impl<E> Task for ErrorTask<E>
+where
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+{
+    type Message = ErrorMessage;
+    type Queue = E;
+
     fn get_counter_prefix() -> &'static str {
         COUNTER_PREFIX
+    }
+
+    fn queue(&self) -> &Arc<E> {
+        &self.error_queue
+    }
+
+    fn stop_flag(&self) -> &Arc<AtomicBool> {
+        &self.stop_flag
+    }
+
+    async fn process_message(&mut self, message_id: String, message: ErrorMessage) {
+        info!(
+            "[error] Got message {}/{}/{}",
+            message.uuid(),
+            message.ms_run_name().as_ref().unwrap_or(&"n/a".to_string()),
+            message.spectrum_id().as_ref().unwrap_or(&"n/a".to_string()),
+        );
+
+        let metrics_counter_name = Self::get_counter_name(message.uuid());
+
+        // Create a file path depending on the level of the message
+        let relative_file_path = if message.ms_run_name().is_some()
+            && message.spectrum_id().is_some()
+            && message.precursor().is_some()
+        {
+            create_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name().as_ref().unwrap(),
+                message.spectrum_id().as_ref().unwrap(),
+                message.precursor().as_ref().unwrap(),
+                "err",
+            )
+        } else if message.ms_run_name().is_some() && message.spectrum_id().is_some() {
+            create_file_path_on_spectrum_level(
+                message.uuid(),
+                message.ms_run_name().as_ref().unwrap(),
+                message.spectrum_id().as_ref().unwrap(),
+                "err",
+            )
+        } else if message.ms_run_name().is_some() {
+            create_file_path_on_ms_run_level(message.uuid(), message.ms_run_name().as_ref().unwrap(), "err")
+        } else {
+            create_file_path_on_search_level(message.uuid(), "err")
+        };
+
+        let absolute_file_path = self.work_dir.join(relative_file_path);
+
+        match create_dir_all(absolute_file_path.parent().unwrap()).await {
+            Ok(_) => {}
+            Err(e) => {
+                let error_message = message.to_error_message(PipelineError::DirectoryCreationError(e));
+                error!("{}", &error_message);
+                return;
+            }
+        }
+
+        let mut log_file = match File::options()
+            .create(true)
+            .append(true)
+            .open(&absolute_file_path)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                let error_message = message.to_error_message(PipelineError::OpenLogError(e));
+                error!("{}", &error_message);
+                return;
+            }
+        };
+
+        match log_file.write(message.error().as_bytes()) {
+            Ok(_) => {}
+            Err(e) => {
+                let error_message = message.to_error_message(PipelineError::WriteLogError(e));
+                error!("{}", &error_message);
+                return;
+            }
+        }
+
+        Self::ack_message(&message_id, self.error_queue.as_ref()).await;
+
+        counter!(metrics_counter_name.clone()).increment(1);
     }
 }

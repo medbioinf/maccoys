@@ -23,9 +23,13 @@ use crate::pipeline::{
     queue_server::{IsQueueRouteable, QueueServer, QueueServerState},
     storage::{LocalPipelineStorage, RedisPipelineStorage},
     tasks::{
-        error_task::ErrorTask, identification_task::IdentificationTask,
-        indexing_task::IndexingTask, publication_task::PublicationTask, scoring_task::ScoringTask,
-        search_space_generation_task::SearchSpaceGenerationTask, task::Task,
+        error_task::{self, ErrorTask},
+        identification_task::{self, IdentificationTask},
+        indexing_task::{self, IndexingTask},
+        publication_task::{self, PublicationTask},
+        scoring_task::{self, ScoringTask},
+        search_space_generation_task::{self, SearchSpaceGenerationTask},
+        task::Task,
     },
     utils::create_file_path_on_ms_run_level,
 };
@@ -178,29 +182,35 @@ where
 
         let indexing_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.index.num_tasks)
             .map(|_| {
-                tokio::spawn(IndexingTask::start(
-                    result_dir.clone(),
-                    indexing_queue.clone(),
-                    search_space_generation_queue.clone(),
-                    error_queue.clone(),
-                    storage.clone(),
-                    index_stop_flag.clone(),
-                ))
+                tokio::spawn(
+                    IndexingTask::new(
+                        result_dir.clone(),
+                        indexing_queue.clone(),
+                        search_space_generation_queue.clone(),
+                        error_queue.clone(),
+                        storage.clone(),
+                        index_stop_flag.clone(),
+                    )
+                    .run(),
+                )
             })
             .collect();
 
         let search_space_generation_tasks: Vec<tokio::task::JoinHandle<()>> =
             (0..config.search_space_generation.num_tasks)
                 .map(|_| {
-                    tokio::spawn(SearchSpaceGenerationTask::start(
-                        Arc::new(config.search_space_generation.clone()),
-                        storage.clone(),
-                        search_space_generation_queue.clone(),
-                        identification_queue.clone(),
-                        publication_queue.clone(),
-                        error_queue.clone(),
-                        search_space_generation_stop_flag.clone(),
-                    ))
+                    tokio::spawn(
+                        SearchSpaceGenerationTask::new(
+                            Arc::new(config.search_space_generation.clone()),
+                            storage.clone(),
+                            search_space_generation_queue.clone(),
+                            identification_queue.clone(),
+                            publication_queue.clone(),
+                            error_queue.clone(),
+                            search_space_generation_stop_flag.clone(),
+                        )
+                        .run(),
+                    )
                 })
                 .collect();
 
@@ -208,50 +218,58 @@ where
             (0..config.identification.num_tasks)
                 .map(|comet_proc_idx| {
                     let comet_tmp_dir = tmp_dir.join(format!("comet_{}", comet_proc_idx));
-                    tokio::spawn(IdentificationTask::start(
-                        comet_tmp_dir,
-                        Arc::new(config.identification.clone()),
-                        storage.clone(),
-                        identification_queue.clone(),
-                        scoring_queue.clone(),
-                        publication_queue.clone(),
-                        error_queue.clone(),
-                        identification_stop_flag.clone(),
-                    ))
+                    tokio::spawn(
+                        IdentificationTask::new(
+                            comet_tmp_dir,
+                            Arc::new(config.identification.clone()),
+                            storage.clone(),
+                            identification_queue.clone(),
+                            scoring_queue.clone(),
+                            publication_queue.clone(),
+                            error_queue.clone(),
+                            identification_stop_flag.clone(),
+                        )
+                        .run(),
+                    )
                 })
                 .collect();
 
         let scoring_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.scoring.num_tasks)
             .map(|_| {
-                tokio::spawn(ScoringTask::start(
-                    scoring_queue.clone(),
-                    publication_queue.clone(),
-                    error_queue.clone(),
-                    scoring_stop_flag.clone(),
-                    config.scoring.threads,
-                ))
+                tokio::spawn(
+                    ScoringTask::new(
+                        scoring_queue.clone(),
+                        publication_queue.clone(),
+                        error_queue.clone(),
+                        scoring_stop_flag.clone(),
+                        config.scoring.threads,
+                    )
+                    .run(),
+                )
             })
             .collect();
 
         let publication_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.publication.num_tasks)
             .map(|_| {
-                tokio::spawn(PublicationTask::start(
-                    result_dir.clone(),
-                    publication_queue.clone(),
-                    error_queue.clone(),
-                    storage.clone(),
-                    publication_stop_flag.clone(),
-                ))
+                tokio::spawn(
+                    PublicationTask::new(
+                        result_dir.clone(),
+                        publication_queue.clone(),
+                        error_queue.clone(),
+                        storage.clone(),
+                        publication_stop_flag.clone(),
+                    )
+                    .run(),
+                )
             })
             .collect();
 
         let error_tasks: Vec<tokio::task::JoinHandle<()>> = (0..config.error.num_tasks)
             .map(|_| {
-                tokio::spawn(ErrorTask::start(
-                    result_dir.clone(),
-                    error_queue.clone(),
-                    error_stop_flag.clone(),
-                ))
+                tokio::spawn(
+                    ErrorTask::new(result_dir.clone(), error_queue.clone(), error_stop_flag.clone())
+                        .run(),
+                )
             })
             .collect();
 
@@ -311,52 +329,52 @@ where
 
         if let Some(tui) = tui {
             tui.add_metric(MetricConfig::rate(
-                IndexingTask::get_counter_name(&uuid),
+                indexing_task::get_counter_name(&uuid),
                 "Indexing rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                SearchSpaceGenerationTask::get_counter_name(&uuid),
+                search_space_generation_task::get_counter_name(&uuid),
                 "Search spaces generation rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                IdentificationTask::get_counter_name(&uuid),
+                identification_task::get_counter_name(&uuid),
                 "Identification rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                ScoringTask::get_counter_name(&uuid),
+                scoring_task::get_counter_name(&uuid),
                 "Scoring rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                PublicationTask::get_counter_name(&uuid),
+                publication_task::get_counter_name(&uuid),
                 "Publication rate",
             ));
             tui.add_metric(MetricConfig::rate(
-                ErrorTask::get_counter_name(&uuid),
+                error_task::get_counter_name(&uuid),
                 "Error rate",
             ));
 
             tui.add_metric(MetricConfig::counter(
-                IndexingTask::get_counter_name(&uuid),
+                indexing_task::get_counter_name(&uuid),
                 "Indexed runs",
             ));
             tui.add_metric(MetricConfig::counter(
-                SearchSpaceGenerationTask::get_counter_name(&uuid),
+                search_space_generation_task::get_counter_name(&uuid),
                 "Search spaces generated",
             ));
             tui.add_metric(MetricConfig::counter(
-                IdentificationTask::get_counter_name(&uuid),
+                identification_task::get_counter_name(&uuid),
                 "Identified spectra",
             ));
             tui.add_metric(MetricConfig::counter(
-                ScoringTask::get_counter_name(&uuid),
+                scoring_task::get_counter_name(&uuid),
                 "Scored PSM distributions",
             ));
             tui.add_metric(MetricConfig::counter(
-                PublicationTask::get_counter_name(&uuid),
+                publication_task::get_counter_name(&uuid),
                 "Publicated results",
             ));
             tui.add_metric(MetricConfig::counter(
-                ErrorTask::get_counter_name(&uuid),
+                error_task::get_counter_name(&uuid),
                 "Errors",
             ));
         }
@@ -421,12 +439,12 @@ where
         }
 
         if let Some(tui) = tui {
-            tui.remove_metric(IndexingTask::get_counter_name(&uuid).as_str());
-            tui.remove_metric(SearchSpaceGenerationTask::get_counter_name(&uuid).as_str());
-            tui.remove_metric(IdentificationTask::get_counter_name(&uuid).as_str());
-            tui.remove_metric(ScoringTask::get_counter_name(&uuid).as_str());
-            tui.remove_metric(PublicationTask::get_counter_name(&uuid).as_str());
-            tui.remove_metric(ErrorTask::get_counter_name(&uuid).as_str());
+            tui.remove_metric(indexing_task::get_counter_name(&uuid).as_str());
+            tui.remove_metric(search_space_generation_task::get_counter_name(&uuid).as_str());
+            tui.remove_metric(identification_task::get_counter_name(&uuid).as_str());
+            tui.remove_metric(scoring_task::get_counter_name(&uuid).as_str());
+            tui.remove_metric(publication_task::get_counter_name(&uuid).as_str());
+            tui.remove_metric(error_task::get_counter_name(&uuid).as_str());
         }
 
         Ok(())

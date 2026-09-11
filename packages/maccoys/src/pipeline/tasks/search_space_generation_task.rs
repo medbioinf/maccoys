@@ -1,10 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use macpepdb::{
@@ -42,27 +39,75 @@ use super::task::Task;
 ///
 pub const COUNTER_PREFIX: &str = "maccoys_search_space_generation";
 
+/// Returns the metrics counter name for a search UUID. Free function mirroring
+/// [`Task::get_counter_name`] for use where `SearchSpaceGenerationTask`'s generics
+/// aren't in scope to infer.
+///
+pub fn get_counter_name(uuid: &str) -> String {
+    format!("{}_{}", COUNTER_PREFIX, uuid)
+}
+
+/// Returns the Loki tracing label value for SearchSpaceGenerationTask. Free function mirroring
+/// [`Task::loki_tracing_label_value`] for use where SearchSpaceGenerationTask's generics aren't
+/// in scope to infer.
+///
+pub fn loki_tracing_label_value() -> &'static str {
+    COUNTER_PREFIX
+}
+
 /// Task to generate the search space for the search engine
 ///
-pub struct SearchSpaceGenerationTask;
+/// # Generics
+/// * `S` - Type of the storage
+/// * `G` - Type of the search space generation queue (this task's own queue)
+/// * `I` - Type of the identification queue
+/// * `P` - Type of the publication queue
+/// * `E` - Type of the error queue
+///
+pub struct SearchSpaceGenerationTask<S, G, I, P, E>
+where
+    S: PipelineStorage + Send + Sync + 'static,
+    G: PipelineQueue<SearchSpaceGenerationMessage> + Send + Sync + 'static,
+    I: PipelineQueue<IdentificationMessage> + Send + Sync + 'static,
+    P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+{
+    config: Arc<SearchSpaceGenerationTaskConfiguration>,
+    storage: Arc<S>,
+    search_space_generation_queue: Arc<G>,
+    identification_queue: Arc<I>,
+    publication_queue: Arc<P>,
+    error_queue: Arc<E>,
+    stop_flag: Arc<AtomicBool>,
+    /// UUID of the search the cached parameters/PTMs below belong to, to avoid
+    /// refetching them for every message of the same search.
+    last_search_uuid: String,
+    current_search_params: SearchParameters,
+    current_ptms: Arc<PTMCollection<Arc<PostTranslationalModification>>>,
+    metrics_counter_name: String,
+}
 
-impl SearchSpaceGenerationTask {
-    /// Start the indexing task
+impl<S, G, I, P, E> SearchSpaceGenerationTask<S, G, I, P, E>
+where
+    S: PipelineStorage + Send + Sync + 'static,
+    G: PipelineQueue<SearchSpaceGenerationMessage> + Send + Sync + 'static,
+    I: PipelineQueue<IdentificationMessage> + Send + Sync + 'static,
+    P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+{
+    /// Creates a new search space generation task
     ///
     /// # Arguments
     /// * `config` - Configuration for the search space generation task
-    /// * `search_space_generation_queue` - Queue for the search space generation task
-    /// * `comet_search_queue` - Queue for the Comet search task
     /// * `storage` - Storage to access configuration and PTMs
+    /// * `search_space_generation_queue` - Queue for the search space generation task
+    /// * `identification_queue` - Queue for the identification task
+    /// * `publication_queue` - Queue for the publication task
+    /// * `error_queue` - Queue for the error task
     /// * `stop_flag` - Flag to indicate to stop once the search space generation queue is empty
     ///
-    /// # Generics
-    /// * `S` - Type of the storage
-    /// * `G` - Type of the search space generation queue
-    /// * `I` - Type of the identification queue
-    /// * `E` - Type of the error queue
-    ///
-    pub async fn start<S, G, I, P, E>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
         config: Arc<SearchSpaceGenerationTaskConfiguration>,
         storage: Arc<S>,
         search_space_generation_queue: Arc<G>,
@@ -70,237 +115,41 @@ impl SearchSpaceGenerationTask {
         publication_queue: Arc<P>,
         error_queue: Arc<E>,
         stop_flag: Arc<AtomicBool>,
-    ) where
-        S: PipelineStorage + Send + Sync + 'static,
-        G: PipelineQueue<SearchSpaceGenerationMessage> + Send + Sync + 'static,
-        I: PipelineQueue<IdentificationMessage> + Send + Sync + 'static,
-        P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
-        E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
-    {
-        let mut last_search_uuid = String::new();
-        let mut current_search_params = SearchParameters::new();
-        let mut current_ptms: Arc<PTMCollection<Arc<PostTranslationalModification>>> =
-            Arc::new(PTMCollection::new(vec![]).unwrap());
-        let mut metrics_counter_name = COUNTER_PREFIX.to_string();
-
-        'message_loop: loop {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            let (message_id, message) = match search_space_generation_queue.pop().await {
-                Ok(Some(message)) => message,
-                Ok(None) => {
-                    // If the queue is empty, wait for a while before checking again
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue 'message_loop;
-                }
-                Err(e) => {
-                    error!("{}", e);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    continue 'message_loop;
-                }
-            };
-            info!(
-                "[search space generation] Got message {}/{}/{} with {} precursor(s)",
-                message.uuid(),
-                message.ms_run_name(),
-                message.spectrum_id(),
-                message.precursors().len()
-            );
-
-            if last_search_uuid != *message.uuid() {
-                current_search_params = match storage.get_search_parameters(message.uuid()).await {
-                    Ok(Some(params)) => params,
-                    Ok(None) => {
-                        let error_message = message.to_error_message(
-                            SearchSpaceGenerationError::SearchParametersNotFoundError().into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                    Err(e) => {
-                        let error_message = message.to_error_message(
-                            SearchSpaceGenerationError::GetSearchParametersError(e).into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                let ptms = match storage.get_ptms(message.uuid()).await {
-                    Ok(Some(ptms)) => ptms,
-                    Ok(None) => {
-                        let error_message = message.to_error_message(
-                            SearchSpaceGenerationError::PTMsNotFoundError().into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                    Err(e) => {
-                        let error_message = message
-                            .to_error_message(SearchSpaceGenerationError::GetPTMsError(e).into());
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                current_ptms = match PTMCollection::new(ptms) {
-                    Ok(ptms) => Arc::new(ptms),
-                    Err(err) => {
-                        let error_message = message.to_error_message(
-                            SearchSpaceGenerationError::PTMCollection(Box::new(err)).into(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'message_loop;
-                    }
-                };
-
-                last_search_uuid = message.uuid().clone();
-                metrics_counter_name = Self::get_counter_name(message.uuid());
-            }
-
-            // Generate the search space for each precursor
-            'precursor_loop: for precursor in message.precursors() {
-                let now = std::time::Instant::now();
-
-                let mass = mass_to_int(precursor.to_dalton());
-
-                let mut search_space = InMemorySearchSpace::new();
-
-                let search_space_generator = match SearchSpaceGenerator::new(
-                    &config.target_url,
-                    config.decoy_url.clone(),
-                    config.target_lookup_url.clone(),
-                )
-                .await
-                {
-                    Ok(generator) => generator,
-                    Err(err) => {
-                        let error_message = message.to_error_message_with_precursor(
-                            SearchSpaceGenerationError::from(err).into(),
-                            precursor.clone(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'precursor_loop;
-                    }
-                };
-
-                match search_space_generator
-                    .create(
-                        &mut search_space,
-                        mass,
-                        current_search_params.lower_mass_tolerance_ppm,
-                        current_search_params.upper_mass_tolerance_ppm,
-                        current_search_params.max_variable_modifications,
-                        current_ptms.clone(),
-                        current_search_params.decoys_per_peptide,
-                        config.concurrent_searches,
-                    )
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(err) => {
-                        let error_message = message.to_error_message_with_precursor(
-                            SearchSpaceGenerationError::from(err).into(),
-                            precursor.clone(),
-                        );
-                        error!("{}", &error_message);
-                        Self::enqueue_message(error_message, error_queue.as_ref()).await;
-                        continue 'precursor_loop;
-                    }
-                };
-
-                let elapsed = now.elapsed();
-
-                let search_space_size = search_space.size();
-                let search_space_len = search_space.len();
-
-                info!(
-                    "[search space generation] Took {:.4}s to process message {}/{}/{} with {} m/z & {} charge. Found {} candidate peptides",
-                    elapsed.as_secs_f32(),
-                    message.uuid(),
-                    message.ms_run_name(),
-                    message.spectrum_id(),
-                    precursor.mz(),
-                    precursor.charge(),
-                    search_space.len(),
-                );
-
-                let identification_message =
-                    message.into_identification_message(precursor.clone(), search_space);
-
-                Self::enqueue_message(identification_message, identification_queue.as_ref()).await;
-                Self::ack_message(&message_id, search_space_generation_queue.as_ref()).await;
-                counter!(metrics_counter_name.clone()).increment(1);
-
-                // sending metrics
-
-                let metrics_path = create_metrics_file_path_on_precursor_level(
-                    message.uuid(),
-                    message.ms_run_name(),
-                    message.spectrum_id(),
-                    precursor,
-                    "search_space_generation.time",
-                );
-
-                Self::enqueue_message(
-                    message.into_publication_message(
-                        metrics_path,
-                        elapsed.as_millis().to_string().into_bytes(),
-                    ),
-                    publication_queue.as_ref(),
-                )
-                .await;
-
-                let metrics_path = create_metrics_file_path_on_precursor_level(
-                    message.uuid(),
-                    message.ms_run_name(),
-                    message.spectrum_id(),
-                    precursor,
-                    "search_space_generation.size",
-                );
-
-                Self::enqueue_message(
-                    message.into_publication_message(
-                        metrics_path,
-                        search_space_size.to_string().into_bytes(),
-                    ),
-                    publication_queue.as_ref(),
-                )
-                .await;
-
-                let metrics_path = create_metrics_file_path_on_precursor_level(
-                    message.uuid(),
-                    message.ms_run_name(),
-                    message.spectrum_id(),
-                    precursor,
-                    "search_space_generation.len",
-                );
-
-                Self::enqueue_message(
-                    message.into_publication_message(
-                        metrics_path,
-                        search_space_len.to_string().into_bytes(),
-                    ),
-                    publication_queue.as_ref(),
-                )
-                .await;
-            }
+    ) -> Self {
+        Self {
+            config,
+            storage,
+            search_space_generation_queue,
+            identification_queue,
+            publication_queue,
+            error_queue,
+            stop_flag,
+            last_search_uuid: String::new(),
+            current_search_params: SearchParameters::new(),
+            current_ptms: Arc::new(PTMCollection::new(vec![]).unwrap()),
+            metrics_counter_name: COUNTER_PREFIX.to_string(),
         }
-        // wait before checking the queue again
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
+}
+
+/// Standalone entrypoint used by the `maccoys pipeline search-space-generation` CLI command;
+/// always talks to the HTTP queue broker, Redis storage and Redis-backed PTM lookup, so it's
+/// implemented for the one concrete instantiation rather than the generic one used by
+/// [`super::super::local_pipeline`].
+///
+impl
+    SearchSpaceGenerationTask<
+        RedisPipelineStorage,
+        HttpPipelineQueue<SearchSpaceGenerationMessage>,
+        HttpPipelineQueue<IdentificationMessage>,
+        HttpPipelineQueue<PublicationMessage>,
+        HttpPipelineQueue<ErrorMessage>,
+    >
+{
     /// Run the search space generation task by itself
     ///
     /// # Arguments
-    /// * `work_dir` - Working directory
     /// * `config_file_path` - Path to the configuration file
     ///
     pub async fn run_standalone(config_file_path: PathBuf) -> Result<(), PipelineError> {
@@ -336,10 +185,10 @@ impl SearchSpaceGenerationTask {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let handles: Vec<tokio::task::JoinHandle<()>> =
-            (0..config.search_space_generation.num_tasks)
-                .map(|_| {
-                    tokio::spawn(SearchSpaceGenerationTask::start(
+        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.search_space_generation.num_tasks)
+            .map(|_| {
+                tokio::spawn(
+                    SearchSpaceGenerationTask::new(
                         search_space_generation_config.clone(),
                         storage.clone(),
                         search_space_generation_queue.clone(),
@@ -347,9 +196,11 @@ impl SearchSpaceGenerationTask {
                         publication_queue.clone(),
                         error_queue.clone(),
                         stop_flag.clone(),
-                    ))
-                })
-                .collect();
+                    )
+                    .run(),
+                )
+            })
+            .collect();
 
         for handle in handles {
             handle.await?;
@@ -359,8 +210,224 @@ impl SearchSpaceGenerationTask {
     }
 }
 
-impl Task for SearchSpaceGenerationTask {
+impl<S, G, I, P, E> Task for SearchSpaceGenerationTask<S, G, I, P, E>
+where
+    S: PipelineStorage + Send + Sync + 'static,
+    G: PipelineQueue<SearchSpaceGenerationMessage> + Send + Sync + 'static,
+    I: PipelineQueue<IdentificationMessage> + Send + Sync + 'static,
+    P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
+    E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
+{
+    type Message = SearchSpaceGenerationMessage;
+    type Queue = G;
+
     fn get_counter_prefix() -> &'static str {
         COUNTER_PREFIX
+    }
+
+    fn queue(&self) -> &Arc<G> {
+        &self.search_space_generation_queue
+    }
+
+    fn stop_flag(&self) -> &Arc<AtomicBool> {
+        &self.stop_flag
+    }
+
+    async fn process_message(&mut self, message_id: String, message: SearchSpaceGenerationMessage) {
+        info!(
+            "[search space generation] Got message {}/{}/{} with {} precursor(s)",
+            message.uuid(),
+            message.ms_run_name(),
+            message.spectrum_id(),
+            message.precursors().len()
+        );
+
+        if self.last_search_uuid != *message.uuid() {
+            self.current_search_params = match self.storage.get_search_parameters(message.uuid()).await {
+                Ok(Some(params)) => params,
+                Ok(None) => {
+                    let error_message = message.to_error_message(
+                        SearchSpaceGenerationError::SearchParametersNotFoundError().into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+                Err(e) => {
+                    let error_message = message.to_error_message(
+                        SearchSpaceGenerationError::GetSearchParametersError(e).into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+            };
+
+            let ptms = match self.storage.get_ptms(message.uuid()).await {
+                Ok(Some(ptms)) => ptms,
+                Ok(None) => {
+                    let error_message = message
+                        .to_error_message(SearchSpaceGenerationError::PTMsNotFoundError().into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+                Err(e) => {
+                    let error_message =
+                        message.to_error_message(SearchSpaceGenerationError::GetPTMsError(e).into());
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+            };
+
+            self.current_ptms = match PTMCollection::new(ptms) {
+                Ok(ptms) => Arc::new(ptms),
+                Err(err) => {
+                    let error_message = message.to_error_message(
+                        SearchSpaceGenerationError::PTMCollection(Box::new(err)).into(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    return;
+                }
+            };
+
+            self.last_search_uuid = message.uuid().clone();
+            self.metrics_counter_name = Self::get_counter_name(message.uuid());
+        }
+
+        let current_search_params = self.current_search_params.clone();
+        let current_ptms = self.current_ptms.clone();
+        let metrics_counter_name = self.metrics_counter_name.clone();
+
+        // Generate the search space for each precursor
+        'precursor_loop: for precursor in message.precursors() {
+            let now = std::time::Instant::now();
+
+            let mass = mass_to_int(precursor.to_dalton());
+
+            let mut search_space = InMemorySearchSpace::new();
+
+            let search_space_generator = match SearchSpaceGenerator::new(
+                &self.config.target_url,
+                self.config.decoy_url.clone(),
+                self.config.target_lookup_url.clone(),
+            )
+            .await
+            {
+                Ok(generator) => generator,
+                Err(err) => {
+                    let error_message = message.to_error_message_with_precursor(
+                        SearchSpaceGenerationError::from(err).into(),
+                        precursor.clone(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    continue 'precursor_loop;
+                }
+            };
+
+            match search_space_generator
+                .create(
+                    &mut search_space,
+                    mass,
+                    current_search_params.lower_mass_tolerance_ppm,
+                    current_search_params.upper_mass_tolerance_ppm,
+                    current_search_params.max_variable_modifications,
+                    current_ptms.clone(),
+                    current_search_params.decoys_per_peptide,
+                    self.config.concurrent_searches,
+                )
+                .await
+            {
+                Ok(_) => (),
+                Err(err) => {
+                    let error_message = message.to_error_message_with_precursor(
+                        SearchSpaceGenerationError::from(err).into(),
+                        precursor.clone(),
+                    );
+                    error!("{}", &error_message);
+                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                    continue 'precursor_loop;
+                }
+            };
+
+            let elapsed = now.elapsed();
+
+            let search_space_size = search_space.size();
+            let search_space_len = search_space.len();
+
+            info!(
+                "[search space generation] Took {:.4}s to process message {}/{}/{} with {} m/z & {} charge. Found {} candidate peptides",
+                elapsed.as_secs_f32(),
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                precursor.mz(),
+                precursor.charge(),
+                search_space.len(),
+            );
+
+            let identification_message =
+                message.into_identification_message(precursor.clone(), search_space);
+
+            Self::enqueue_message(identification_message, self.identification_queue.as_ref()).await;
+            Self::ack_message(&message_id, self.search_space_generation_queue.as_ref()).await;
+            counter!(metrics_counter_name.clone()).increment(1);
+
+            // sending metrics
+
+            let metrics_path = create_metrics_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                precursor,
+                "search_space_generation.time",
+            );
+
+            Self::enqueue_message(
+                message.into_publication_message(
+                    metrics_path,
+                    elapsed.as_millis().to_string().into_bytes(),
+                ),
+                self.publication_queue.as_ref(),
+            )
+            .await;
+
+            let metrics_path = create_metrics_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                precursor,
+                "search_space_generation.size",
+            );
+
+            Self::enqueue_message(
+                message.into_publication_message(
+                    metrics_path,
+                    search_space_size.to_string().into_bytes(),
+                ),
+                self.publication_queue.as_ref(),
+            )
+            .await;
+
+            let metrics_path = create_metrics_file_path_on_precursor_level(
+                message.uuid(),
+                message.ms_run_name(),
+                message.spectrum_id(),
+                precursor,
+                "search_space_generation.len",
+            );
+
+            Self::enqueue_message(
+                message.into_publication_message(
+                    metrics_path,
+                    search_space_len.to_string().into_bytes(),
+                ),
+                self.publication_queue.as_ref(),
+            )
+            .await;
+        }
     }
 }

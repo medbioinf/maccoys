@@ -18,13 +18,12 @@ use maccoys::pipeline::local_pipeline::{build_and_run_local_pipeline, QueueTarge
 use maccoys::pipeline::queue_server::QueueServer;
 use maccoys::pipeline::remote_pipeline::RemotePipeline;
 use maccoys::pipeline::remote_pipeline_web_api::RemotePipelineWebApi;
-use maccoys::pipeline::tasks::error_task::ErrorTask;
-use maccoys::pipeline::tasks::identification_task::IdentificationTask;
-use maccoys::pipeline::tasks::indexing_task::IndexingTask;
-use maccoys::pipeline::tasks::publication_task::PublicationTask;
-use maccoys::pipeline::tasks::scoring_task::ScoringTask;
-use maccoys::pipeline::tasks::search_space_generation_task::SearchSpaceGenerationTask;
-use maccoys::pipeline::tasks::task::Task;
+use maccoys::pipeline::tasks::error_task::{self, ErrorTask};
+use maccoys::pipeline::tasks::identification_task::{self, IdentificationTask};
+use maccoys::pipeline::tasks::indexing_task::{self, IndexingTask};
+use maccoys::pipeline::tasks::publication_task::{self, PublicationTask};
+use maccoys::pipeline::tasks::scoring_task::{self, ScoringTask};
+use maccoys::pipeline::tasks::search_space_generation_task::{self, SearchSpaceGenerationTask};
 use maccoys::search_space::search_space_generator::{FastaSearchSpace, SearchSpaceGenerator};
 use macpepdb::mass::to_int as mass_to_int;
 use macpepdb::monitoring::{MetricTarget, Monitoring, TracingLogRotation, TracingTarget};
@@ -663,23 +662,23 @@ fn pipeline_stage_label(commands: &Commands) -> &'static str {
             } => RemotePipelineWebApi::loki_tracing_label_value(),
             PipelineCommand::Index {
                 config_file_path: _,
-            } => IndexingTask::loki_tracing_label_value(),
+            } => indexing_task::loki_tracing_label_value(),
             PipelineCommand::SearchSpaceGeneration {
                 config_file_path: _,
-            } => SearchSpaceGenerationTask::loki_tracing_label_value(),
+            } => search_space_generation_task::loki_tracing_label_value(),
             PipelineCommand::Identification {
                 tmp_dir: _,
                 config_file_path: _,
-            } => IdentificationTask::loki_tracing_label_value(),
+            } => identification_task::loki_tracing_label_value(),
             PipelineCommand::Scoring {
                 config_file_path: _,
-            } => ScoringTask::loki_tracing_label_value(),
+            } => scoring_task::loki_tracing_label_value(),
             PipelineCommand::Publication {
                 config_file_path: _,
-            } => PublicationTask::loki_tracing_label_value(),
+            } => publication_task::loki_tracing_label_value(),
             PipelineCommand::Error {
                 config_file_path: _,
-            } => ErrorTask::loki_tracing_label_value(),
+            } => error_task::loki_tracing_label_value(),
             PipelineCommand::QueueServer {
                 interface: _,
                 port: _,
