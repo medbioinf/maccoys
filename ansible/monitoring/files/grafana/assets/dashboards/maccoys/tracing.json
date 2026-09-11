@@ -127,7 +127,7 @@
           {
             "datasource": "maccoys-loki",
             "editorMode": "code",
-            "expr": "sum(count_over_time({maccoys=\"$maccoys\", level=~\"$level\"} [$__interval]))",
+            "expr": "sum(count_over_time({instance=\"$instance\", pipeline_stage=\"$pipeline_stage\", level=~\"$level\"} [$__interval]))",
             "legendFormat": "",
             "queryType": "range",
             "refId": "A"
@@ -165,7 +165,7 @@
           {
             "datasource": "maccoys-loki",
             "editorMode": "code",
-            "expr": "{maccoys=\"$maccoys\", level=~\"$level\"} | logfmt",
+            "expr": "{instance=\"$instance\", pipeline_stage=\"$pipeline_stage\", level=~\"$level\"} | logfmt",
             "hide": false,
             "legendFormat": "",
             "queryType": "range",
@@ -185,17 +185,38 @@
       "list": [
         {
           "current": {
-            "text": "development",
-            "value": "development"
+            "text": "maccoys",
+            "value": "maccoys"
           },
           "datasource": "maccoys-loki",
           "definition": "",
           "includeAll": false,
-          "label": "maccoys",
-          "name": "maccoys",
+          "label": "instance",
+          "name": "instance",
           "options": [],
           "query": {
-            "label": "maccoys",
+            "label": "instance",
+            "refId": "LokiVariableQueryEditor-VariableQuery",
+            "stream": "",
+            "type": 1
+          },
+          "refresh": 1,
+          "regex": "",
+          "type": "query"
+        },
+        {
+          "current": {
+            "text": "maccoys_identifications",
+            "value": "maccoys_identifications"
+          },
+          "datasource": "maccoys-loki",
+          "definition": "",
+          "includeAll": false,
+          "label": "pipeline_stage",
+          "name": "pipeline_stage",
+          "options": [],
+          "query": {
+            "label": "pipeline_stage",
             "refId": "LokiVariableQueryEditor-VariableQuery",
             "stream": "",
             "type": 1
@@ -250,6 +271,6 @@
     "timezone": "",
     "title": "Logs",
     "uid": "sadlil-loki-apps-dashboard",
-    "version": 5,
+    "version": 7,
     "weekStart": ""
   }
