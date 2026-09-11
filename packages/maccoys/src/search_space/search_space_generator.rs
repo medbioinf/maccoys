@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 // 3rd party imports
 use dihardts_omicstools::chemistry::amino_acid::{AminoAcid, CANONICAL_AMINO_ACIDS};
@@ -29,6 +30,20 @@ use crate::constants::{
 };
 use crate::peptide_arena::PeptideArena;
 use crate::search_space::target_lookup::TargetLookup;
+
+/// Initial delay before retrying a failed target/decoy fetch in [`SearchSpaceGenerator::create`]
+const RETRY_BACKOFF_START: Duration = Duration::from_millis(200);
+
+/// Upper bound the retry delay is capped at, so a permanently broken URL/config doesn't
+/// busy-loop the retry forever
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// Sleeps for `interval`, then returns the next (doubled, capped) interval to use
+/// if the same operation fails again
+async fn retry_backoff_sleep(interval: Duration) -> Duration {
+    tokio::time::sleep(interval).await;
+    (interval * 2).min(RETRY_BACKOFF_MAX)
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -558,6 +573,7 @@ impl SearchSpaceGenerator {
     where
         T: IsSearchSpace,
     {
+        let mut target_backoff = RETRY_BACKOFF_START;
         loop {
             let target_result = self
                 .add_peptides(
@@ -580,6 +596,7 @@ impl SearchSpaceGenerator {
                 }
                 Err(err) => {
                     error!("Error adding target peptides: `{}, retry... ", err);
+                    target_backoff = retry_backoff_sleep(target_backoff).await;
                     continue;
                 }
             }
@@ -588,6 +605,7 @@ impl SearchSpaceGenerator {
         let needed_decoys = decoys_per_peptide * fasta.target_count();
 
         if needed_decoys > 0 {
+            let mut decoy_backoff = RETRY_BACKOFF_START;
             loop {
                 // Fetch decoys from cache if possible
                 //
@@ -609,6 +627,7 @@ impl SearchSpaceGenerator {
 
                 if let Err(err) = cached_decoy_result {
                     error!("Error adding cached decoy peptides: `{}, retry... ", err);
+                    decoy_backoff = retry_backoff_sleep(decoy_backoff).await;
                     continue;
                 }
 
@@ -631,6 +650,7 @@ impl SearchSpaceGenerator {
                         }
                         Err(err) => {
                             error!("Error adding missing decoy peptides: `{}, retry... ", err);
+                            decoy_backoff = retry_backoff_sleep(decoy_backoff).await;
                             continue;
                         }
                     }

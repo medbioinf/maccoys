@@ -4,6 +4,7 @@ use axum::{
 };
 use http::StatusCode;
 use thiserror::Error;
+use tracing::{error, warn};
 
 use crate::pipeline::errors::message_error::MessageError;
 
@@ -15,10 +16,10 @@ pub enum HttpQueueServerError {
     QueueEmptyError,
     #[error("[HttpQueueServer] Key `{0}` not found in store")]
     KeyNotFoundError(String),
-    #[error("[HttpQueueServer] Unreadabale queue")]
-    UnreadableQueueError,
-    #[error("[HttpQueueServer] Unwritable queue")]
-    UnwritableQueueError,
+    #[error("[HttpQueueServer] Unreadable queue: {0}")]
+    UnreadableQueueError(std::io::Error),
+    #[error("[HttpQueueServer] Unwritable queue: {0}")]
+    UnwritableQueueError(std::io::Error),
     #[error("[HttpQueueServer] Unable to acquire TCP listener: {0}")]
     TcpListenerError(std::io::Error),
     #[error("[HttpQueueServer] Unreadable Hub state")]
@@ -35,14 +36,14 @@ pub enum HttpQueueServerError {
     UnknownQueueError,
     #[error("[HttpQueueServer] `{0}` not found")]
     RouteNotFoundError(String),
-    #[error("[HttpQueueServer] Failed to read state file")]
-    CacheFileReadError,
-    #[error("[HttpQueueServer] Failed to write state file")]
-    CacheFileWriteError,
-    #[error("[HttpQueueServer] Failed to serialize state")]
-    StateSerializationError,
-    #[error("[HttpQueueServer] Failed to deserialize state")]
-    StateDeserializationError,
+    #[error("[HttpQueueServer] Failed to read state file: {0}")]
+    CacheFileReadError(std::io::Error),
+    #[error("[HttpQueueServer] Failed to write state file: {0}")]
+    CacheFileWriteError(std::io::Error),
+    #[error("[HttpQueueServer] Failed to serialize state: {0}")]
+    StateSerializationError(postcard::Error),
+    #[error("[HttpQueueServer] Failed to deserialize state: {0}")]
+    StateDeserializationError(postcard::Error),
     #[error("[HttpQueueServer] Could not start the server: {0}")]
     ServerStartError(std::io::Error),
     #[error("[HttpQueueServer] Could not send the shutdown signal to the server")]
@@ -71,7 +72,18 @@ impl IntoResponse for HttpQueueServerError {
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        // error!("{}, Status Code: {}", self, status_code);
+        // Queue-full/-empty are routine polling outcomes, not failures; skip logging them so
+        // they don't drown out real errors.
+        if !matches!(
+            self,
+            HttpQueueServerError::QueueFullError | HttpQueueServerError::QueueEmptyError
+        ) {
+            if status_code.is_server_error() {
+                error!("{:?}, Status Code: {}", self, status_code);
+            } else {
+                warn!("{:?}, Status Code: {}", self, status_code);
+            }
+        }
 
         (status_code, self.to_string()).into_response()
     }

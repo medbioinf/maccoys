@@ -9,6 +9,20 @@ use crate::pipeline::{
     errors::queue_error::QueueError, messages::is_message::IsMessage, queue::PipelineQueue,
 };
 
+/// Initial delay for the retry loops below
+const BACKOFF_START: Duration = Duration::from_millis(100);
+
+/// Upper bound the retry loops' delay is capped at, so a sustained outage produces
+/// periodic log lines instead of a tight, ever-shrinking-value-free busy loop
+const BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Sleeps for `interval`, then returns the next (doubled, capped) interval to use
+/// if the same operation fails again
+async fn backoff_sleep(interval: Duration) -> Duration {
+    tokio::time::sleep(interval).await;
+    (interval * 2).min(BACKOFF_MAX)
+}
+
 /// Common functionality shared by every pipeline stage: polling its own queue,
 /// backing off when the queue is empty or erroring, and dispatching to
 /// [`Task::process_message`] for the actual, stage-specific work.
@@ -63,20 +77,25 @@ pub trait Task: Sized {
         Self: Send + 'static,
     {
         async move {
+            let mut pop_backoff = BACKOFF_START;
             'message_loop: loop {
                 if self.stop_flag().load(Ordering::Relaxed) {
                     break;
                 }
                 let (message_id, message) = match self.queue().pop().await {
-                    Ok(Some(message)) => message,
+                    Ok(Some(message)) => {
+                        pop_backoff = BACKOFF_START;
+                        message
+                    }
                     Ok(None) => {
                         // If the queue is empty, wait for a while before checking again
+                        pop_backoff = BACKOFF_START;
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue 'message_loop;
                     }
                     Err(e) => {
                         error!("{}", e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        pop_backoff = backoff_sleep(pop_backoff).await;
                         continue 'message_loop;
                     }
                 };
@@ -87,7 +106,8 @@ pub trait Task: Sized {
     }
 
     /// Tries to enqueue the message to the queue.
-    /// If it fails, it will log the error and try again
+    /// Retries until it succeeds so a message is never silently dropped; logs
+    /// every failure except a full queue, which is routine backpressure.
     ///
     /// # Arguments
     /// * `message` - Message to enqueue
@@ -100,18 +120,18 @@ pub trait Task: Sized {
     {
         async {
             let mut message = message;
+            let mut backoff = BACKOFF_START;
             loop {
                 message = match queue.push(message).await {
                     Ok(_) => break,
-                    Err((err, errored_message)) => match err {
-                        QueueError::QueueFullError => *errored_message,
-                        _ => {
+                    Err((err, errored_message)) => {
+                        if !matches!(err, QueueError::QueueFullError) {
                             error!("{}", err);
-                            break;
                         }
-                    },
+                        *errored_message
+                    }
                 };
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                backoff = backoff_sleep(backoff).await;
             }
         }
     }
@@ -132,12 +152,13 @@ pub trait Task: Sized {
         Q: PipelineQueue<M> + Send + Sync + 'static,
     {
         async {
+            let mut backoff = BACKOFF_START;
             loop {
                 match queue.ack(message_id).await {
                     Ok(()) => break,
                     Err(e) => {
                         error!("{}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        backoff = backoff_sleep(backoff).await;
                         continue;
                     }
                 }

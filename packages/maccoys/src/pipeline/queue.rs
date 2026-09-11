@@ -176,10 +176,10 @@ where
 
         let storage_key = self.new_storage_key(message.id());
         let file_path = self.directory.join(&storage_key);
-        if tokio::fs::write(&file_path, bytes).await.is_err() {
+        if let Err(e) = tokio::fs::write(&file_path, bytes).await {
             return Err((
                 Box::new(message),
-                HttpQueueServerError::UnwritableQueueError,
+                HttpQueueServerError::UnwritableQueueError(e),
             ));
         }
 
@@ -205,7 +205,7 @@ where
         let message = match tokio::fs::read(&file_path).await {
             Ok(bytes) => CompressedBinaryMessage::<M>::from_postcard(&bytes)
                 .map_err(HttpQueueServerError::MessageError),
-            Err(_) => Err(HttpQueueServerError::UnreadableQueueError),
+            Err(e) => Err(HttpQueueServerError::UnreadableQueueError(e)),
         };
 
         let message = match message {
@@ -248,7 +248,7 @@ where
         let file_path = self.directory.join(&storage_key);
         tokio::fs::remove_file(&file_path)
             .await
-            .map_err(|_| HttpQueueServerError::UnwritableQueueError)?;
+            .map_err(HttpQueueServerError::UnwritableQueueError)?;
 
         Ok(())
     }
@@ -426,6 +426,24 @@ where
 /// Queue implemented used [crate::pipeline::queue_server::QueueServer] as backend
 /// Messages are convert to compressed binary messages and transfered using HTTP.
 ///
+/// Timeout used for every request made by [`HttpPipelineQueue`]'s client
+const HTTP_QUEUE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Builds the context string for a [`HttpQueueError::RequestError`], noting when the
+/// underlying `reqwest::Error` was a timeout so it can be told apart from e.g. a
+/// connection-refused/DNS failure without inspecting the nested error.
+///
+fn request_error_context(context: &'static str, err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        format!(
+            "{context} (timed out after {}s)",
+            HTTP_QUEUE_REQUEST_TIMEOUT.as_secs()
+        )
+    } else {
+        context.to_string()
+    }
+}
+
 pub struct HttpPipelineQueue<M>
 where
     M: IsMessage + IsQueueRouteable,
@@ -458,7 +476,7 @@ where
         );
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(HTTP_QUEUE_REQUEST_TIMEOUT)
             .user_agent(config.queue_name.clone())
             // .default_headers(default_header)
             .http2_prior_knowledge()
@@ -479,18 +497,24 @@ where
         let url = format!("{}{}", self.base_url, M::capacity_route());
 
         let response = self.client.get(&url).send().await.map_err(|err| {
+            let context = request_error_context("getting capacity", &err);
             QueueError::from(HttpQueueError::RequestError(
                 self.queue_name.clone(),
-                "getting capacity",
+                url.clone(),
+                context,
                 err,
             ))
         })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let reason = response.text().await.unwrap_or_default();
+            let reason = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(HttpQueueError::UnsuccessStatusCode(
                 self.queue_name.clone(),
+                url,
                 status,
                 reason,
                 "getting capacity",
@@ -513,9 +537,11 @@ where
         let url = format!("{}{}", self.base_url, M::pop_route());
 
         let response = self.client.get(&url).send().await.map_err(|err| {
+            let context = request_error_context("popping message", &err);
             QueueError::from(HttpQueueError::RequestError(
                 self.queue_name.clone(),
-                "getting message",
+                url.clone(),
+                context,
                 err,
             ))
         })?;
@@ -528,9 +554,13 @@ where
             }
             _ => {
                 let status = response.status();
-                let reason = response.text().await.unwrap_or_default();
+                let reason = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
                 return Err(HttpQueueError::UnsuccessStatusCode(
                     self.queue_name.clone(),
+                    url,
                     status,
                     reason,
                     "popping message",
@@ -540,7 +570,8 @@ where
         }
 
         let message_bytes = response.bytes().await.map_err(|err| {
-            HttpQueueError::RequestError(self.queue_name.clone(), "accessing body for message", err)
+            let context = request_error_context("accessing body for message", &err);
+            HttpQueueError::RequestError(self.queue_name.clone(), url.clone(), context, err)
         })?;
 
         let message: M = CompressedBinaryMessage::from_postcard(&message_bytes)
@@ -605,8 +636,9 @@ where
         {
             Ok(response) => response,
             Err(err) => {
+                let context = request_error_context("pushing message", &err);
                 return Err((
-                    HttpQueueError::RequestError(self.queue_name.clone(), "getting message", err)
+                    HttpQueueError::RequestError(self.queue_name.clone(), url.clone(), context, err)
                         .into(),
                     Box::new(message),
                 ))
@@ -620,10 +652,14 @@ where
                     return Err((QueueError::QueueFullError, Box::new(message)))
                 }
                 _ => {
-                    let reason: String = response.text().await.unwrap_or_default();
+                    let reason: String = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
                     return Err((
                         HttpQueueError::UnsuccessStatusCode(
                             self.queue_name.clone(),
+                            url,
                             status,
                             reason,
                             "pushing message",
@@ -648,9 +684,11 @@ where
             .send()
             .await
             .map_err(|err| {
+                let context = request_error_context("acknowledging message", &err);
                 QueueError::from(HttpQueueError::RequestError(
                     self.queue_name.clone(),
-                    "acknowledging message",
+                    url.clone(),
+                    context,
                     err,
                 ))
             })?;
@@ -667,9 +705,13 @@ where
                 return Ok(());
             }
 
-            let reason = response.text().await.unwrap_or_default();
+            let reason = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(HttpQueueError::UnsuccessStatusCode(
                 self.queue_name.clone(),
+                url,
                 status,
                 reason,
                 "acknowledging message",
@@ -684,14 +726,19 @@ where
         let url = format!("{}{}", self.base_url, M::len_route());
 
         let response = self.client.get(&url).send().await.map_err(|err| {
-            HttpQueueError::RequestError(self.queue_name.clone(), "acknowledging message", err)
+            let context = request_error_context("getting length", &err);
+            HttpQueueError::RequestError(self.queue_name.clone(), url.clone(), context, err)
         })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let reason = response.text().await.unwrap_or_default();
+            let reason = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(HttpQueueError::UnsuccessStatusCode(
                 self.queue_name.clone(),
+                url,
                 status,
                 reason,
                 "getting length",
@@ -714,14 +761,19 @@ where
         let url = format!("{}{}", self.base_url, M::is_full_route());
 
         let response = self.client.get(&url).send().await.map_err(|err| {
-            HttpQueueError::RequestError(self.queue_name.clone(), "checking if full", err)
+            let context = request_error_context("checking if full", &err);
+            HttpQueueError::RequestError(self.queue_name.clone(), url.clone(), context, err)
         })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let reason = response.text().await.unwrap_or_default();
+            let reason = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(HttpQueueError::UnsuccessStatusCode(
                 self.queue_name.clone(),
+                url,
                 status,
                 reason,
                 "checking if full",

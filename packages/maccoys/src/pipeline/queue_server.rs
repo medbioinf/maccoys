@@ -146,14 +146,14 @@ macro_rules! queue_namespace {
 
             impl SerializableQueueCollection {
                 pub fn from_file(path: &PathBuf) -> Result<Self, HttpQueueServerError> {
-                    let serialized = std::fs::read(path).map_err(|_| HttpQueueServerError::CacheFileReadError)?;
-                    let queue_collection: Self = postcard::from_bytes(&serialized).map_err(|_| HttpQueueServerError::StateDeserializationError)?;
+                    let serialized = std::fs::read(path).map_err(HttpQueueServerError::CacheFileReadError)?;
+                    let queue_collection: Self = postcard::from_bytes(&serialized).map_err(HttpQueueServerError::StateDeserializationError)?;
                     Ok(queue_collection)
                 }
 
                 pub fn to_file(&self, path: &PathBuf) -> Result<(), HttpQueueServerError> {
-                    let serialized = postcard::to_allocvec(self).map_err(|_| HttpQueueServerError::StateSerializationError)?;
-                    std::fs::write(path, serialized).map_err(|_| HttpQueueServerError::CacheFileWriteError)?;
+                    let serialized = postcard::to_allocvec(self).map_err(HttpQueueServerError::StateSerializationError)?;
+                    std::fs::write(path, serialized).map_err(HttpQueueServerError::CacheFileWriteError)?;
                     Ok(())
                 }
 

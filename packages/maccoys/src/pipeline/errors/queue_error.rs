@@ -31,13 +31,13 @@ pub enum LocalQueueError {
 pub enum HttpQueueError {
     #[error("[HttpQueue / {0}] Base URL is missing in config")]
     BaseUrlMissing(String),
-    #[error("[HttpQueue / {0}] Error building HTTP client:\n\t{1}")]
+    #[error("[HttpQueue / {0}] Error building HTTP client:\n\t{1:?}")]
     BuildError(String, reqwest::Error),
-    #[error("[HttpQueue / {0}] HTTP request error when {1}:\n\t{2:?}")]
-    RequestError(String, &'static str, reqwest::Error),
-    #[error("[HttpQueue / {0}] Non-success status code `{1} - {2}` when {3}")]
-    UnsuccessStatusCode(String, reqwest::StatusCode, String, &'static str),
-    #[error("[HttpQueue / {0}] Unable to deserialize response when {1}:\n\t{2}")]
+    #[error("[HttpQueue / {0}] HTTP request error when {2} (url: {1}):\n\t{3:?}")]
+    RequestError(String, String, String, reqwest::Error),
+    #[error("[HttpQueue / {0}] Non-success status code `{2} - {3}` when {4} (url: {1})")]
+    UnsuccessStatusCode(String, String, reqwest::StatusCode, String, &'static str),
+    #[error("[HttpQueue / {0}] Unable to deserialize response when {1}:\n\t{2:?}")]
     DeserializationError(String, &'static str, reqwest::Error),
     #[error("[HttpQueue / {0}] Message error {1}:\n\t{2}")]
     MessageError(String, &'static str, MessageError),

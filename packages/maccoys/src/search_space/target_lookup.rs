@@ -19,8 +19,8 @@ pub enum Error {
     BlobTable(Box<macpepdb::blob_table::Error>),
     #[error("Database client error in target lookup: {0}")]
     DatabaseClient(Box<macpepdb::client::Error>),
-    #[error("Invalid target lookup URL. Allowed is `http://<macpepdb-api-base>`, `bloom+http://<macpepdb-bloomfilter-base>` or `postgresql://<postgresql-connection-url>`")]
-    InvalidUrl,
+    #[error("Invalid target lookup URL `{0}`. Allowed is `http://<macpepdb-api-base>`, `bloom+http://<macpepdb-bloomfilter-base>` or `postgresql://<postgresql-connection-url>`")]
+    InvalidUrl(String),
     #[error("HTTP request error in target lookup: {0}")]
     HttpRequest(Box<reqwest::Error>),
     #[error("Missing configuration in database for target lookup")]
@@ -29,8 +29,8 @@ pub enum Error {
     PeptideSequence(Box<macpepdb::sequence::Error>),
     #[error("Peptide table error in target lookup: {0}")]
     PeptideTable(Box<macpepdb::peptide_table::Error>),
-    #[error("Unexpected status code in target lookup: {0}")]
-    UnexpectedStatusCode(u16),
+    #[error("Unexpected status code `{1}` in target lookup at `{0}` (content type `{2}`): {3}")]
+    UnexpectedStatusCode(String, u16, String, String),
     #[error("Unable to build HTTP client: {0}")]
     WebClientBuild(Box<reqwest::Error>),
 }
@@ -80,7 +80,7 @@ impl TargetLookup {
 
             Ok(Self::Database(client, configuration))
         } else {
-            Err(Error::InvalidUrl)
+            Err(Error::InvalidUrl(url.to_string()))
         }
     }
 
@@ -120,8 +120,9 @@ impl TargetLookup {
                     .map_err(|err| Error::PeptideTable(Box::new(err)))
             }
             Self::Api(client, url) | Self::BloomFilter(client, url) => {
+                let request_url = url.replace(":sequence:", sequence);
                 let response = client
-                    .get(url.replace(":sequence:", sequence))
+                    .get(&request_url)
                     .send()
                     .await
                     .map_err(|err| Error::HttpRequest(Box::new(err)))?;
@@ -129,7 +130,24 @@ impl TargetLookup {
                 match response.status() {
                     StatusCode::OK => Ok(true),
                     StatusCode::NOT_FOUND => Ok(false),
-                    _ => Err(Error::UnexpectedStatusCode(response.status().as_u16())),
+                    status => {
+                        let content_type = response
+                            .headers()
+                            .get("content-type")
+                            .and_then(|ct| ct.to_str().ok())
+                            .unwrap_or("unknown content type")
+                            .to_string();
+                        let body = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+                        Err(Error::UnexpectedStatusCode(
+                            request_url,
+                            status.as_u16(),
+                            content_type,
+                            body,
+                        ))
+                    }
                 }
             }
         }
