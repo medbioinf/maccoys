@@ -469,21 +469,23 @@ where
             return Err(HttpQueueError::BaseUrlMissing(config.queue_name.clone()).into());
         }
 
-        let base_url = format!(
-            "{}{}",
-            config.queue_url.as_ref().unwrap(),
-            QueueController::path()
-        );
+        let queue_url = config.queue_url.as_ref().unwrap();
 
-        let client = reqwest::Client::builder()
+        let base_url = format!("{}{}", queue_url, QueueController::path());
+
+        let mut client_builder = reqwest::Client::builder()
             .timeout(HTTP_QUEUE_REQUEST_TIMEOUT)
-            .user_agent(config.queue_name.clone())
-            // .default_headers(default_header)
-            .http2_prior_knowledge()
-            .build()
-            .map_err(|err| {
-                QueueError::from(HttpQueueError::BuildError(config.queue_name.clone(), err))
-            })?;
+            .user_agent(config.queue_name.clone());
+
+        if queue_url.starts_with("http://") {
+            // No TLS means no ALPN, so force HTTP/2 prior knowledge (h2c) explicitly —
+            // the queue server (axum::serve, "http2" feature) auto-detects it.
+            client_builder = client_builder.http2_prior_knowledge();
+        }
+
+        let client = client_builder.build().map_err(|err| {
+            QueueError::from(HttpQueueError::BuildError(config.queue_name.clone(), err))
+        })?;
 
         Ok(Self {
             base_url,
