@@ -9,6 +9,7 @@ RUN cargo build -r --package maccoys
 
 FROM debian:trixie-slim
 
+COPY --from=build-stage /etc/ssl/certs /etc/ssl/certs
 COPY --from=build-stage /usr/src/maccoys/target/release/maccoys /usr/bin/maccoys
 
 ENTRYPOINT [ "/usr/bin/maccoys" ]
