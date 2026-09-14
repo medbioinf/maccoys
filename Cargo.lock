@@ -423,6 +423,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3588,7 +3594,7 @@ dependencies = [
  "postcard",
  "rand 0.8.7",
  "rayon",
- "reqwest 0.12.28",
+ "reqwest 0.13.5",
  "rustis",
  "serde",
  "serde_json",
@@ -3626,7 +3632,7 @@ dependencies = [
  "dioxus-logger",
  "getrandom 0.3.4",
  "maccoys-exchange-entities",
- "reqwest 0.12.28",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "toml",
@@ -3639,7 +3645,7 @@ dependencies = [
 [[package]]
 name = "macpepdb"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#cc02f2e66649a9fe82cc9041420447011b35a327"
+source = "git+https://github.com/medbioinf/macpepdb.git#c882134bc55c01e4aef5a121c9f813fa09379a8f"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -3676,7 +3682,7 @@ dependencies = [
  "postgres-types",
  "rand 0.9.5",
  "rayon",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "static_assertions",
@@ -3703,7 +3709,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_metrics_peek"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#cc02f2e66649a9fe82cc9041420447011b35a327"
+source = "git+https://github.com/medbioinf/macpepdb.git#c882134bc55c01e4aef5a121c9f813fa09379a8f"
 dependencies = [
  "metrics",
 ]
@@ -3711,12 +3717,12 @@ dependencies = [
 [[package]]
 name = "macpepdb_peptide_hydrophobicity"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#cc02f2e66649a9fe82cc9041420447011b35a327"
+source = "git+https://github.com/medbioinf/macpepdb.git#c882134bc55c01e4aef5a121c9f813fa09379a8f"
 
 [[package]]
 name = "macpepdb_tui"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#cc02f2e66649a9fe82cc9041420447011b35a327"
+source = "git+https://github.com/medbioinf/macpepdb.git#c882134bc55c01e4aef5a121c9f813fa09379a8f"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
@@ -3733,7 +3739,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_uniprot_reader"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#cc02f2e66649a9fe82cc9041420447011b35a327"
+source = "git+https://github.com/medbioinf/macpepdb.git#c882134bc55c01e4aef5a121c9f813fa09379a8f"
 dependencies = [
  "futures",
  "serde",
@@ -3744,7 +3750,7 @@ dependencies = [
 [[package]]
 name = "macpepdb_web_common"
 version = "0.1.0"
-source = "git+https://github.com/medbioinf/macpepdb.git#cc02f2e66649a9fe82cc9041420447011b35a327"
+source = "git+https://github.com/medbioinf/macpepdb.git#c882134bc55c01e4aef5a121c9f813fa09379a8f"
 dependencies = [
  "serde",
 ]
@@ -5524,11 +5530,8 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
- "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.4.15",
  "http 1.4.2",
  "http-body 1.1.0",
  "http-body-util",
@@ -5538,7 +5541,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
- "mime",
  "mime_guess",
  "native-tls",
  "percent-encoding",
@@ -5567,13 +5569,14 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2 0.4.15",
@@ -5586,6 +5589,7 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
