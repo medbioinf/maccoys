@@ -18,5 +18,5 @@
   vars:
     maccoys_id: queue-server
     maccoys_cmd: queue-server
-    maccoys_opts: "{{ hostvars[ (groups['queue']|first) ]['queue_state_dir'] }} 0.0.0.0 8123"
+    maccoys_opts: "0.0.0.0 8123"
     prometheus_scraping_port: 9497
