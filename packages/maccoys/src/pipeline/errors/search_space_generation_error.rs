@@ -16,7 +16,7 @@ pub enum SearchSpaceGenerationError {
     ReadingSpectrumMzMlError(anyhow::Error),
     #[error("Error while reading the spectrum `{0}`:\n\t{1}")]
     SpectrumReadError(String, anyhow::Error),
-    #[error("Error generating FASTA:\n\t{0}")]
+    #[error("Search space generator error in search space generation task:\n\t{0}")]
     SearchSpaceGenerator(Box<crate::search_space::search_space_generator::Error>),
     #[error("Error when flushing FASTA:\n\t{0}")]
     FastaFlushError(std::io::Error),
