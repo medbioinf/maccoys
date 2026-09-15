@@ -49,6 +49,7 @@ rustis = { workspace = true, features = ["tokio-runtime"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 signal-hook = { workspace = true }
+sysinfo = { workspace = true }
 tcmalloc2 = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }

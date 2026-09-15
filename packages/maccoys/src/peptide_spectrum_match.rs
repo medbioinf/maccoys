@@ -181,6 +181,12 @@ pub struct PeptideSpectrumMatchCollection {
     theoretical_mass_col: Vec<f64>,
     second_theoretical_mass_col: Vec<f64>,
     loop_score_col: Option<Vec<f64>>,
+    /// Flat, row-major cache of the 3 LoOP features per row (row `idx` at
+    /// `[idx*3..idx*3+3]`), built once by [`Self::prepare_loop_features`] so
+    /// [`PointSource::point`] can borrow instead of allocating a `Vec` per call. Derived
+    /// from the other columns, so it's excluded from `PartialEq` and never (de)serialized.
+    #[serde(skip)]
+    loop_feature_buffer: Option<Vec<f64>>,
 }
 
 impl PartialEq for PeptideSpectrumMatchCollection {
@@ -234,6 +240,7 @@ impl PeptideSpectrumMatchCollection {
             theoretical_mass_col: vec![f64::NAN; peptides.len()],
             second_theoretical_mass_col: vec![f64::NAN; peptides.len()],
             loop_score_col: None,
+            loop_feature_buffer: None,
             peptides,
         }
     }
@@ -285,21 +292,77 @@ impl PeptideSpectrumMatchCollection {
         );
 
         let keep: Vec<bool> = self.xcorr_col.iter().map(|x| !x.is_nan()).collect();
+        self.retain_by_keep_mask(&keep);
+    }
 
-        self.peptides.retain(&keep);
+    /// Keeps only the `max_len` rows with the highest `xcorr`, dropping the rest, to bound
+    /// how many candidates ever reach LoOP scoring for a single spectrum (defense-in-depth
+    /// against a pathologically large search space). No-op if the collection already has
+    /// `max_len` rows or fewer.
+    ///
+    /// Ties at the cut-off `xcorr` value are all kept, so the result can be slightly larger
+    /// than `max_len`.
+    ///
+    /// Must be called before [`Self::set_loop_score_col`], like [`Self::retain_scored`].
+    ///
+    pub fn truncate_to_top_by_xcorr(&mut self, max_len: usize) {
+        debug_assert!(
+            self.loop_score_col.is_none(),
+            "truncate_to_top_by_xcorr must be called before set_loop_score_col"
+        );
+
+        if self.len() <= max_len {
+            return;
+        }
+
+        if max_len == 0 {
+            self.retain_by_keep_mask(&vec![false; self.len()]);
+            return;
+        }
+
+        let mut sorted_xcorr = self.xcorr_col.clone();
+        sorted_xcorr.select_nth_unstable_by(max_len - 1, |a, b| b.total_cmp(a));
+        let threshold = sorted_xcorr[max_len - 1];
+
+        let keep: Vec<bool> = self.xcorr_col.iter().map(|x| *x >= threshold).collect();
+        self.retain_by_keep_mask(&keep);
+    }
+
+    /// Filters `peptides` and every plain-`Vec` column in lockstep with `keep`, keeping the
+    /// relative order of the retained rows. Shared by [`Self::retain_scored`] and
+    /// [`Self::truncate_to_top_by_xcorr`].
+    ///
+    fn retain_by_keep_mask(&mut self, keep: &[bool]) {
+        self.peptides.retain(keep);
 
         // Filters a column `Vec` in lockstep with `keep`, using an external index
         // counter into the mask rather than duplicating this loop 5 times.
         fn retain_by_mask<T>(col: &mut Vec<T>, keep: &[bool]) {
+            debug_assert_eq!(keep.len(), col.len());
             let mut keep_iter = keep.iter();
             col.retain(|_| *keep_iter.next().unwrap());
         }
 
-        retain_by_mask(&mut self.xcorr_col, &keep);
-        retain_by_mask(&mut self.ions_total_col, &keep);
-        retain_by_mask(&mut self.ions_matched_col, &keep);
-        retain_by_mask(&mut self.theoretical_mass_col, &keep);
-        retain_by_mask(&mut self.second_theoretical_mass_col, &keep);
+        retain_by_mask(&mut self.xcorr_col, keep);
+        retain_by_mask(&mut self.ions_total_col, keep);
+        retain_by_mask(&mut self.ions_matched_col, keep);
+        retain_by_mask(&mut self.theoretical_mass_col, keep);
+        retain_by_mask(&mut self.second_theoretical_mass_col, keep);
+    }
+
+    /// Builds the flat, row-major LoOP-feature cache consumed by [`PointSource::point`],
+    /// from the current (final) row set. Must be called after any row-count-changing
+    /// operation (e.g. [`Self::retain_scored`] / [`Self::truncate_to_top_by_xcorr`]) and
+    /// before this collection is passed to `local_outlier_probabilities`.
+    ///
+    pub fn prepare_loop_features(&mut self) {
+        let mut buffer = Vec::with_capacity(self.len() * 3);
+        for idx in 0..self.len() {
+            buffer.push(self.xcorr_col[idx]);
+            buffer.push(self.ions_matched_col[idx] as f64 / self.ions_total_col[idx] as f64);
+            buffer.push((self.theoretical_mass_col[idx] - self.experimental_mass).abs());
+        }
+        self.loop_feature_buffer = Some(buffer);
     }
 
     pub fn len(&self) -> usize {
@@ -393,6 +456,10 @@ impl PeptideSpectrumMatchCollection {
                 .loop_score_col
                 .as_ref()
                 .map_or(0, |col| col.capacity() * std::mem::size_of::<f64>())
+            + self
+                .loop_feature_buffer
+                .as_ref()
+                .map_or(0, |buffer| buffer.capacity() * std::mem::size_of::<f64>())
     }
 
     pub async fn write_parquet<W: Write + Send>(&self, writer: W) -> Result<(), Error> {
@@ -643,6 +710,7 @@ impl PeptideSpectrumMatchCollection {
             theoretical_mass_col,
             second_theoretical_mass_col,
             loop_score_col,
+            loop_feature_buffer: None,
         })
     }
 
@@ -672,13 +740,12 @@ impl PointSource<f64> for PeptideSpectrumMatchCollection {
         &self,
         idx: usize,
     ) -> Result<Cow<'_, [f64]>, local_outlier_probabilities::error::Error> {
-        let values = vec![
-            self.xcorr_col[idx],
-            self.ions_matched_col[idx] as f64 / self.ions_total_col[idx] as f64,
-            (self.theoretical_mass_col[idx] - self.experimental_mass).abs(),
-        ];
+        let buffer = self
+            .loop_feature_buffer
+            .as_deref()
+            .expect("prepare_loop_features must be called before scoring");
 
-        Ok(Cow::Owned(values))
+        Ok(Cow::Borrowed(&buffer[idx * 3..idx * 3 + 3]))
     }
 }
 
@@ -777,6 +844,132 @@ mod tests {
         // Nothing written -> every row stays a NaN placeholder.
 
         psms.retain_scored();
+
+        assert_eq!(psms.len(), 0);
+        assert!(psms.is_empty());
+    }
+
+    fn psms_with_xcorr(xcorr_values: &[f64]) -> PeptideSpectrumMatchCollection {
+        let mut peptide_arena = PeptideArena::new();
+        for (idx, _) in xcorr_values.iter().enumerate() {
+            peptide_arena.push(format!("PEPTIDE{idx}"));
+        }
+
+        let mut psms = PeptideSpectrumMatchCollection::with_capacity(
+            "scan_1".to_string(),
+            Precursor::new(500.25, 2),
+            peptide_arena,
+        );
+        for (idx, &xcorr) in xcorr_values.iter().enumerate() {
+            set_scoring_result_at_index(&mut psms, idx, scoring_result(xcorr, 10, 5, 999.5, 999.5));
+        }
+        psms
+    }
+
+    #[test]
+    fn test_prepare_loop_features_matches_point() {
+        let mut psms = psms_with_xcorr(&[1.0, 2.0, 3.0]);
+        psms.prepare_loop_features();
+
+        for idx in 0..psms.len() {
+            let point = PointSource::point(&psms, idx).unwrap();
+            assert_eq!(point[0], psms.xcorr_col()[idx]);
+            assert_eq!(
+                point[1],
+                psms.ions_matched_col()[idx] as f64 / psms.ions_total_col()[idx] as f64
+            );
+            assert_eq!(
+                point[2],
+                (psms.theoretical_mass_col()[idx] - psms.experimental_mass()).abs()
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "prepare_loop_features must be called before scoring")]
+    fn test_point_without_prepare_loop_features_panics() {
+        let psms = psms_with_xcorr(&[1.0]);
+        let _ = PointSource::point(&psms, 0);
+    }
+
+    #[test]
+    fn test_loop_feature_buffer_excluded_from_serde() {
+        // Unlike `psms_with_xcorr`, uses distinct min/max theoretical mass so
+        // `second_theoretical_mass_col` is `Some(_)` rather than the `f64::NAN` sentinel:
+        // serde_json serializes `NaN` as `null`, which the derived `Deserialize` can't read
+        // back into a plain `f64` — an unrelated, pre-existing quirk of NaN-sentinel columns
+        // under JSON that this test isn't about, so it's avoided here.
+        let mut peptide_arena = PeptideArena::new();
+        peptide_arena.push("PEPTIDE0");
+        peptide_arena.push("PEPTIDE1");
+        let mut psms = PeptideSpectrumMatchCollection::with_capacity(
+            "scan_1".to_string(),
+            Precursor::new(500.25, 2),
+            peptide_arena,
+        );
+        set_scoring_result_at_index(&mut psms, 0, scoring_result(1.0, 10, 5, 999.5, 999.9));
+        set_scoring_result_at_index(&mut psms, 1, scoring_result(2.0, 10, 5, 999.5, 999.9));
+        psms.prepare_loop_features();
+        assert!(psms.loop_feature_buffer.is_some());
+
+        let serialized = serde_json::to_string(&psms).unwrap();
+        assert!(!serialized.contains("loop_feature_buffer"));
+
+        let deserialized: PeptideSpectrumMatchCollection =
+            serde_json::from_str(&serialized).unwrap();
+        assert!(deserialized.loop_feature_buffer.is_none());
+    }
+
+    #[test]
+    fn test_partial_eq_ignores_loop_feature_buffer() {
+        let mut with_buffer = psms_with_xcorr(&[1.0, 2.0]);
+        with_buffer.prepare_loop_features();
+        let without_buffer = psms_with_xcorr(&[1.0, 2.0]);
+
+        assert!(with_buffer.loop_feature_buffer.is_some());
+        assert!(without_buffer.loop_feature_buffer.is_none());
+        assert_eq!(with_buffer, without_buffer);
+    }
+
+    #[test]
+    fn test_truncate_to_top_by_xcorr_noop_under_cap() {
+        let mut psms = psms_with_xcorr(&[3.0, 1.0, 2.0]);
+        psms.truncate_to_top_by_xcorr(10);
+        assert_eq!(psms.len(), 3);
+        assert_eq!(psms.xcorr_col(), &[3.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_truncate_to_top_by_xcorr_keeps_highest() {
+        let mut psms = psms_with_xcorr(&[3.0, 1.0, 4.0, 1.5, 5.0]);
+        psms.truncate_to_top_by_xcorr(2);
+
+        assert_eq!(psms.len(), 2);
+        assert_eq!(psms.xcorr_col(), &[4.0, 5.0]);
+        assert_eq!(
+            psms.peptides().collect::<Vec<_>>(),
+            vec!["PEPTIDE2", "PEPTIDE4"]
+        );
+        // Every column stayed aligned with the kept rows, not just xcorr.
+        assert_eq!(psms.ions_total_col(), &[10, 10]);
+        assert_eq!(psms.ions_matched_col(), &[5, 5]);
+    }
+
+    #[test]
+    fn test_truncate_to_top_by_xcorr_ties_at_threshold_are_all_kept() {
+        let mut psms = psms_with_xcorr(&[1.0, 2.0, 2.0, 2.0]);
+        psms.truncate_to_top_by_xcorr(2);
+
+        // All three rows tied at the cut-off value (2.0) are kept, so the result can
+        // exceed max_len; the below-threshold row (1.0) must not be.
+        assert_eq!(psms.len(), 3);
+        assert!(psms.xcorr_col().iter().all(|&x| x == 2.0));
+    }
+
+    #[test]
+    fn test_truncate_to_top_by_xcorr_zero_keeps_nothing() {
+        let mut psms = psms_with_xcorr(&[1.0, 2.0, 3.0]);
+        psms.truncate_to_top_by_xcorr(0);
 
         assert_eq!(psms.len(), 0);
         assert!(psms.is_empty());

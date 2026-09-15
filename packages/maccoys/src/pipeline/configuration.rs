@@ -130,6 +130,41 @@ pub struct ScoringTaskConfiguration {
     pub general: TaskConfiguration,
     /// Number of threads to use
     pub threads: usize,
+    /// Number of neighbors to use for the LoOP scoring. Kept small (LoOP/LOF practice is
+    /// typically k=10-50) since the underlying crate's memory use for the neighbor-index
+    /// buffers scales with `num_psms * neighbors`.
+    #[serde(default = "default_scoring_neighbors")]
+    pub neighbors: usize,
+    /// Fraction (0.0-1.0) of *currently available* system memory a single LoOP scoring call
+    /// is allowed to use. Before scoring, the task estimates the memory a spectrum's PSM
+    /// collection would need at `neighbors` neighbors (see
+    /// `pipeline::tasks::scoring_task::estimate_loop_memory_bytes`) and, if that exceeds this
+    /// fraction of the memory available at that moment, truncates the collection to its
+    /// highest-`xcorr` rows before scoring. Unlike a fixed PSM-count cap, this scales
+    /// automatically with the host's actual memory, so it doesn't need retuning as deployment
+    /// hardware changes. See [`Self::effective_memory_safety_margin`] for how concurrent
+    /// scoring tasks (`general.num_tasks`) factor in.
+    #[serde(default = "default_scoring_memory_safety_margin")]
+    pub memory_safety_margin: f64,
+}
+
+fn default_scoring_neighbors() -> usize {
+    20
+}
+
+fn default_scoring_memory_safety_margin() -> f64 {
+    0.5
+}
+
+impl ScoringTaskConfiguration {
+    /// [`Self::memory_safety_margin`] divided by the number of scoring tasks that can run
+    /// concurrently (`general.num_tasks`), since each one independently checks *currently
+    /// available* memory and could otherwise all decide there's enough room for their own
+    /// message at the same time.
+    ///
+    pub fn effective_memory_safety_margin(&self) -> f64 {
+        self.memory_safety_margin / self.general.num_tasks.max(1) as f64
+    }
 }
 
 impl Deref for ScoringTaskConfiguration {
@@ -260,6 +295,8 @@ impl Default for PipelineConfiguration {
                     queue_url: None,
                 },
                 threads: 1,
+                neighbors: default_scoring_neighbors(),
+                memory_safety_margin: default_scoring_memory_safety_margin(),
             },
             publication: TaskConfiguration {
                 num_tasks: 1,
