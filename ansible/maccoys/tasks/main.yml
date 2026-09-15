@@ -87,7 +87,7 @@
 - name: Start container
   when: maccoys_action == "start"
   community.docker.docker_container:
-    image: ghcr.io/medbioinf/maccoys:dev
+    image: "{{ hostvars[inventory_hostname]['maccoys_dockerimage'] }}"
     name: maccoys-{{ maccoys_id }}
     # auto_remove: true
     user: "{{ hostvars[inventory_hostname]['maccoys_docker_user']['uid'] }}:{{ hostvars[inventory_hostname]['maccoys_docker_user']['gid'] }}"

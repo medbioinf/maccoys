@@ -7,6 +7,7 @@ all:
     # In case you built the maccoys docker image locally, use `docker images save -o <docker-image-file-path>` to write it to disk and add the path here
     # The image file will be copied to the hosts and loaded.
     maccoys_dockerimage_file: ~
+    maccoys_dockerimage: ghcr.io/medbioinf/maccoys:latest
     # User and group ID of the user who should run maccoys in the docker containers.
     maccoys_docker_user:
       uid: 1000
