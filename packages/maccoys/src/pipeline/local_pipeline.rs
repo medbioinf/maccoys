@@ -322,6 +322,8 @@ where
                         error_queue.clone(),
                         scoring_stop_flag.clone(),
                         config.scoring.threads,
+                        config.scoring.neighbors,
+                        config.scoring.effective_memory_safety_margin(),
                     )
                     .run(),
                 )

@@ -10,17 +10,79 @@ use crate::pipeline::{
 };
 
 /// Initial delay for the retry loops below
-const BACKOFF_START: Duration = Duration::from_millis(100);
+pub(crate) const BACKOFF_START: Duration = Duration::from_millis(100);
 
 /// Upper bound the retry loops' delay is capped at, so a sustained outage produces
 /// periodic log lines instead of a tight, ever-shrinking-value-free busy loop
-const BACKOFF_MAX: Duration = Duration::from_secs(5);
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// Sleeps for `interval`, then returns the next (doubled, capped) interval to use
 /// if the same operation fails again
-async fn backoff_sleep(interval: Duration) -> Duration {
+pub(crate) async fn backoff_sleep(interval: Duration) -> Duration {
     tokio::time::sleep(interval).await;
     (interval * 2).min(BACKOFF_MAX)
+}
+
+/// Polls one stage of a round-robin, multi-stage worker (see `processing_worker`): skips the
+/// stage if `outgoing` is full, so a worker slot never blocks on a saturated downstream queue
+/// while a sibling stage sharing the same slot still has room to make progress. Otherwise pops
+/// one message from `incoming` (if any) and runs `process` on it.
+///
+/// # Arguments
+/// * `outgoing` - The queue `process` forwards results to; only checked for space, not popped
+/// * `incoming` - This stage's own queue, popped from only if `outgoing` has space
+/// * `process` - Called with the popped message id/payload; expected to forward to `outgoing`
+///   and acknowledge `incoming` itself, exactly like every [`Task::process_message`] impl does
+///
+/// Returns `true` if a message was popped and processed.
+///
+pub(crate) async fn poll_stage_with_backpressure<OutMessage, Out, InMessage, In, F, Fut>(
+    outgoing: &Out,
+    incoming: &In,
+    process: F,
+) -> bool
+where
+    OutMessage: IsMessage,
+    Out: PipelineQueue<OutMessage>,
+    InMessage: IsMessage,
+    In: PipelineQueue<InMessage>,
+    F: FnOnce(String, InMessage) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    match outgoing.is_full().await {
+        Ok(true) => return false,
+        Ok(false) => {}
+        Err(e) => {
+            error!("{}", e);
+            return false;
+        }
+    }
+
+    poll_terminal_stage(incoming, process).await
+}
+
+/// Polls one terminal stage (no downstream pipeline queue, e.g. publication/error) of a
+/// round-robin, multi-stage worker: pops one message from `incoming` (if any) and runs
+/// `process` on it. Returns `true` if a message was popped and processed.
+///
+pub(crate) async fn poll_terminal_stage<InMessage, In, F, Fut>(incoming: &In, process: F) -> bool
+where
+    InMessage: IsMessage,
+    In: PipelineQueue<InMessage>,
+    F: FnOnce(String, InMessage) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    match incoming.pop().await {
+        Ok(Some((message_id, message))) => {
+            process(message_id, message).await;
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            error!("{}", e);
+            false
+        }
+    }
 }
 
 /// Common functionality shared by every pipeline stage: polling its own queue,

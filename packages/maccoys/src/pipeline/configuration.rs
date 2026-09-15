@@ -356,6 +356,37 @@ pub struct StandaloneIdentificationConfiguration {
     pub storage: PipelineStorageConfiguration,
 }
 
+/// Configuration for the combined processing worker, which runs search space generation,
+/// identification and scoring in one process. Each worker slot round-robins across the three
+/// stages, skipping a stage when its outgoing queue is full, so idle capacity in one stage
+/// flows to a busier one instead of sitting idle in a per-stage pool.
+///
+/// The `num_tasks` field inside `search_space_generation`/`identification`/`scoring` below is
+/// ignored by this worker (there is no longer a separate pool per stage); only their queue
+/// name/capacity/url, and where present `threads`, are used. The shared pool size comes from
+/// the top-level `processing_num_tasks` TOML key instead (renamed so it doesn't collide with
+/// [`StandaloneFinalizationConfiguration`]'s own top-level `num_tasks` when both structs are
+/// deserialized from the same shared config file).
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneProcessingConfiguration {
+    /// Size of the worker pool shared across all three stages
+    #[serde(rename = "processing_num_tasks")]
+    pub num_tasks: usize,
+    /// Search space generation task configuration
+    pub search_space_generation: SearchSpaceGenerationTaskConfiguration,
+    /// Identification task configuration
+    pub identification: IdentificationTaskConfiguration,
+    /// Scoring task configuration
+    pub scoring: ScoringTaskConfiguration,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
+}
+
 /// Configuration for standalone indexing
 ///
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -388,6 +419,31 @@ pub struct StandalonePublicationConfiguration {
 pub struct StandaloneErrorConfiguration {
     /// Error task configuration
     pub error: TaskConfiguration,
+    /// Work directory
+    pub work_directory: PathBuf,
+}
+
+/// Configuration for the combined finalization worker, which runs publication and error
+/// handling in one process. Both are terminal stages (they write to disk, not to a further
+/// pipeline queue), so each worker slot simply round-robins between the two queues, picking
+/// whichever has a pending message.
+///
+/// The `num_tasks` field inside `publication`/`error` below is ignored by this worker (there
+/// is no longer a separate pool per stage); only their queue name/capacity/url are used. The
+/// shared pool size comes from the top-level `finalization_num_tasks` TOML key instead (see
+/// [`StandaloneProcessingConfiguration`] for why it isn't just `num_tasks`).
+///
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct StandaloneFinalizationConfiguration {
+    /// Size of the worker pool shared across both stages
+    #[serde(rename = "finalization_num_tasks")]
+    pub num_tasks: usize,
+    /// Publication task configuration
+    pub publication: TaskConfiguration,
+    /// Error task configuration
+    pub error: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
     /// Work directory
     pub work_directory: PathBuf,
 }

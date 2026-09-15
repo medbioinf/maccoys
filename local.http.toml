@@ -3,6 +3,11 @@
 prometheus_base_url = "http://localhost:9090"
 work_directory = "/mnt/results/tests/results"
 message_timeout = 600
+# Shared worker pool size for `pipeline processing` (search_space_generation + identification +
+# scoring) and `pipeline finalization` (publication + error). The per-stage `num_tasks` below are
+# ignored by those two grouped commands; only used by the single-stage standalone commands.
+processing_num_tasks = 3
+finalization_num_tasks = 2
 
 [search_parameters]
 max_charge = 6

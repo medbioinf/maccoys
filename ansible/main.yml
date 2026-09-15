@@ -47,54 +47,24 @@
    - indexing
 
 
-- name: MaCcoyS search space generation
+- name: MaCcoyS processing
   hosts:
-   - search_space_generation
+   - processing
   become: true
   roles:
-   - maccoys-search-space-generation
+   - maccoys-processing
   tags:
-   - search-space-generation
+   - processing
 
 
-- name: MaCcoyS identification
+- name: MaCcoyS finalization
   hosts:
-   - identification
+   - finalization
   become: true
   roles:
-   - maccoys-identification
+   - maccoys-finalization
   tags:
-   - identification
-
-
-- name: MaCcoyS scoring
-  hosts:
-   - scoring
-  become: true
-  roles:
-   - maccoys-scoring
-  tags:
-   - scoring
-
-
-- name: MaCcoyS publishing
-  hosts:
-   - publishing
-  become: true
-  roles:
-   - maccoys-publishing
-  tags:
-   - publishing
-
-
-- name: MaCcoyS error handling
-  hosts:
-   - error
-  become: true
-  roles:
-   - maccoys-error
-  tags:
-   - error
+   - finalization
 
 
 - name: MaCcoyS entrypoint

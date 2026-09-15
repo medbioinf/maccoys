@@ -19,8 +19,10 @@ use maccoys::pipeline::queue_server::QueueServer;
 use maccoys::pipeline::remote_pipeline::RemotePipeline;
 use maccoys::pipeline::remote_pipeline_web_api::RemotePipelineWebApi;
 use maccoys::pipeline::tasks::error_task::{self, ErrorTask};
+use maccoys::pipeline::tasks::finalization_worker;
 use maccoys::pipeline::tasks::identification_task::{self, IdentificationTask};
 use maccoys::pipeline::tasks::indexing_task::{self, IndexingTask};
+use maccoys::pipeline::tasks::processing_worker;
 use maccoys::pipeline::tasks::publication_task::{self, PublicationTask};
 use maccoys::pipeline::tasks::scoring_task::{self, ScoringTask};
 use maccoys::pipeline::tasks::search_space_generation_task::{self, SearchSpaceGenerationTask};
@@ -175,6 +177,25 @@ enum PipelineCommand {
     Error {
         /// Path to the indexing configuration file.
         /// Contains `goodness_and_rescoring`-, `cleanup`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Combined search space generation, identification & scoring worker for distributed
+    /// processing. Groups these stages on one worker so idle capacity in one stage's task pool
+    /// can be used by another when queue sizes are uneven.
+    Processing {
+        /// Optional temp folder for intermediate files, default: `<system temp folder>/maccoys`
+        #[arg(short, long)]
+        tmp_dir: Option<PathBuf>,
+        /// Path to the configuration file.
+        /// Contains `search_space_generation`-, `identification`-, `scoring`-, `publication`-,
+        /// `error`- & `storages`-section of the pipeline configuration
+        config_file_path: PathBuf,
+    },
+    /// Combined publication & error worker for distributed processing. Should run on the same
+    /// machine which hosts the file system.
+    Finalization {
+        /// Path to the configuration file.
+        /// Contains `publication`-, `error`- & `storages`-section of the pipeline configuration
         config_file_path: PathBuf,
     },
     /// Http queuing server
@@ -493,10 +514,7 @@ async fn main() -> Result<()> {
                 config,
                 mzml_file_paths,
             } => {
-                let tmp_dir = match tmp_dir {
-                    Some(tmp_dir) => tmp_dir,
-                    None => env::temp_dir().join("maccoys"),
-                };
+                let tmp_dir = resolve_tmp_dir(tmp_dir);
 
                 debug!("Temp folder: {}", tmp_dir.display());
 
@@ -587,10 +605,7 @@ async fn main() -> Result<()> {
                 tmp_dir,
                 config_file_path,
             } => {
-                let tmp_dir = match tmp_dir {
-                    Some(tmp_dir) => tmp_dir,
-                    None => env::temp_dir().join("maccoys"),
-                };
+                let tmp_dir = resolve_tmp_dir(tmp_dir);
                 IdentificationTask::run_standalone(tmp_dir, config_file_path).await?
             }
             PipelineCommand::Scoring { config_file_path } => {
@@ -601,6 +616,16 @@ async fn main() -> Result<()> {
             }
             PipelineCommand::Error { config_file_path } => {
                 ErrorTask::run_standalone(config_file_path).await?
+            }
+            PipelineCommand::Processing {
+                tmp_dir,
+                config_file_path,
+            } => {
+                let tmp_dir = resolve_tmp_dir(tmp_dir);
+                processing_worker::run_standalone(tmp_dir, config_file_path).await?
+            }
+            PipelineCommand::Finalization { config_file_path } => {
+                finalization_worker::run_standalone(config_file_path).await?
             }
             PipelineCommand::QueueServer {
                 interface,
@@ -643,6 +668,16 @@ fn convert_str_paths_and_resolve_globs(paths: Vec<String>) -> Result<Vec<PathBuf
         .collect())
 }
 
+/// Resolves an optional `--tmp-dir` CLI argument to a concrete path, defaulting to
+/// `<system temp folder>/maccoys` when none was given.
+///
+fn resolve_tmp_dir(tmp_dir: Option<PathBuf>) -> PathBuf {
+    match tmp_dir {
+        Some(tmp_dir) => tmp_dir,
+        None => env::temp_dir().join("maccoys"),
+    }
+}
+
 fn pipeline_stage_label(commands: &Commands) -> &'static str {
     match commands {
         Commands::Web(web_command) => match &web_command.command {
@@ -676,6 +711,13 @@ fn pipeline_stage_label(commands: &Commands) -> &'static str {
             PipelineCommand::Error {
                 config_file_path: _,
             } => error_task::loki_tracing_label_value(),
+            PipelineCommand::Processing {
+                tmp_dir: _,
+                config_file_path: _,
+            } => processing_worker::loki_tracing_label_value(),
+            PipelineCommand::Finalization {
+                config_file_path: _,
+            } => finalization_worker::loki_tracing_label_value(),
             PipelineCommand::QueueServer {
                 interface: _,
                 port: _,

@@ -48,29 +48,16 @@ all:
           - <FOLDER_FOR_SEARCH_RESULTS>:/searches
       hosts:
 
-    # Search space generation hosts
-    search_space_generation:
+    # Processing hosts: search space generation, identification & scoring grouped on one
+    # worker so idle capacity in one stage's task pool can be used by another when queue
+    # sizes are uneven.
+    processing:
       hosts:
 
-    # Identification hosts
-    identification:
-      hosts:
-
-    # Scoring hosts
-    scoring:
-      hosts:
-
-    # Publishing hosts
-    publishing:
+    # Finalization hosts: publication & error handling grouped on one worker
+    finalization:
       vars:
-        publishing_volumes:
-          - <FOLDER_FOR_SEARCH_RESULTS>:/searches
-      hosts:
-
-    # Error handling hosts
-    error:
-      vars:
-        error_volumes:
+        finalization_volumes:
           - <FOLDER_FOR_SEARCH_RESULTS>:/searches
       hosts:
 
