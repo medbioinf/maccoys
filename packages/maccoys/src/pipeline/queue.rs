@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    io::Cursor,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -90,6 +91,11 @@ type RWLockedMessages = RwLock<(VecDeque<String>, HashMap<String, (String, Durat
 ///   [`crate::pipeline::local_pipeline::LocalPipeline`], which compresses on push and
 ///   decompresses on pop, delegating to the compressed-level methods.
 ///
+/// Maximum byte length allowed for the sanitized id portion of a spooled message's storage key
+/// filename, kept comfortably under ext4's 255-byte `NAME_MAX` to leave room for the appended
+/// `__<sequence>` suffix.
+const MAX_STORAGE_KEY_ID_LEN: usize = 200;
+
 pub struct LocalPipelineQueue<M>
 where
     M: IsMessage,
@@ -151,9 +157,24 @@ where
     /// Builds a storage key unique to this push, so that two messages sharing the same
     /// `IsMessage::get_id()` never overwrite each other's spooled payload on disk.
     ///
+    /// `message_id` can be arbitrarily long (e.g. some message types embed a user-supplied
+    /// mzML file name or spectrum id verbatim), so ids that would overflow the filesystem's
+    /// filename length limit are hashed down to a fixed-length representation instead of being
+    /// used verbatim, which would otherwise fail the spool write with `ENAMETOOLONG`.
+    ///
     fn new_storage_key(&self, message_id: &str) -> String {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        format!("{}__{}", sanatize_string_for_path(message_id), sequence)
+        let sanitized = sanatize_string_for_path(message_id);
+        let safe_id = if sanitized.len() > MAX_STORAGE_KEY_ID_LEN {
+            let mut cursor = Cursor::new(sanitized.as_bytes());
+            format!(
+                "{:x}",
+                murmur3::murmur3_x64_128(&mut cursor, 0).unwrap_or(sanitized.len() as u128)
+            )
+        } else {
+            sanitized
+        };
+        format!("{}__{}", safe_id, sequence)
     }
 
     /// Tries to push a message into the queue, spooling its payload to disk
@@ -877,6 +898,38 @@ mod tests {
         let (rescheduled_id, rescheduled) = queue.pop().await.unwrap().unwrap();
         assert_eq!(rescheduled.get_id(), message.get_id());
         queue.ack(&rescheduled_id).await.unwrap();
+        assert_eq!(queue.len(), 0);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// A message whose `get_id()` is long enough to overflow a filesystem's filename length
+    /// limit (e.g. because it embeds a long user-supplied mzML file name) must still spool
+    /// successfully - `new_storage_key` should hash it down instead of failing the write with
+    /// `ENAMETOOLONG`.
+    #[tokio::test]
+    async fn test_local_pipeline_queue_handles_oversized_message_id() {
+        let directory =
+            temp_dir().join("maccoys.tests.queue.test_local_pipeline_queue_handles_oversized_message_id");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let queue = LocalPipelineQueue::<IndexingMessage>::new_at(
+            1,
+            Duration::from_secs(900),
+            directory.clone(),
+        );
+
+        let long_uuid = "a".repeat(400);
+        let message = IndexingMessage::new(long_uuid, vec!["run1".to_string()]);
+        assert!(message.get_id().len() > MAX_STORAGE_KEY_ID_LEN);
+
+        queue.push(message.clone()).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+
+        let (id, popped) = queue.pop().await.unwrap().unwrap();
+        assert_eq!(popped.get_id(), message.get_id());
+        queue.ack(&id).await.unwrap();
         assert_eq!(queue.len(), 0);
 
         std::fs::remove_dir_all(&directory).ok();
