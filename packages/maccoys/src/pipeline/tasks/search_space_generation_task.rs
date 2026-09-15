@@ -130,7 +130,6 @@ where
             metrics_counter_name: COUNTER_PREFIX.to_string(),
         }
     }
-
 }
 
 /// Standalone entrypoint used by the `maccoys pipeline search-space-generation` CLI command;
@@ -185,22 +184,23 @@ impl
 
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let handles: Vec<tokio::task::JoinHandle<()>> = (0..config.search_space_generation.num_tasks)
-            .map(|_| {
-                tokio::spawn(
-                    SearchSpaceGenerationTask::new(
-                        search_space_generation_config.clone(),
-                        storage.clone(),
-                        search_space_generation_queue.clone(),
-                        identification_queue.clone(),
-                        publication_queue.clone(),
-                        error_queue.clone(),
-                        stop_flag.clone(),
+        let handles: Vec<tokio::task::JoinHandle<()>> =
+            (0..config.search_space_generation.num_tasks)
+                .map(|_| {
+                    tokio::spawn(
+                        SearchSpaceGenerationTask::new(
+                            search_space_generation_config.clone(),
+                            storage.clone(),
+                            search_space_generation_queue.clone(),
+                            identification_queue.clone(),
+                            publication_queue.clone(),
+                            error_queue.clone(),
+                            stop_flag.clone(),
+                        )
+                        .run(),
                     )
-                    .run(),
-                )
-            })
-            .collect();
+                })
+                .collect();
 
         for handle in handles {
             handle.await?;
@@ -243,25 +243,26 @@ where
         );
 
         if self.last_search_uuid != *message.uuid() {
-            self.current_search_params = match self.storage.get_search_parameters(message.uuid()).await {
-                Ok(Some(params)) => params,
-                Ok(None) => {
-                    let error_message = message.to_error_message(
-                        SearchSpaceGenerationError::SearchParametersNotFoundError().into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
-                    return;
-                }
-                Err(e) => {
-                    let error_message = message.to_error_message(
-                        SearchSpaceGenerationError::GetSearchParametersError(e).into(),
-                    );
-                    error!("{}", &error_message);
-                    Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
-                    return;
-                }
-            };
+            self.current_search_params =
+                match self.storage.get_search_parameters(message.uuid()).await {
+                    Ok(Some(params)) => params,
+                    Ok(None) => {
+                        let error_message = message.to_error_message(
+                            SearchSpaceGenerationError::SearchParametersNotFoundError().into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let error_message = message.to_error_message(
+                            SearchSpaceGenerationError::GetSearchParametersError(e).into(),
+                        );
+                        error!("{}", &error_message);
+                        Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
+                        return;
+                    }
+                };
 
             let ptms = match self.storage.get_ptms(message.uuid()).await {
                 Ok(Some(ptms)) => ptms,
@@ -273,8 +274,8 @@ where
                     return;
                 }
                 Err(e) => {
-                    let error_message =
-                        message.to_error_message(SearchSpaceGenerationError::GetPTMsError(e).into());
+                    let error_message = message
+                        .to_error_message(SearchSpaceGenerationError::GetPTMsError(e).into());
                     error!("{}", &error_message);
                     Self::enqueue_message(error_message, self.error_queue.as_ref()).await;
                     return;
