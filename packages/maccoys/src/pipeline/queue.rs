@@ -292,6 +292,12 @@ where
         self.capacity
     }
 
+    /// Number of messages currently popped and awaiting acknowledgement
+    ///
+    pub fn in_progress_len(&self) -> usize {
+        self.messages.read().1.len()
+    }
+
     /// Moves timed out work-in-progress messages back onto the pending queue.
     /// No disk I/O is necessary here, the spooled payload is left untouched.
     ///

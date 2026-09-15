@@ -135,6 +135,22 @@ macro_rules! queue_namespace {
                     ].into_iter().collect::<Result<Vec<()>, HttpQueueServerError>>()?;
                     Ok(())
                 }
+
+                /// Returns len/capacity/is_full/in_progress stats for every queue in the collection
+                ///
+                pub fn stats(&self) -> Vec<QueueStats> {
+                    vec![
+                        $(
+                            QueueStats {
+                                name: stringify!([<$data_type:snake>]),
+                                len: self.[< $data_type:snake _queue >].len(),
+                                capacity: self.[< $data_type:snake _queue >].capacity(),
+                                is_full: self.[< $data_type:snake _queue >].is_full(),
+                                in_progress: self.[< $data_type:snake _queue >].in_progress_len(),
+                            },
+                        )+
+                    ]
+                }
             }
 
             /// Serializable version of QueueCollection for saving/loading state
@@ -175,6 +191,18 @@ macro_rules! queue_namespace {
                         $([< $data_type:snake _queue >]: SerializableLocalPipelineQueue::from(queue_collection.[< $data_type:snake _queue >]) ),+
                     }
                 }
+            }
+
+            /// Stats for a single queue
+            ///
+            #[derive(Debug, Clone, Serialize)]
+            pub struct QueueStats {
+                pub name: &'static str,
+                pub len: usize,
+                pub capacity: usize,
+                pub is_full: bool,
+                /// Number of messages currently popped and awaiting acknowledgement
+                pub in_progress: usize,
             }
 
             /// Controller for queue operations
@@ -253,11 +281,18 @@ macro_rules! queue_namespace {
                     (StatusCode::OK, "Queue Server is healthy")
                 }
 
+                /// Returns len/capacity/is_full/in_progress stats for every queue
+                ///
+                async fn stats(State(state): State<Arc<QueueServerState>>) -> (StatusCode, Json<Vec<QueueStats>>) {
+                    (StatusCode::OK, Json(state.queue_collection().stats()))
+                }
+
                 /// Returns the router for queue operations
                 ///
                 pub fn router() -> Router<Arc<QueueServerState>> {
                     Router::new()
                     .route("/healthcheck", get(Self::healthcheck))
+                    .route("/stats", get(Self::stats))
                     $(
                         .route($data_type::push_route(), post(Self::[< push_ $data_type:snake >]))
                         .route($data_type::pop_route(), get(Self::[< pop_ $data_type:snake >]))
@@ -696,6 +731,67 @@ mod tests {
             .unwrap();
 
         std::fs::remove_file(&state_path).unwrap();
+        std::fs::remove_dir_all(&queue_data_directory).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_queue_collection_stats() {
+        let queue_data_directory = temp_dir().join("maccoys.tests.queue_server.test_stats");
+
+        let config_file_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("test_files")
+            .join("maccoys.http-queue.toml");
+
+        let config = std::fs::read_to_string(config_file_path).unwrap();
+        let config = toml::from_str::<PipelineConfiguration>(&config)
+            .unwrap()
+            .to_remote_entrypoint_configuration();
+
+        let queue_collection = QueueCollection::from_config(&config, queue_data_directory.clone());
+
+        let stats = queue_collection.stats();
+        assert_eq!(stats.len(), 6);
+        let indexing_stats = stats
+            .iter()
+            .find(|s| s.name == "indexing_message")
+            .unwrap();
+        assert_eq!(indexing_stats.len, 0);
+        assert_eq!(indexing_stats.in_progress, 0);
+        assert!(!indexing_stats.is_full);
+        assert_eq!(indexing_stats.capacity, config.index.queue_capacity);
+
+        let message1 = IndexingMessage::new("test1".to_string(), vec!["run1".to_string()]);
+        let message2 = IndexingMessage::new("test2".to_string(), vec!["run1".to_string()]);
+
+        queue_collection
+            .indexing_message_queue
+            .try_push_compressed(CompressedBinaryMessage::try_from_message(&message1).unwrap())
+            .await
+            .unwrap();
+        queue_collection
+            .indexing_message_queue
+            .try_push_compressed(CompressedBinaryMessage::try_from_message(&message2).unwrap())
+            .await
+            .unwrap();
+
+        queue_collection
+            .indexing_message_queue
+            .try_pop_compressed()
+            .await
+            .unwrap();
+
+        let stats = queue_collection.stats();
+        let indexing_stats = stats
+            .iter()
+            .find(|s| s.name == "indexing_message")
+            .unwrap();
+        assert_eq!(indexing_stats.len, 2);
+        assert_eq!(indexing_stats.in_progress, 1);
+
         std::fs::remove_dir_all(&queue_data_directory).ok();
     }
 }
