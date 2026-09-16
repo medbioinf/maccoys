@@ -489,6 +489,13 @@ where
             Self::enqueue_message(identification_message, self.identification_queue.as_ref()).await;
             Self::ack_message(&message_id, self.search_space_generation_queue.as_ref()).await;
             counter!(metrics_counter_name.clone()).increment(1);
+            if let Err(e) = self
+                .storage
+                .increase_stage_count(COUNTER_PREFIX, message.uuid())
+                .await
+            {
+                error!("Error increasing search space generation stage count: {:?}", e);
+            }
 
             // sending metrics
 

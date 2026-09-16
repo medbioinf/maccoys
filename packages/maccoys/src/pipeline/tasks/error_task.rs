@@ -16,6 +16,7 @@ use crate::pipeline::{
     errors::pipeline_error::PipelineError,
     messages::{error_message::ErrorMessage, is_message::IsMessage},
     queue::{HttpPipelineQueue, PipelineQueue},
+    storage::{PipelineStorage, RedisPipelineStorage},
     utils::{
         create_file_path_on_ms_run_level, create_file_path_on_precursor_level,
         create_file_path_on_search_level, create_file_path_on_spectrum_level,
@@ -49,31 +50,42 @@ pub fn loki_tracing_label_value() -> &'static str {
 /// to have minimal chance of network errors.
 ///
 /// # Generics
+/// * `St` - Type of the storage
 /// * `E` - Type of the error queue (this task's own queue)
 ///
-pub struct ErrorTask<E>
+pub struct ErrorTask<St, E>
 where
+    St: PipelineStorage + Send + Sync + 'static,
     E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
 {
     work_dir: PathBuf,
+    storage: Arc<St>,
     error_queue: Arc<E>,
     stop_flag: Arc<AtomicBool>,
 }
 
-impl<E> ErrorTask<E>
+impl<St, E> ErrorTask<St, E>
 where
+    St: PipelineStorage + Send + Sync + 'static,
     E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
 {
     /// Creates a new error task
     ///
     /// # Arguments
     /// * `work_dir` - The working directory
+    /// * `storage` - Storage to track per-search stage counts
     /// * `error_queue` - The queue to get the errors to write from
     /// * `stop_flag` - The flag to stop the task
     ///
-    pub fn new(work_dir: PathBuf, error_queue: Arc<E>, stop_flag: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        work_dir: PathBuf,
+        storage: Arc<St>,
+        error_queue: Arc<E>,
+        stop_flag: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             work_dir,
+            storage,
             error_queue,
             stop_flag,
         }
@@ -85,7 +97,7 @@ where
 /// the HTTP queue broker, so it's implemented for the one concrete instantiation rather than
 /// the generic one used by [`super::super::local_pipeline`].
 ///
-impl ErrorTask<HttpPipelineQueue<ErrorMessage>> {
+impl ErrorTask<RedisPipelineStorage, HttpPipelineQueue<ErrorMessage>> {
     /// Run the error handling task by itself
     ///
     /// # Arguments
@@ -97,6 +109,8 @@ impl ErrorTask<HttpPipelineQueue<ErrorMessage>> {
                 .context("Deserialize config")?;
 
         let error_queue = Arc::new(HttpPipelineQueue::<ErrorMessage>::new(&config.error).await?);
+
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
 
         let mut signals = Signals::new([SIGINT])?;
 
@@ -117,6 +131,7 @@ impl ErrorTask<HttpPipelineQueue<ErrorMessage>> {
                 tokio::spawn(
                     ErrorTask::new(
                         config.work_directory.clone(),
+                        storage.clone(),
                         error_queue.clone(),
                         stop_flag.clone(),
                     )
@@ -133,8 +148,9 @@ impl ErrorTask<HttpPipelineQueue<ErrorMessage>> {
     }
 }
 
-impl<E> Task for ErrorTask<E>
+impl<St, E> Task for ErrorTask<St, E>
 where
+    St: PipelineStorage + Send + Sync + 'static,
     E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
 {
     type Message = ErrorMessage;
@@ -223,5 +239,12 @@ where
         Self::ack_message(&message_id, self.error_queue.as_ref()).await;
 
         counter!(metrics_counter_name.clone()).increment(1);
+        if let Err(e) = self
+            .storage
+            .increase_stage_count(COUNTER_PREFIX, message.uuid())
+            .await
+        {
+            error!("Error increasing error stage count: {:?}", e);
+        }
     }
 }

@@ -323,6 +323,9 @@ where
         Self::enqueue_message(scoring_message, self.scoring_queue.as_ref()).await;
         Self::ack_message(&message_id, self.identification_queue.as_ref()).await;
         counter!(self.metrics_counter_name.clone()).increment(1);
+        if let Err(e) = self.storage.increase_stage_count(COUNTER_PREFIX, message.uuid()).await {
+            error!("Error increasing identification stage count: {:?}", e);
+        }
 
         // sending metrics
 

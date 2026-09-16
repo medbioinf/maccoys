@@ -568,6 +568,7 @@ async fn main() -> Result<()> {
                     search_parameters_file,
                     mzml_file_paths,
                     ptms_file,
+                    tui,
                 )
                 .await?;
                 tracing::info!("Do not forget your UUID: {}", uuid);
@@ -586,7 +587,7 @@ async fn main() -> Result<()> {
             }
             PipelineCommand::SearchMonitor { base_url, uuid } => {
                 info!("Running search monitor");
-                RemotePipeline::start_remote_search_monitor(base_url, &uuid).await?;
+                RemotePipeline::start_remote_search_monitor(base_url, &uuid, tui).await?;
             }
             // PipelineCommand::QueueMonitor { base_url } => {
             //     info!("Running queue monitor");

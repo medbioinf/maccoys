@@ -317,6 +317,7 @@ where
             .map(|_| {
                 tokio::spawn(
                     ScoringTask::new(
+                        storage.clone(),
                         scoring_queue.clone(),
                         publication_queue.clone(),
                         error_queue.clone(),
@@ -350,6 +351,7 @@ where
                 tokio::spawn(
                     ErrorTask::new(
                         result_dir.clone(),
+                        storage.clone(),
                         error_queue.clone(),
                         error_stop_flag.clone(),
                     )

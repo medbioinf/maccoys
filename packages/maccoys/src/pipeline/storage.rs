@@ -21,6 +21,16 @@ use super::{
 const TOTAL_SPECTRUM_COUNT_PREFIX: &str = "total_spectrum_count_";
 const FINISHED_SPECTRUM_COUNT_PREFIX: &str = "finished_spectrum_count_";
 
+/// Names of the per-search stage counts tracked between [`PipelineStorage::init_search`] and
+/// [`PipelineStorage::cleanup_search`]. Must match the `COUNTER_PREFIX` of the corresponding
+/// task (`search_space_generation_task`, `identification_task`, `scoring_task`, `error_task`).
+const TRACKED_STAGE_COUNTS: [&str; 4] = [
+    "maccoys_search_space_generation",
+    "maccoys_identifications",
+    "maccoys_scorings",
+    "maccoys_errors",
+];
+
 /// Max AtomicU64 as default value if key was not found
 static MAX_ATOMIC_U64: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -123,6 +133,9 @@ pub trait PipelineStorage: Send + Sync + Sized {
             // Set counters
             self.init_total_spectrum_count(uuid).await?;
             self.init_finished_spectrum_count(uuid).await?;
+            for stage in TRACKED_STAGE_COUNTS {
+                self.init_stage_count(stage, uuid).await?;
+            }
 
             Ok(())
         }
@@ -141,6 +154,9 @@ pub trait PipelineStorage: Send + Sync + Sized {
             // Remove counters
             self.remove_total_spectrum_count(uuid).await?;
             self.remove_finished_spectrum_count(uuid).await?;
+            for stage in TRACKED_STAGE_COUNTS {
+                self.remove_stage_count(stage, uuid).await?;
+            }
             Ok(())
         }
     }
@@ -223,6 +239,64 @@ pub trait PipelineStorage: Send + Sync + Sized {
     ///
     fn remove_finished_spectrum_count(
         &self,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Returns the key for a named per-stage count
+    ///
+    /// # Arguments
+    /// * `stage` - Name of the stage, e.g. a task's counter prefix
+    /// * `uuid` - UUID for the counters
+    ///
+    fn get_stage_count_key(stage: &str, uuid: &str) -> String {
+        format!("stage_count:{}:{}", stage, uuid)
+    }
+
+    /// Initialize a named per-stage count
+    ///
+    /// # Arguments
+    /// * `stage` - Name of the stage, e.g. a task's counter prefix
+    /// * `uuid` - UUID for the counters
+    ///
+    fn init_stage_count(
+        &self,
+        stage: &str,
+        uuid: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Increment a named per-stage count by 1
+    ///
+    /// # Arguments
+    /// * `stage` - Name of the stage, e.g. a task's counter prefix
+    /// * `uuid` - UUID for the counters
+    ///
+    fn increase_stage_count(
+        &self,
+        stage: &str,
+        uuid: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Get a named per-stage count. If the count is not initialized, it will return u64::MAX.
+    ///
+    /// # Arguments
+    /// * `stage` - Name of the stage, e.g. a task's counter prefix
+    /// * `uuid` - UUID for the counters
+    ///
+    fn get_stage_count(
+        &self,
+        stage: &str,
+        uuid: &str,
+    ) -> impl Future<Output = Result<u64, StorageError>> + Send;
+
+    /// Remove a named per-stage count
+    ///
+    /// # Arguments
+    /// * `stage` - Name of the stage, e.g. a task's counter prefix
+    /// * `uuid` - UUID for the counters
+    ///
+    fn remove_stage_count(
+        &self,
+        stage: &str,
         uuid: &str,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
@@ -526,6 +600,53 @@ impl PipelineStorage for LocalPipelineStorage {
         Ok(())
     }
 
+    async fn init_stage_count(&self, stage: &str, uuid: &str) -> Result<(), StorageError> {
+        self.counters
+            .write()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("initializing stage count".to_string())
+            })?
+            .insert(Self::get_stage_count_key(stage, uuid), AtomicU64::new(0));
+        Ok(())
+    }
+
+    async fn increase_stage_count(&self, stage: &str, uuid: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .counters
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("increasing stage count".to_string())
+            })?
+            .get(&Self::get_stage_count_key(stage, uuid))
+            .ok_or_else(|| {
+                LocalStorageError::CountNotFoundError(Self::get_stage_count_key(stage, uuid))
+            })?
+            .fetch_add(1, Ordering::Relaxed)
+            + 1)
+    }
+
+    async fn get_stage_count(&self, stage: &str, uuid: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .counters
+            .read()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("getting stage count".to_string())
+            })?
+            .get(&Self::get_stage_count_key(stage, uuid))
+            .unwrap_or(&MAX_ATOMIC_U64)
+            .load(Ordering::Relaxed))
+    }
+
+    async fn remove_stage_count(&self, stage: &str, uuid: &str) -> Result<(), StorageError> {
+        self.counters
+            .write()
+            .map_err(|_| {
+                LocalStorageError::PoisenedStorageLock("removing stage count".to_string())
+            })?
+            .remove(&Self::get_stage_count_key(stage, uuid));
+        Ok(())
+    }
+
     async fn set_search_fully_enqueued(&self, uuid: &str) -> Result<(), StorageError> {
         self.flags
             .insert(Self::get_search_fully_enqueued_key(uuid), true);
@@ -794,6 +915,40 @@ impl PipelineStorage for RedisPipelineStorage {
         Ok(())
     }
 
+    async fn init_stage_count(&self, stage: &str, uuid: &str) -> Result<(), StorageError> {
+        Ok(self
+            .client
+            .set(Self::get_stage_count_key(stage, uuid), Self::safe_u64_to_i64(0))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("initializing stage count", err))?)
+    }
+
+    async fn increase_stage_count(&self, stage: &str, uuid: &str) -> Result<u64, StorageError> {
+        let value_i64 = self
+            .client
+            .incr(Self::get_stage_count_key(stage, uuid))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("increasing stage count", err))?;
+        Ok(Self::safe_i64_to_u64(value_i64))
+    }
+
+    async fn get_stage_count(&self, stage: &str, uuid: &str) -> Result<u64, StorageError> {
+        let value_i64 = self
+            .client
+            .get(Self::get_stage_count_key(stage, uuid))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("getting stage count", err))?;
+        Ok(Self::safe_i64_to_u64(value_i64))
+    }
+
+    async fn remove_stage_count(&self, stage: &str, uuid: &str) -> Result<(), StorageError> {
+        self.client
+            .del(Self::get_stage_count_key(stage, uuid))
+            .await
+            .map_err(|err| RedisStorageError::RedisError("removing stage count", err))?;
+        Ok(())
+    }
+
     async fn set_search_fully_enqueued(&self, uuid: &str) -> Result<(), StorageError> {
         let key = Self::get_search_fully_enqueued_key(uuid);
 
@@ -938,6 +1093,55 @@ mod tests {
 
             assert_eq!(i, storage.get_finished_spectrum_count(uuid).await.unwrap());
         }
+    }
+
+    /// Test the named per-stage count functionality for various storage implementations.
+    async fn test_generic_stage_count<S>(storage: S, stage: &str, uuid: &str)
+    where
+        S: PipelineStorage,
+    {
+        storage.init_stage_count(stage, uuid).await.unwrap();
+
+        assert_eq!(0, storage.get_stage_count(stage, uuid).await.unwrap());
+
+        for i in 1..10 {
+            let returned = storage.increase_stage_count(stage, uuid).await.unwrap();
+            assert_eq!(i, returned);
+            assert_eq!(i, storage.get_stage_count(stage, uuid).await.unwrap());
+        }
+
+        storage.remove_stage_count(stage, uuid).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_stage_count() {
+        let uuid: &'static str = "test_uuid";
+
+        let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
+            time_to_idle: 5,
+            url: Some("redis://127.0.0.1:6380".to_string()),
+        };
+
+        let storage = RedisPipelineStorage::new(&config).await.unwrap();
+        // start fresh
+        storage.client.del("*").await.unwrap();
+
+        test_generic_stage_count(storage, "maccoys_identifications", uuid).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_stage_count() {
+        let uuid: &'static str = "test_uuid";
+
+        let storage = LocalPipelineStorage::new(&PipelineStorageConfiguration {
+            time_to_idle: 5,
+            url: None,
+        })
+        .await
+        .unwrap();
+
+        test_generic_stage_count(storage, "maccoys_identifications", uuid).await;
     }
 
     /// Test the time to idle functionality for cvarious storage implementations.s

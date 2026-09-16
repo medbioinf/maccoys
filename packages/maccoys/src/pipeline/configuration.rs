@@ -456,6 +456,8 @@ pub struct StandaloneScoringConfiguration {
     pub publication: TaskConfiguration,
     /// Error task configuration
     pub error: TaskConfiguration,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
 }
 
 /// Configuration for standalone file publication
@@ -480,6 +482,8 @@ pub struct StandaloneErrorConfiguration {
     pub error: TaskConfiguration,
     /// Work directory
     pub work_directory: PathBuf,
+    /// Storage configuration
+    pub storage: PipelineStorageConfiguration,
 }
 
 /// Configuration for the combined finalization worker, which runs publication and error

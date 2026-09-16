@@ -118,6 +118,7 @@ pub async fn run_standalone(
                 stop_flag.clone(),
             );
             let scoring_task = ScoringTask::new(
+                storage.clone(),
                 scoring_queue.clone(),
                 publication_queue.clone(),
                 error_queue.clone(),
@@ -221,6 +222,7 @@ async fn run_slot(
         HttpPipelineQueue<ErrorMessage>,
     >,
     mut scoring_task: ScoringTask<
+        RedisPipelineStorage,
         HttpPipelineQueue<ScoringMessage>,
         HttpPipelineQueue<PublicationMessage>,
         HttpPipelineQueue<ErrorMessage>,

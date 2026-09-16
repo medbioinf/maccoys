@@ -88,6 +88,7 @@ pub async fn run_standalone(config_file_path: PathBuf) -> Result<(), PipelineErr
             );
             let error_task = ErrorTask::new(
                 config.work_directory.clone(),
+                storage.clone(),
                 error_queue.clone(),
                 stop_flag.clone(),
             );
@@ -119,7 +120,7 @@ async fn run_slot(
         HttpPipelineQueue<ErrorMessage>,
         RedisPipelineStorage,
     >,
-    mut error_task: ErrorTask<HttpPipelineQueue<ErrorMessage>>,
+    mut error_task: ErrorTask<RedisPipelineStorage, HttpPipelineQueue<ErrorMessage>>,
     publication_queue: Arc<HttpPipelineQueue<PublicationMessage>>,
     error_queue: Arc<HttpPipelineQueue<ErrorMessage>>,
     stop_flag: Arc<AtomicBool>,

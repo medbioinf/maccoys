@@ -18,6 +18,7 @@ use crate::pipeline::{
         publication_message::PublicationMessage, scoring_message::ScoringMessage,
     },
     queue::{HttpPipelineQueue, PipelineQueue},
+    storage::{PipelineStorage, RedisPipelineStorage},
     utils::{create_file_path_on_precursor_level, create_metrics_file_path_on_precursor_level},
 };
 
@@ -91,16 +92,19 @@ fn max_psms_for_memory_budget(budget_bytes: usize, neighbors: usize) -> usize {
 /// This tasks runs a Python interpreter in the background to utilize functionality from [scipy](https://scipy.org/) which is currently not available in Rust
 ///
 /// # Generics
+/// * `St` - Type of the storage
 /// * `S` - Type of the scoring queue (this task's own queue)
 /// * `P` - Type of the publication queue
 /// * `E` - Type of the error queue
 ///
-pub struct ScoringTask<S, P, E>
+pub struct ScoringTask<St, S, P, E>
 where
+    St: PipelineStorage + Send + Sync + 'static,
     S: PipelineQueue<ScoringMessage> + Send + Sync + 'static,
     P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
     E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
 {
+    storage: Arc<St>,
     scoring_queue: Arc<S>,
     publish_queue: Arc<P>,
     error_queue: Arc<E>,
@@ -113,8 +117,9 @@ where
     memory_safety_margin: f64,
 }
 
-impl<S, P, E> ScoringTask<S, P, E>
+impl<St, S, P, E> ScoringTask<St, S, P, E>
 where
+    St: PipelineStorage + Send + Sync + 'static,
     S: PipelineQueue<ScoringMessage> + Send + Sync + 'static,
     P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
     E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
@@ -122,6 +127,7 @@ where
     /// Creates a new scoring task
     ///
     /// # Arguments
+    /// * `storage` - Storage to track per-search stage counts
     /// * `scoring_queue` - The queue to get the PSMs to score
     /// * `publish_queue` - The queue to push the scored PSMs to
     /// * `error_queue` - The queue to push the errors to
@@ -134,7 +140,9 @@ where
     ///   [`crate::peptide_spectrum_match::PeptideSpectrumMatchCollection::truncate_to_top_by_xcorr`]
     ///   and [`crate::pipeline::configuration::ScoringTaskConfiguration::effective_memory_safety_margin`])
     ///
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        storage: Arc<St>,
         scoring_queue: Arc<S>,
         publish_queue: Arc<P>,
         error_queue: Arc<E>,
@@ -149,6 +157,7 @@ where
             .unwrap();
 
         Self {
+            storage,
             scoring_queue,
             publish_queue,
             error_queue,
@@ -167,6 +176,7 @@ where
 ///
 impl
     ScoringTask<
+        RedisPipelineStorage,
         HttpPipelineQueue<ScoringMessage>,
         HttpPipelineQueue<PublicationMessage>,
         HttpPipelineQueue<ErrorMessage>,
@@ -198,6 +208,8 @@ impl
 
         let error_queue = Arc::new(HttpPipelineQueue::<ErrorMessage>::new(&config.error).await?);
 
+        let storage = Arc::new(RedisPipelineStorage::new(&config.storage).await?);
+
         let mut signals = Signals::new([SIGINT]).map_err(PipelineError::SignalHandlerError)?;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -216,6 +228,7 @@ impl
             .map(|_| {
                 tokio::spawn(
                     ScoringTask::new(
+                        storage.clone(),
                         scoring_queue.clone(),
                         publication_queue.clone(),
                         error_queue.clone(),
@@ -237,8 +250,9 @@ impl
     }
 }
 
-impl<S, P, E> Task for ScoringTask<S, P, E>
+impl<St, S, P, E> Task for ScoringTask<St, S, P, E>
 where
+    St: PipelineStorage + Send + Sync + 'static,
     S: PipelineQueue<ScoringMessage> + Send + Sync + 'static,
     P: PipelineQueue<PublicationMessage> + Send + Sync + 'static,
     E: PipelineQueue<ErrorMessage> + Send + Sync + 'static,
@@ -268,6 +282,7 @@ where
         );
 
         let metrics_counter_name = Self::get_counter_name(message.uuid());
+        let search_uuid = message.uuid().clone();
 
         let relative_psms_path = create_file_path_on_precursor_level(
             message.uuid(),
@@ -397,6 +412,13 @@ where
         Self::enqueue_message(publication_message, self.publish_queue.as_ref()).await;
         Self::ack_message(&message_id, self.scoring_queue.as_ref()).await;
         counter!(metrics_counter_name.clone()).increment(1);
+        if let Err(e) = self
+            .storage
+            .increase_stage_count(COUNTER_PREFIX, &search_uuid)
+            .await
+        {
+            error!("Error increasing scoring stage count: {:?}", e);
+        }
 
         // send some metrics
 

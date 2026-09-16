@@ -37,6 +37,7 @@ use super::{
         search_space_generation_message::SearchSpaceGenerationMessage,
     },
     queue::PipelineQueue,
+    tasks::{error_task, identification_task, scoring_task, search_space_generation_task},
     utils::create_file_path_on_ms_run_level,
 };
 
@@ -191,18 +192,31 @@ pub struct ProgressRepsonse {
     total_spectrum_count: u64,
     finished_spectrum_count: u64,
     is_search_fully_enqueued: bool,
+    search_space_generated_count: u64,
+    identified_count: u64,
+    scored_count: u64,
+    error_count: u64,
 }
 
 impl ProgressRepsonse {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         total_spectrum_count: u64,
         finished_spectrum_count: u64,
         is_search_fully_enqueued: bool,
+        search_space_generated_count: u64,
+        identified_count: u64,
+        scored_count: u64,
+        error_count: u64,
     ) -> Self {
         Self {
             total_spectrum_count,
             finished_spectrum_count,
             is_search_fully_enqueued,
+            search_space_generated_count,
+            identified_count,
+            scored_count,
+            error_count,
         }
     }
 
@@ -216,6 +230,22 @@ impl ProgressRepsonse {
 
     pub fn is_search_fully_enqueued(&self) -> bool {
         self.is_search_fully_enqueued
+    }
+
+    pub fn search_space_generated_count(&self) -> u64 {
+        self.search_space_generated_count
+    }
+
+    pub fn identified_count(&self) -> u64 {
+        self.identified_count
+    }
+
+    pub fn scored_count(&self) -> u64 {
+        self.scored_count
+    }
+
+    pub fn error_count(&self) -> u64 {
+        self.error_count
     }
 }
 
@@ -484,7 +514,11 @@ impl RemotePipelineWebApi {
     /// {
     ///  "total_spectrum_count": 100,
     ///  "finished_spectrum_count": 50,
-    ///  "is_search_fully_enqueued": false
+    ///  "is_search_fully_enqueued": false,
+    ///  "search_space_generated_count": 80,
+    ///  "identified_count": 70,
+    ///  "scored_count": 60,
+    ///  "error_count": 2
     /// }
     /// ```
     ///
@@ -515,6 +549,42 @@ impl RemotePipelineWebApi {
                     format!("Error getting total spectrum count: {:?}", e),
                 )
             })?,
+            storage
+                .get_stage_count(search_space_generation_task::COUNTER_PREFIX, &uuid)
+                .await
+                .map_err(|e| {
+                    WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error getting search space generation count: {:?}", e),
+                    )
+                })?,
+            storage
+                .get_stage_count(identification_task::COUNTER_PREFIX, &uuid)
+                .await
+                .map_err(|e| {
+                    WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error getting identification count: {:?}", e),
+                    )
+                })?,
+            storage
+                .get_stage_count(scoring_task::COUNTER_PREFIX, &uuid)
+                .await
+                .map_err(|e| {
+                    WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error getting scoring count: {:?}", e),
+                    )
+                })?,
+            storage
+                .get_stage_count(error_task::COUNTER_PREFIX, &uuid)
+                .await
+                .map_err(|e| {
+                    WebError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Error getting error count: {:?}", e),
+                    )
+                })?,
         );
 
         Ok(Json(serde_json::to_value(response)?))
