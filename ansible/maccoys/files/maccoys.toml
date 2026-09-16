@@ -15,11 +15,12 @@ queue_url = "http://<QUEUE_SERVER>:8123"
 
 [search_space_generation]
 num_tasks = 8
-concurrent_searches = 64
+concurrent_searches = 256
 queue_name = "search_space_generation"
 queue_capacity = 100
 queue_url = "http://<QUEUE_SERVER>:8123"
 target_url = "<TARGET_PEPTIDE_URL>"
+max_concurrent = 3
 # decoy_url = "http://
 # target_lookup_url = "http://
 

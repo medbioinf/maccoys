@@ -288,7 +288,7 @@ where
                             error_queue.clone(),
                             search_space_generation_stop_flag.clone(),
                         )
-                        .run(),
+                        .run_with_slot_limit(),
                     )
                 })
                 .collect();

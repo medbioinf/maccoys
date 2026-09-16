@@ -2,6 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
+    time::Duration,
 };
 
 use macpepdb::{
@@ -9,13 +10,13 @@ use macpepdb::{
     post_translational_modification::{PTMCollection, PostTranslationalModification},
 };
 use metrics::counter;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     pipeline::{
         configuration::{
             SearchParameters, SearchSpaceGenerationTaskConfiguration,
-            StandaloneSearchSpaceGenerationConfiguration,
+            StandaloneSearchSpaceGenerationConfiguration, SEARCH_SPACE_GENERATION_QUEUE_KEY,
         },
         errors::{
             pipeline_error::PipelineError,
@@ -33,7 +34,16 @@ use crate::{
     search_space::search_space_generator::{InMemorySearchSpace, SearchSpaceGenerator},
 };
 
-use super::task::Task;
+use super::task::{backoff_sleep, Task, BACKOFF_START};
+
+/// A lease held while a search-space-generation message is being processed, when
+/// `max_concurrent` is configured. `Unlimited` is returned when the limiter is disabled, so
+/// callers don't need to special-case the "no limit configured" case themselves.
+///
+pub(crate) enum SlotLease {
+    Unlimited,
+    Leased(String),
+}
 
 /// Prefix for the search space generation counter
 ///
@@ -130,6 +140,109 @@ where
             metrics_counter_name: COUNTER_PREFIX.to_string(),
         }
     }
+
+    /// Tries once to acquire a slot under `config.max_concurrent`. Returns
+    /// `Some(SlotLease::Unlimited)` immediately (no storage round-trip) if no limit is
+    /// configured. Returns `None` if the limit is configured and currently exhausted - this is
+    /// routine backpressure, not an error, and callers should treat it exactly like a full
+    /// downstream queue.
+    ///
+    pub(crate) async fn try_acquire_slot(&self) -> Option<SlotLease> {
+        let max_slots = match self.config.max_concurrent {
+            Some(max_slots) => max_slots,
+            None => return Some(SlotLease::Unlimited),
+        };
+
+        match self
+            .storage
+            .try_acquire_slot(
+                SEARCH_SPACE_GENERATION_QUEUE_KEY,
+                max_slots.get(),
+                self.config.slot_lease_timeout,
+            )
+            .await
+        {
+            Ok(Some(lease_id)) => Some(SlotLease::Leased(lease_id)),
+            Ok(None) => None,
+            Err(e) => {
+                error!("{}", e);
+                None
+            }
+        }
+    }
+
+    /// Releases a lease acquired via [`Self::try_acquire_slot`]. A no-op for
+    /// `SlotLease::Unlimited`.
+    ///
+    pub(crate) async fn release_slot(&self, lease: SlotLease) {
+        if let SlotLease::Leased(lease_id) = lease {
+            if let Err(e) = self
+                .storage
+                .release_slot(SEARCH_SPACE_GENERATION_QUEUE_KEY, &lease_id)
+                .await
+            {
+                error!("{}", e);
+            }
+        }
+    }
+
+    /// Same loop as [`Task::run`], except a slot under `config.max_concurrent` (if configured)
+    /// is acquired before popping each message and released once it's been processed. Waiting
+    /// for a slot here blocks only this task instance - each instance of this task type is
+    /// always spawned as its own independent worker (never sharing a round-robin slot with
+    /// other stages, unlike the grouped `processing_worker`), so blocking with backoff is fine
+    /// and mirrors the existing empty-queue backoff below.
+    ///
+    pub(crate) async fn run_with_slot_limit(mut self)
+    where
+        Self: Send + 'static,
+    {
+        let mut pop_backoff = BACKOFF_START;
+        let mut acquire_backoff = BACKOFF_START;
+        'message_loop: loop {
+            if self.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+
+            let lease = loop {
+                match self.try_acquire_slot().await {
+                    Some(lease) => {
+                        acquire_backoff = BACKOFF_START;
+                        break lease;
+                    }
+                    None => {
+                        if self.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            break 'message_loop;
+                        }
+                        acquire_backoff = backoff_sleep(acquire_backoff).await;
+                    }
+                }
+            };
+
+            let (message_id, message) = match self.search_space_generation_queue.pop().await {
+                Ok(Some(message)) => {
+                    pop_backoff = BACKOFF_START;
+                    message
+                }
+                Ok(None) => {
+                    self.release_slot(lease).await;
+                    pop_backoff = BACKOFF_START;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue 'message_loop;
+                }
+                Err(e) => {
+                    self.release_slot(lease).await;
+                    error!("{}", e);
+                    pop_backoff = backoff_sleep(pop_backoff).await;
+                    continue 'message_loop;
+                }
+            };
+
+            debug!("[{}] recv", &message_id);
+            self.process_message(message_id, message).await;
+            self.release_slot(lease).await;
+        }
+    }
 }
 
 /// Standalone entrypoint used by the `maccoys pipeline search-space-generation` CLI command;
@@ -197,7 +310,7 @@ impl
                             error_queue.clone(),
                             stop_flag.clone(),
                         )
-                        .run(),
+                        .run_with_slot_limit(),
                     )
                 })
                 .collect();

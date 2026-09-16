@@ -5,12 +5,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::Future;
 use macpepdb::post_translational_modification::PostTranslationalModification;
 use mini_moka::sync::Cache;
-use rustis::commands::{GenericCommands, StringCommands};
+use rustis::commands::{GenericCommands, ScriptingCommands, SortedSetCommands, StringCommands};
 
 use super::{
     configuration::{PipelineStorageConfiguration, SearchParameters},
@@ -271,6 +272,50 @@ pub trait PipelineStorage: Send + Sync + Sized {
         &self,
         uuid: &str,
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
+
+    /// Returns the key used to namespace a named semaphore's slots
+    ///
+    /// # Arguments
+    /// * `key` - Name of the semaphore, e.g. a stage's queue name
+    ///
+    fn get_semaphore_key(key: &str) -> String {
+        format!("semaphore:{}", key)
+    }
+
+    /// Attempts to acquire one of `max_slots` concurrent slots for the named semaphore `key`.
+    /// Returns `Ok(None)` (not an error) if all slots are currently leased and unexpired; this
+    /// is the routine "at capacity" case, not a failure.
+    ///
+    /// A returned lease id must eventually be passed to [`PipelineStorage::release_slot`]. If
+    /// it never is (e.g. the holder crashes), the lease self-expires after `lease_timeout` and
+    /// is reclaimed lazily the next time anyone calls this method for the same `key` - there's
+    /// no separate background sweep, unlike the queue's reschedule loop, since eviction of
+    /// expired entries happens as a side effect of every acquire attempt.
+    ///
+    /// # Arguments
+    /// * `key` - Name of the semaphore
+    /// * `max_slots` - Maximum number of concurrently held slots
+    /// * `lease_timeout` - How long an acquired slot stays reserved without being released
+    ///
+    fn try_acquire_slot(
+        &self,
+        key: &str,
+        max_slots: usize,
+        lease_timeout: Duration,
+    ) -> impl Future<Output = Result<Option<String>, StorageError>> + Send;
+
+    /// Releases a previously acquired slot lease, freeing it up for another acquirer. A no-op
+    /// if the lease already expired or was already released.
+    ///
+    /// # Arguments
+    /// * `key` - Name of the semaphore
+    /// * `lease_id` - Lease id returned by [`PipelineStorage::try_acquire_slot`]
+    ///
+    fn release_slot(
+        &self,
+        key: &str,
+        lease_id: &str,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 }
 
 /// Local storage for the pipeline to
@@ -287,6 +332,9 @@ pub struct LocalPipelineStorage {
 
     /// Flags
     flags: Cache<String, bool>,
+
+    /// Named semaphores: semaphore key -> (lease id -> expiry)
+    semaphores: RwLock<HashMap<String, HashMap<String, Instant>>>,
 }
 
 impl PipelineStorage for LocalPipelineStorage {
@@ -299,6 +347,7 @@ impl PipelineStorage for LocalPipelineStorage {
                 .max_capacity(1000)
                 .time_to_idle(std::time::Duration::from_secs(config.time_to_idle))
                 .build(),
+            semaphores: RwLock::new(HashMap::new()),
         })
     }
 
@@ -488,6 +537,41 @@ impl PipelineStorage for LocalPipelineStorage {
             .flags
             .get(&Self::get_search_fully_enqueued_key(uuid))
             .unwrap_or(false))
+    }
+
+    async fn try_acquire_slot(
+        &self,
+        key: &str,
+        max_slots: usize,
+        lease_timeout: Duration,
+    ) -> Result<Option<String>, StorageError> {
+        let mut semaphores_guard = self.semaphores.write().map_err(|_| {
+            LocalStorageError::PoisenedStorageLock("acquiring semaphore slot".to_string())
+        })?;
+        let leases = semaphores_guard
+            .entry(Self::get_semaphore_key(key))
+            .or_default();
+
+        let now = Instant::now();
+        leases.retain(|_, expiry| *expiry > now);
+
+        if leases.len() >= max_slots {
+            return Ok(None);
+        }
+
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        leases.insert(lease_id.clone(), now + lease_timeout);
+        Ok(Some(lease_id))
+    }
+
+    async fn release_slot(&self, key: &str, lease_id: &str) -> Result<(), StorageError> {
+        let mut semaphores_guard = self.semaphores.write().map_err(|_| {
+            LocalStorageError::PoisenedStorageLock("releasing semaphore slot".to_string())
+        })?;
+        if let Some(leases) = semaphores_guard.get_mut(&Self::get_semaphore_key(key)) {
+            leases.remove(lease_id);
+        }
+        Ok(())
     }
 }
 
@@ -749,6 +833,52 @@ impl PipelineStorage for RedisPipelineStorage {
             None => Ok(false), // If the key does not exist, we consider the search not done
         }
     }
+
+    async fn try_acquire_slot(
+        &self,
+        key: &str,
+        max_slots: usize,
+        lease_timeout: Duration,
+    ) -> Result<Option<String>, StorageError> {
+        // Evicts leases whose score (absolute expiry, seconds since epoch) is in the past,
+        // then atomically admits a new lease only if that leaves room under `max_slots`.
+        // Needs to happen as one atomic step (evict + count + conditionally add), so it's a
+        // Lua script rather than separate ZREMRANGEBYSCORE/ZCARD/ZADD calls.
+        const ACQUIRE_SCRIPT: &str = r#"
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+            if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[2]) then
+                redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+                return 1
+            end
+            return 0
+        "#;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let expiry = (now + lease_timeout).as_secs_f64();
+        let lease_id = uuid::Uuid::new_v4().to_string();
+
+        let acquired: i64 = self
+            .client
+            .eval(
+                ACQUIRE_SCRIPT,
+                Self::get_semaphore_key(key),
+                (now.as_secs_f64(), max_slots, expiry, lease_id.as_str()),
+            )
+            .await
+            .map_err(|err| RedisStorageError::RedisError("acquiring semaphore slot", err))?;
+
+        Ok(if acquired == 1 { Some(lease_id) } else { None })
+    }
+
+    async fn release_slot(&self, key: &str, lease_id: &str) -> Result<(), StorageError> {
+        self.client
+            .zrem(Self::get_semaphore_key(key), lease_id)
+            .await
+            .map_err(|err| RedisStorageError::RedisError("releasing semaphore slot", err))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -861,5 +991,135 @@ mod tests {
         .unwrap();
 
         test_generic_time_to_idle(storage, uuid, time_to_idle).await;
+    }
+
+    /// Test the semaphore functionality for various storage implementations.
+    async fn test_generic_semaphore<S>(storage: S, key: &str, lease_timeout: u64)
+    where
+        S: PipelineStorage,
+    {
+        let max_slots = 2;
+        let lease_timeout = Duration::from_secs(lease_timeout);
+
+        let lease_a = storage
+            .try_acquire_slot(key, max_slots, lease_timeout)
+            .await
+            .unwrap()
+            .expect("first slot should be free");
+        let _lease_b = storage
+            .try_acquire_slot(key, max_slots, lease_timeout)
+            .await
+            .unwrap()
+            .expect("second slot should be free");
+
+        // both slots taken, a third acquire should be denied
+        assert!(storage
+            .try_acquire_slot(key, max_slots, lease_timeout)
+            .await
+            .unwrap()
+            .is_none());
+
+        // releasing a lease frees a slot back up
+        storage.release_slot(key, &lease_a).await.unwrap();
+        assert!(storage
+            .try_acquire_slot(key, max_slots, lease_timeout)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_semaphore() {
+        let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
+            time_to_idle: 86_400,
+            url: Some("redis://127.0.0.1:6380".to_string()),
+        };
+
+        let storage = RedisPipelineStorage::new(&config).await.unwrap();
+        storage.client.del("*").await.unwrap();
+
+        test_generic_semaphore(storage, "test_semaphore", 5).await;
+    }
+
+    #[tokio::test]
+    async fn test_local_semaphore() {
+        let storage = LocalPipelineStorage::new(&PipelineStorageConfiguration {
+            time_to_idle: 86_400,
+            url: None,
+        })
+        .await
+        .unwrap();
+
+        test_generic_semaphore(storage, "test_semaphore", 5).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_redis_semaphore_lease_expiry() {
+        let key = "test_semaphore_expiry";
+        let lease_timeout = 2;
+
+        let config: PipelineStorageConfiguration = PipelineStorageConfiguration {
+            time_to_idle: 86_400,
+            url: Some("redis://127.0.0.1:6380".to_string()),
+        };
+
+        let storage = RedisPipelineStorage::new(&config).await.unwrap();
+        storage.client.del("*").await.unwrap();
+
+        // acquire without releasing (simulates a crashed holder)
+        storage
+            .try_acquire_slot(key, 1, Duration::from_secs(lease_timeout))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(storage
+            .try_acquire_slot(key, 1, Duration::from_secs(lease_timeout))
+            .await
+            .unwrap()
+            .is_none());
+
+        tokio::time::sleep(Duration::from_secs(lease_timeout + 1)).await;
+
+        assert!(storage
+            .try_acquire_slot(key, 1, Duration::from_secs(lease_timeout))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_local_semaphore_lease_expiry() {
+        let key = "test_semaphore_expiry";
+        let lease_timeout = 2;
+
+        let storage = LocalPipelineStorage::new(&PipelineStorageConfiguration {
+            time_to_idle: 86_400,
+            url: None,
+        })
+        .await
+        .unwrap();
+
+        storage
+            .try_acquire_slot(key, 1, Duration::from_secs(lease_timeout))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(storage
+            .try_acquire_slot(key, 1, Duration::from_secs(lease_timeout))
+            .await
+            .unwrap()
+            .is_none());
+
+        tokio::time::sleep(Duration::from_secs(lease_timeout + 1)).await;
+
+        assert!(storage
+            .try_acquire_slot(key, 1, Duration::from_secs(lease_timeout))
+            .await
+            .unwrap()
+            .is_some());
     }
 }

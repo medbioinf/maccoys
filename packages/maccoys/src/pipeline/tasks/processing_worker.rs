@@ -8,7 +8,7 @@ use std::{
 };
 
 use signal_hook::{consts::SIGINT, iterator::Signals};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::pipeline::{
     configuration::StandaloneProcessingConfiguration,
@@ -147,6 +147,57 @@ pub async fn run_standalone(
     Ok(())
 }
 
+/// Polls the search space generation stage of a round-robin worker slot: skips the stage (like
+/// [`poll_stage_with_backpressure`]) if `outgoing` is full, and also skips it (rather than
+/// blocking the shared slot) if `ssg_task`'s concurrency limiter has no free slot right now -
+/// the message is left untouched in `incoming` either way, so a sibling stage sharing this slot
+/// can still make progress. Kept specific to this one stage/concrete instantiation rather than
+/// folded into the generic `poll_stage_with_backpressure`, since no other stage needs a
+/// concurrency limiter.
+///
+async fn poll_search_space_generation_stage(
+    outgoing: &HttpPipelineQueue<IdentificationMessage>,
+    incoming: &HttpPipelineQueue<SearchSpaceGenerationMessage>,
+    ssg_task: &mut SearchSpaceGenerationTask<
+        RedisPipelineStorage,
+        HttpPipelineQueue<SearchSpaceGenerationMessage>,
+        HttpPipelineQueue<IdentificationMessage>,
+        HttpPipelineQueue<PublicationMessage>,
+        HttpPipelineQueue<ErrorMessage>,
+    >,
+) -> bool {
+    match outgoing.is_full().await {
+        Ok(true) => return false,
+        Ok(false) => {}
+        Err(e) => {
+            error!("{}", e);
+            return false;
+        }
+    }
+
+    let lease = match ssg_task.try_acquire_slot().await {
+        Some(lease) => lease,
+        None => return false,
+    };
+
+    match incoming.pop().await {
+        Ok(Some((message_id, message))) => {
+            ssg_task.process_message(message_id, message).await;
+            ssg_task.release_slot(lease).await;
+            true
+        }
+        Ok(None) => {
+            ssg_task.release_slot(lease).await;
+            false
+        }
+        Err(e) => {
+            error!("{}", e);
+            ssg_task.release_slot(lease).await;
+            false
+        }
+    }
+}
+
 /// One worker slot's loop: round-robins across search space generation, identification and
 /// scoring, skipping a stage when its outgoing queue is full (via
 /// [`poll_stage_with_backpressure`]) so this slot never blocks on a saturated downstream while
@@ -193,10 +244,10 @@ async fn run_slot(
 
             let did_work = match stage {
                 0 => {
-                    poll_stage_with_backpressure(
+                    poll_search_space_generation_stage(
                         identification_queue.as_ref(),
                         search_space_generation_queue.as_ref(),
-                        |id, msg| ssg_task.process_message(id, msg),
+                        &mut ssg_task,
                     )
                     .await
                 }

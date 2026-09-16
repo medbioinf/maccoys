@@ -92,6 +92,26 @@ pub struct SearchSpaceGenerationTaskConfiguration {
 
     /// Optional URL to the target lookup database
     pub target_lookup_url: Option<String>,
+
+    /// Global cap on concurrently in-flight search-space-generation messages across the whole
+    /// deployment (not just this process), to avoid overwhelming MaCPepDB. `None` (default)
+    /// disables the limiter entirely, preserving unbounded behavior.
+    #[serde(default)]
+    pub max_concurrent: Option<NonZeroUsize>,
+
+    /// Lease timeout for a slot acquired under `max_concurrent`: if a worker holding a slot
+    /// dies without releasing it, the slot is reclaimed after this long. Should comfortably
+    /// exceed the worst-case time to process one message (all its precursors' MaCPepDB
+    /// round-trips). Only relevant when `max_concurrent` is set.
+    #[serde(
+        default = "default_slot_lease_timeout",
+        with = "crate::utils::serde::duration_as_secs"
+    )]
+    pub slot_lease_timeout: Duration,
+}
+
+fn default_slot_lease_timeout() -> Duration {
+    Duration::from_secs(600)
 }
 
 impl Deref for SearchSpaceGenerationTaskConfiguration {
@@ -277,6 +297,8 @@ impl Default for PipelineConfiguration {
                 concurrent_searches: NonZeroUsize::new(16).unwrap(),
                 decoy_url: None,
                 target_lookup_url: None,
+                max_concurrent: None,
+                slot_lease_timeout: default_slot_lease_timeout(),
             },
             identification: IdentificationTaskConfiguration {
                 general: TaskConfiguration {
